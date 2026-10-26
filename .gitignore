@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+*.gpxil.tif
+!tests/data/*.gpxil.tif
+*.pdf
+results*.json
+examples/run/

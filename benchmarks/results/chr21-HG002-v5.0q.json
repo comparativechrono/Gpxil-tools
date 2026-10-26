@@ -1,0 +1,438 @@
+{
+  "sequence": {
+    "name": "21",
+    "length": 46709983,
+    "N": 6621364,
+    "softmasked": 22752430
+  },
+  "width": 8192,
+  "environment": {
+    "python": "3.13.17",
+    "numpy": "2.5.3",
+    "tifffile": "2026.9.20",
+    "imagecodecs": "2026.10.10",
+    "pillow": "12.3.0",
+    "gpxiltools": "0.1.0",
+    "cpu": "x86_64",
+    "cores": 2
+  },
+  "reference": [
+    {
+      "name": "FASTA, uncompressed (60 bp lines)",
+      "bytes": 47488488,
+      "bits_per_base": 8.133,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "FASTA.gz as distributed (Ensembl)",
+      "bytes": 12587949,
+      "bits_per_base": 2.156,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "gzip, includes soft-masking"
+    },
+    {
+      "name": "UCSC .2bit (exact size)",
+      "bytes": 12157960,
+      "bits_per_base": 2.082,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "2 bits/base + N and mask blocks"
+    },
+    {
+      "name": "FASTA.xz -9",
+      "bytes": 9791388,
+      "bits_per_base": 1.677,
+      "encode_s": 85.38,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "FASTA.zst -19",
+      "bytes": 10230517,
+      "bits_per_base": 1.752,
+      "encode_s": 58.26,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, deflate 6, 256 KiB strips",
+      "bytes": 11729234,
+      "bits_per_base": 2.009,
+      "encode_s": 1.44,
+      "decode_s": 0.14,
+      "random_access_ms": 0.562,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, deflate 9, 256 KiB strips",
+      "bytes": 11250688,
+      "bits_per_base": 1.927,
+      "encode_s": 5.11,
+      "decode_s": 0.15,
+      "random_access_ms": 0.585,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, deflate 9, 64 KiB strips",
+      "bytes": 11536880,
+      "bits_per_base": 1.976,
+      "encode_s": 4.75,
+      "decode_s": 0.14,
+      "random_access_ms": 0.175,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, deflate 9, 1 MiB strips",
+      "bytes": 11179220,
+      "bits_per_base": 1.915,
+      "encode_s": 5.24,
+      "decode_s": 0.13,
+      "random_access_ms": 1.834,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, zstd 3, 256 KiB strips",
+      "bytes": 12575324,
+      "bits_per_base": 2.154,
+      "encode_s": 0.31,
+      "decode_s": 0.11,
+      "random_access_ms": 0.418,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, zstd 9, 256 KiB strips",
+      "bytes": 11478874,
+      "bits_per_base": 1.966,
+      "encode_s": 2.95,
+      "decode_s": 0.1,
+      "random_access_ms": 0.465,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, zstd 19, 256 KiB strips",
+      "bytes": 10561994,
+      "bits_per_base": 1.809,
+      "encode_s": 23.06,
+      "decode_s": 0.12,
+      "random_access_ms": 0.601,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, zstd 19, 1 MiB strips",
+      "bytes": 10222736,
+      "bits_per_base": 1.751,
+      "encode_s": 28.72,
+      "decode_s": 0.1,
+      "random_access_ms": 1.663,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, lzma, 256 KiB strips",
+      "bytes": 10046076,
+      "bits_per_base": 1.721,
+      "encode_s": 20.23,
+      "decode_s": 0.46,
+      "random_access_ms": 2.768,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, lzw, 256 KiB strips",
+      "bytes": 12506994,
+      "bits_per_base": 2.142,
+      "encode_s": 0.47,
+      "decode_s": 0.11,
+      "random_access_ms": 0.389,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, packbits",
+      "bytes": 39945540,
+      "bits_per_base": 6.841,
+      "encode_s": 0.34,
+      "decode_s": 0.14,
+      "random_access_ms": 0.672,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "gpxil TIFF, uncompressed",
+      "bytes": 46715292,
+      "bits_per_base": 8.001,
+      "encode_s": 0.06,
+      "decode_s": 0.05,
+      "random_access_ms": 0.041,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "TIFF, deflate 9, 512x512 tiles",
+      "bytes": 11515258,
+      "bits_per_base": 1.972,
+      "encode_s": 4.7,
+      "decode_s": 0.13,
+      "random_access_ms": 12.871,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "4-bit packed IUPAC + 1-bit mask, deflate 9",
+      "bytes": 10436086,
+      "bits_per_base": 1.787,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "payload only: 10,220,150 + 215,936 B"
+    },
+    {
+      "name": "4-bit packed IUPAC + 1-bit mask, zstd 19",
+      "bytes": 9327221,
+      "bits_per_base": 1.597,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "payload only: 9,116,144 + 211,077 B"
+    },
+    {
+      "name": "PNG, 8-bit palette, level 9",
+      "bytes": 11242669,
+      "bits_per_base": 1.926,
+      "encode_s": 15.84,
+      "decode_s": 0.29,
+      "random_access_ms": 289.681,
+      "lossless": true,
+      "note": "any read decodes the whole image"
+    },
+    {
+      "name": "PNG, 4-bit palette (mask dropped)",
+      "bytes": 15554279,
+      "bits_per_base": 2.664,
+      "encode_s": 2.06,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "loses soft-masking"
+    },
+    {
+      "name": "PNG, 24-bit RGB colours (notebook approach)",
+      "bytes": 17313723,
+      "bits_per_base": 2.965,
+      "encode_s": 111.87,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "needs a colour->code reverse lookup to recover bases"
+    },
+    {
+      "name": "WebP lossless (palette)",
+      "bytes": 10805746,
+      "bits_per_base": 1.851,
+      "encode_s": 271.3,
+      "decode_s": 0.76,
+      "random_access_ms": 757.091,
+      "lossless": true,
+      "note": "max 16383 px per side; RGB only"
+    },
+    {
+      "name": "JPEG XL lossless, effort 3 (grey codes)",
+      "bytes": 21663554,
+      "bits_per_base": 3.71,
+      "encode_s": 3.82,
+      "decode_s": 2.52,
+      "random_access_ms": 2519.838,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "JPEG XL lossless, effort 7 (grey codes)",
+      "bytes": 11387561,
+      "bits_per_base": 1.95,
+      "encode_s": 18.26,
+      "decode_s": 4.51,
+      "random_access_ms": 4512.393,
+      "lossless": true,
+      "note": ""
+    },
+    {
+      "name": "TIFF, Hilbert layout (order 13), deflate 9, 256 tiles",
+      "bytes": 13495978,
+      "bits_per_base": 2.311,
+      "encode_s": 5.34,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "2-D locality; each tile is 65,536 consecutive bases"
+    },
+    {
+      "name": "TIFF, Hilbert layout (order 13), zstd 19, 256 tiles",
+      "bytes": 13002253,
+      "bits_per_base": 2.227,
+      "encode_s": 20.21,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": ""
+    }
+  ],
+  "variants": [
+    {
+      "name": "VCF.gz (bgzip-level gzip of the input)",
+      "bytes": 935190,
+      "bits_per_base": 0.16,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "113,870 records, all INFO/FORMAT"
+    },
+    {
+      "name": "VCF.gz, CHROM-ALT + GT only",
+      "bytes": 744241,
+      "bits_per_base": 0.127,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "the content the gt plane holds"
+    },
+    {
+      "name": "gpxil gt + flags planes + sidecar, deflate 9",
+      "bytes": 677021,
+      "bits_per_base": 0.116,
+      "encode_s": 4.32,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "no ref plane"
+    },
+    {
+      "name": "gpxil gt + flags planes + sidecar, zstd 19",
+      "bytes": 666885,
+      "bits_per_base": 0.114,
+      "encode_s": 4.32,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "no ref plane"
+    },
+    {
+      "name": "gpxil gt + flags, deflate 9, outside-benchmark = UNKNOWN",
+      "bytes": 659085,
+      "bits_per_base": 0.113,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": true,
+      "note": "33,195,627 callable bases"
+    },
+    {
+      "name": "CMYK TIFF, one ink per base = allele dosage (0/1/2 copies)",
+      "bytes": 15366233,
+      "bits_per_base": 2.632,
+      "encode_s": null,
+      "decode_s": null,
+      "random_access_ms": null,
+      "lossless": false,
+      "note": "loses phase, indel content, no-call vs deletion"
+    }
+  ],
+  "variant_info": {
+    "records": 113870,
+    "sidecar_entries": 11257,
+    "gt_nonzero": 398590,
+    "callable_bases": 33195627,
+    "dosage_losses": {
+      "positions_with_insertions": 7793,
+      "deleted_vs_unknown_ambiguous": 341209,
+      "phased_positions": 412392,
+      "het_positions_order_lost": 215993
+    },
+    "rgb_both_channels_collisions": {
+      "(np.uint8(1), np.uint8(1), np.uint8(0))": [
+        "R",
+        "T",
+        "W",
+        "K",
+        "D"
+      ],
+      "(np.uint8(1), np.uint8(1), np.uint8(1))": [
+        "V",
+        "Y",
+        "H",
+        "B",
+        "N"
+      ]
+    },
+    "rgb_positions_A/G_het_vs_T": 10507
+  },
+  "matplotlib_route": [
+    {
+      "bases": 250000,
+      "dpi": 150,
+      "grid": [
+        500,
+        500
+      ],
+      "figure_pixels": [
+        1500,
+        1500
+      ],
+      "image_box_pixels": [
+        1155,
+        1162
+      ],
+      "pixels_per_base": [
+        2.31,
+        2.324
+      ],
+      "bases_exact_colour_at_cell_centre": 0.06,
+      "bases_recovered_by_nearest_colour": 1.0
+    },
+    {
+      "bases": 1000000,
+      "dpi": 600,
+      "grid": [
+        200,
+        5000
+      ],
+      "figure_pixels": [
+        240,
+        6000
+      ],
+      "image_box_pixels": [
+        185,
+        4650
+      ],
+      "pixels_per_base": [
+        0.925,
+        0.93
+      ],
+      "bases_exact_colour_at_cell_centre": 0.0233,
+      "bases_recovered_by_nearest_colour": 0.7191
+    }
+  ]
+}

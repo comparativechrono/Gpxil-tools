@@ -1,0 +1,9 @@
+##fileformat=VCFv4.3
+##contig=<ID=chrT,length=10>
+##FILTER=<ID=LowQ,Description="Low quality">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	EXAMPLE
+chrT	2	.	C	T	.	PASS	.	GT	0|1
+chrT	4	.	TAC	T	.	PASS	.	GT	1|0
+chrT	8	.	T	TGG	.	PASS	.	GT	1|1
+chrT	9	.	A	G	.	LowQ	.	GT	./1

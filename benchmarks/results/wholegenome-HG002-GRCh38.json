@@ -1,0 +1,27 @@
+{
+  "input": {
+    "reference": "Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz (Ensembl release 116, 942,484,168 bytes)",
+    "vcf": "HG002_GRCh38_v5.0q_smvar.vcf.gz (GIAB, 42,067,644 bytes)",
+    "callable_regions": "HG002_GRCh38_v5.0q_smvar.benchmark.bed",
+    "options": "--sex XY --ucsc-names"
+  },
+  "command": "gpxil encode Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz -v HG002_GRCh38_v5.0q_smvar.vcf.gz --callable HG002_GRCh38_v5.0q_smvar.benchmark.bed --sex XY --ucsc-names -o HG002_GRCh38.gpxil.tif",
+  "file_bytes": 888808365,
+  "encode_seconds": 750.8,
+  "validate_seconds": 115.3,
+  "cores": 2,
+  "summary": {
+    "contigs": 194,
+    "bases": 3099750718,
+    "records": 5945525,
+    "conflicts": 0,
+    "ref_mismatches": 0,
+    "skipped": 0
+  },
+  "payload_bytes_by_plane": {
+    "ref": 848039405,
+    "gt": 17610202,
+    "sidecar": 6241259,
+    "flags": 15441857
+  }
+}

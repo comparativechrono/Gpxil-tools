@@ -1,0 +1,136 @@
+{
+ "description": "Expected decoded content of worked-example.gpxil.tif (gpxil SPEC.md appendix B). Offsets are 0-based.",
+ "contig": "chrT",
+ "length": 10,
+ "width": 4,
+ "planes": {
+  "ref": [
+   "0x01",
+   "0x02",
+   "0x04",
+   "0x08",
+   "0x01",
+   "0x02",
+   "0x04",
+   "0x08",
+   "0x11",
+   "0x12"
+  ],
+  "gt": [
+   "0x00",
+   "0x08",
+   "0x00",
+   "0x00",
+   "0xd0",
+   "0xd0",
+   "0x00",
+   "0x00",
+   "0xf4",
+   "0x00"
+  ],
+  "flags": [
+   "0x00",
+   "0x11",
+   "0x00",
+   "0x11",
+   "0x11",
+   "0x11",
+   "0x00",
+   "0x17",
+   "0x18",
+   "0x00"
+  ]
+ },
+ "images_including_padding": {
+  "ref": [
+   [
+    "0x01",
+    "0x02",
+    "0x04",
+    "0x08"
+   ],
+   [
+    "0x01",
+    "0x02",
+    "0x04",
+    "0x08"
+   ],
+   [
+    "0x11",
+    "0x12",
+    "0x00",
+    "0x00"
+   ]
+  ],
+  "gt": [
+   [
+    "0x00",
+    "0x08",
+    "0x00",
+    "0x00"
+   ],
+   [
+    "0xd0",
+    "0xd0",
+    "0x00",
+    "0x00"
+   ],
+   [
+    "0xf4",
+    "0x00",
+    "0x00",
+    "0x00"
+   ]
+  ],
+  "flags": [
+   [
+    "0x00",
+    "0x11",
+    "0x00",
+    "0x11"
+   ],
+   [
+    "0x11",
+    "0x11",
+    "0x00",
+    "0x17"
+   ],
+   [
+    "0x18",
+    "0x00",
+    "0x00",
+    "0x00"
+   ]
+  ]
+ },
+ "sidecar": [
+  {
+   "offset": 7,
+   "hap": 1,
+   "kind": "INS",
+   "data": "GG"
+  },
+  {
+   "offset": 7,
+   "hap": 2,
+   "kind": "INS",
+   "data": "GG"
+  }
+ ],
+ "haplotype_1": "ACGTGTGGnc",
+ "haplotype_2": "ATGTACGTGGgc",
+ "haplotype_1_uppercase": "ACGTGTGGNC",
+ "haplotype_2_uppercase": "ATGTACGTGGGC",
+ "gt_meaning": [
+  "REF|REF",
+  "REF|T",
+  "REF|REF",
+  "REF|REF",
+  "DEL|REF",
+  "DEL|REF",
+  "REF|REF",
+  "REF|REF",
+  "UNKNOWN|G",
+  "REF|REF"
+ ]
+}
