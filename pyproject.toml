@@ -22,10 +22,11 @@ dependencies = [
     "tifffile>=2023.7.10",
     "imagecodecs>=2023.1.23",
     "Pillow>=10.0",
+    "jsonschema>=4",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pysam>=0.22", "jsonschema>=4", "pikepdf"]
+test = ["pytest>=7", "pysam>=0.22", "pikepdf"]
 bench = ["matplotlib", "zarr>=2.16"]
 
 [project.scripts]

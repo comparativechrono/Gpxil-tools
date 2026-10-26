@@ -18,9 +18,9 @@ TIFF) and as a whole "genome book" PDF with one printed dot per base.
 pip install git+https://github.com/comparativechrono/Gpxil-tools
 ```
 
-Requires Python 3.10 or later, NumPy, tifffile, imagecodecs and Pillow. For
+Requires Python 3.10 or later, NumPy, tifffile, imagecodecs, Pillow and jsonschema. For
 the tests: `pip install "gpxiltools[test] @ git+https://github.com/comparativechrono/Gpxil-tools"`
-(adds pytest, pysam, jsonschema and pikepdf).
+(adds pytest, pysam and pikepdf).
 
 ## Command line
 
