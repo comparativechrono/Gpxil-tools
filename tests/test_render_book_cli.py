@@ -102,6 +102,26 @@ def test_cli_end_to_end(tmp_path, encoded, capsys):
     assert pdf.read_bytes().startswith(b"%PDF-1.4")
 
 
+def test_encode_notes_a_vcf_on_another_reference(tmp_path, capsys):
+    fa = tmp_path / "r.fa"
+    fa.write_text(">c1\nACGTACGTAC\n")
+    vcf = tmp_path / "v.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n##contig=<ID=c1,length=10>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n"
+        "c1\t2\t.\tC\tT\t.\tPASS\t.\tGT\t0/1\n"  # REF matches
+        "c1\t3\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n"  # the reference has G
+        "c1\t5\t.\tC\tG\t.\tPASS\t.\tGT\t1/1\n"  # the reference has A
+    )
+    assert main(["encode", str(fa), "-v", str(vcf), "-o", str(tmp_path / "v.gpxil.tif")]) == 0
+    err = capsys.readouterr().err
+    assert "note: 2 records' REF alleles don't match the reference" in err
+    vcf.write_text(vcf.read_text().replace("c1\t5\t.\tC\tG", "c1\t5\t.\tA\tG"))
+    assert main(["encode", str(fa), "-v", str(vcf), "-o", str(tmp_path / "w.gpxil.tif")]) == 0
+    assert "note: 1 record's REF allele doesn't match" in capsys.readouterr().err
+
+
 def test_book_structure(tmp_path, encoded):
     pikepdf = pytest.importorskip("pikepdf")
     out = tmp_path / "book.pdf"

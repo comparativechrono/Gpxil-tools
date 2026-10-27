@@ -27,9 +27,11 @@ _RANGE = re.compile(r"bytes=(\d+)-(\d+)$")
 
 
 class _RangeHandler(SimpleHTTPRequestHandler):
-    """Serves files with HTTP range requests, as GitHub Pages does."""
+    """Serves files with HTTP range requests, as GitHub Pages does (hide_size: without Content-Range, as a browser
+    shows a range from another web site, which hides that header)."""
 
     ranges = True
+    hide_size = False
     log = None
 
     def send_head(self):
@@ -44,7 +46,8 @@ class _RangeHandler(SimpleHTTPRequestHandler):
         fh.seek(a)
         self.send_response(206)
         self.send_header("Content-Type", "image/tiff")
-        self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
+        if not self.hide_size:
+            self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
         self.send_header("Content-Length", str(b - a + 1))
         self.end_headers()
         self._left = b - a + 1
@@ -61,9 +64,9 @@ class _RangeHandler(SimpleHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def serve(folder, *, ranges=True):
+def serve(folder, *, ranges=True, hide_size=False):
     log: list[tuple[int, int]] = []
-    handler = type("H", (_RangeHandler,), {"ranges": ranges, "log": log})
+    handler = type("H", (_RangeHandler,), {"ranges": ranges, "hide_size": hide_size, "log": log})
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), partial(handler, directory=str(folder)))
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -132,6 +135,15 @@ def test_a_server_without_range_requests(sample, monkeypatch):
         monkeypatch.setattr("gpxiltools.remote.WHOLE_FILE_LIMIT", 1000)
         with pytest.raises(OSError, match="range requests"):
             GpxilFile(f"{url}/{out.name}")
+
+
+def test_a_range_without_the_files_size(sample):
+    """In the browser, a range from another web site comes without its Content-Range: the size comes from HEAD."""
+    _, _, _, out = sample
+    with serve(out.parent, hide_size=True) as (url, log), GpxilFile(f"{url}/{out.name}") as web, GpxilFile(out) as disk:
+        assert web._fh.size == os.path.getsize(out)
+        _same_contents(web, disk)
+        assert all(b - a < (1 << 20) for a, b in log), "range requests, not whole-file downloads"
 
 
 def test_file_objects(sample):
@@ -306,11 +318,9 @@ def test_missing_codecs_are_said_plainly(tmp_path, monkeypatch):
 
 
 def test_imagecodecs_is_not_needed_in_the_browser():
-    import tomllib
-
-    with open(os.path.join(os.path.dirname(__file__), "..", "pyproject.toml"), "rb") as fh:
-        deps = tomllib.load(fh)["project"]["dependencies"]
-    (codecs,) = [d for d in deps if d.startswith("imagecodecs")]
+    # (the dependency's line of pyproject.toml, read as text: tomllib is Python 3.11 and later)
+    with open(os.path.join(os.path.dirname(__file__), "..", "pyproject.toml"), encoding="utf-8") as fh:
+        (codecs,) = re.findall(r'^\s*"(imagecodecs[^"]*)"', fh.read(), re.M)
     assert "sys_platform != 'emscripten'" in codecs
 
 

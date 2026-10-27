@@ -80,7 +80,16 @@ def cmd_encode(a) -> int:
     mb = summary["bytes"] / 1e6
     print(f"wrote {out}: {summary['contigs']} contigs, {summary['bases']:,} bases, {mb:,.1f} MB in {summary['seconds']}s", file=sys.stderr)
     if summary.get("conflicts"):
-        print(f"note: {summary['conflicts']} conflicting overlapping calls (later record kept); see `gpxil info`", file=sys.stderr)
+        print(f"note: {summary['conflicts']} conflicting overlapping calls (later record kept); see `gpxil info --json`", file=sys.stderr)
+    n = summary.get("ref_mismatches") or 0
+    if n:
+        # (the usual cause: a VCF called against another reference, such as GRCh37 on GRCh38)
+        what = "record's REF allele doesn't" if n == 1 else "records' REF alleles don't"
+        print(
+            f"note: {n:,} {what} match the reference: was the VCF called against another one?"
+            " `gpxil info --json` lists the first for each contig",
+            file=sys.stderr,
+        )
     return 0
 
 

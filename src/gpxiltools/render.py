@@ -82,7 +82,9 @@ class Rendering:
         from PIL import Image
 
         Image.MAX_IMAGE_PIXELS = None
-        im = Image.fromarray(self.index, mode="P")
+        h, w = self.index.shape
+        # (the indices as a palette image; Image.fromarray's mode argument is deprecated from Pillow 11.3)
+        im = Image.frombytes("P", (w, h), np.ascontiguousarray(self.index, dtype=np.uint8).tobytes())
         im.putpalette(self.rgb.reshape(-1).tolist())
         kw = {"optimize": False, "compress_level": 9}
         if dpi:
