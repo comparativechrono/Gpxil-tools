@@ -11,6 +11,7 @@
   so. CMYK: N is 90 % black in both. A book's page on how to read it names
   N's colour. Files are unchanged: palettes are rendering choices, so only
   the colour maps stored for image viewers in newly written files differ.
+- `gpxil palettes` lists N's colours with the bases'.
 
 ## 0.3.0 (27 October 2026)
 

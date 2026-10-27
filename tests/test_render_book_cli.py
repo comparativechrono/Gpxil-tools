@@ -82,6 +82,12 @@ def test_n_is_never_a_mixture():
     assert classic[C.BASE_C | C.BASE_T].tolist() == [128, 128, 128] and classic[C.BASE_N].tolist() == [32, 32, 32]
 
 
+def test_palettes_lists_n(capsys):
+    assert main(["palettes"]) == 0
+    out = capsys.readouterr().out
+    assert "N (32, 32, 32) / CMYK (0, 0, 0, 90)" in out and out.count(", N (") == len(PALETTES)
+
+
 def test_hilbert_properties():
     for k in (1, 3, 4):
         n = 1 << k
