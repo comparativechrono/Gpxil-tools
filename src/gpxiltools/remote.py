@@ -63,14 +63,32 @@ class RangeFile(io.RawIOBase):
         self.fetched += len(body)
         return status, body, content_range
 
+    def _head_size(self) -> int | None:
+        """The file's size from a HEAD request's Content-Length, or None."""
+        req = urllib.request.Request(self.url, headers=self.headers, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                n = r.headers.get("Content-Length")
+        except OSError:
+            return None
+        finally:
+            self.requests += 1
+        return int(n) if n and n.strip().isdigit() else None
+
     def _probe(self) -> int:
         status, body, content_range = self._get(0, self.block - 1)
-        if status == 206 and content_range:
-            m = _CONTENT_RANGE.match(content_range)
+        if status == 206:
+            m = _CONTENT_RANGE.match(content_range or "")
             if m and m.group(3) != "*":
                 size = int(m.group(3))
-                self._cache[0] = body
-                return size
+            else:
+                # a range answered without the file's size, as a browser shows a range from another web site
+                # (Content-Range is hidden unless the server exposes it): the size from a HEAD request instead
+                size = self._head_size()
+                if size is None:
+                    raise OSError(f"{self.url}: the server answered a range request but didn't say how big the file is")
+            self._cache[0] = body
+            return size
         if status == 200:  # the server sent the whole file: fine if it is small
             if len(body) > WHOLE_FILE_LIMIT:
                 raise OSError(f"{self.url}: the server does not answer range requests, and the file is too big to download whole")

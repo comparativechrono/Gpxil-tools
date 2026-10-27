@@ -27,6 +27,11 @@ needs them. Files written by 0.2.0 and 0.3.0 are the same.
   without it.
 - `gpxil fasta` writes to consoles whose `sys.stdout` has no byte buffer
   (notebooks, the browser).
+- A server whose range answers don't say the file's size (as a browser shows
+  a range from another web site, hiding `Content-Range`) is asked for it with
+  a HEAD request.
+- PNG pictures are written without `Image.fromarray(…, mode=…)`, which
+  Pillow 11.3 deprecates.
 
 ## 0.2.0 (27 October 2026)
 
