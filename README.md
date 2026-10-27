@@ -49,9 +49,19 @@ gpxil book HG002.gpxil.tif -o proof.pdf --max-pages 10 --rgb
 # back to sequences and VCF
 gpxil fasta HG002.gpxil.tif --which 1 --region chr21:5,000,001-6,000,000 -o hap1.fa
 gpxil vcf HG002.gpxil.tif -o HG002.from-gpxil.vcf
+gpxil vcf HG002.gpxil.tif --region chr17:7,661,779-7,687,538 -o TP53.vcf
 
-# a file written with --no-ref holds only the sample; give the reference back
+# a file written with --no-ref holds only the sample; give the reference back,
+# as a FASTA or as a gpxil file (which is then read a region at a time)
 gpxil vcf HG002.noref.gpxil.tif --reference GRCh38.fa.gz -o HG002.from-gpxil.vcf
+gpxil fasta HG002.noref.gpxil.tif --reference GRCh38.gpxil.tif --region chr21:5,000,001-5,001,000
+
+# files on the web are read with range requests, a strip at a time: here the
+# Gpxil browser's GRCh38, used without downloading it
+G=https://comparativechrono.github.io/Gpxil-browser/data/grch38/gpxil
+gpxil info $G/chr17.gpxil.tif
+gpxil fasta $G/chr17.gpxil.tif --region chr17:7,668,402-7,668,461
+gpxil encode $G/chr21.gpxil.tif -v HG002_chr21.vcf.gz -o HG002_chr21.gpxil.tif   # a gpxil file as the reference
 
 gpxil palettes
 ```
@@ -97,6 +107,18 @@ gc = np.isin(base, (codes.BASE_C, codes.BASE_G))
 acgt = np.isin(base, codes.HAP_SUB_CODES)
 gc_map = block_reduce(gc, (8, 64), np.sum) / np.maximum(block_reduce(acgt, (8, 64), np.sum), 1)
 ```
+
+A URL or an open binary file works wherever a path does:
+`GpxilFile("https://…/chr17.gpxil.tif")` downloads only what is read
+(`gpxiltools.remote.RangeFile` does the range requests, a block at a time,
+and keeps the recent blocks), and `GpxilFile(io.BytesIO(data))` reads from
+memory.
+
+gpxiltools also runs in the browser, in Pyodide (Python compiled to
+WebAssembly), as it does in [GpxilStudio](https://github.com/comparativechrono/GpxilStudio):
+`micropip.install("gpxiltools")` leaves out imagecodecs, which Pyodide does
+not have and which only Zstandard, LZW and PackBits need. Deflate, the
+default compression, needs nothing but Python.
 
 Writing a file directly, including your own planes:
 

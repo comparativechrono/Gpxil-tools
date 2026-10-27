@@ -210,16 +210,20 @@ class _Planes:
         self.ins_any = (self.flags & (C.FLAG_INS1 | C.FLAG_INS2)) != 0
 
 
-def _chunked_windows(contig: Contig, chunk: int) -> Iterator[tuple[_Planes, list[tuple[int, int]]]]:
+def _chunked_windows(
+    contig: Contig, chunk: int, begin: int = 0, stop: int | None = None
+) -> Iterator[tuple[_Planes, list[tuple[int, int]]]]:
     """Event windows chunk by chunk, each window wholly inside one loaded chunk.
 
     A chunk starts one base early (the anchor of a deletion at its first
     base) and grows while its last window reaches its last base, so no
-    window is ever cut.
+    window is ever cut. ``begin`` must not fall inside a window (see
+    :func:`_safe_start`); chunks are read until one reaches ``stop``.
     """
     n = contig.length
-    start = 0
-    while start < n:
+    stop = n if stop is None else stop
+    start = begin
+    while start < stop:
         end = min(n, start + chunk)
         while True:
             lo = max(0, start - 1)
@@ -231,6 +235,25 @@ def _chunked_windows(contig: Contig, chunk: int) -> Iterator[tuple[_Planes, list
             break
         yield p, [(a + lo, b + lo) for a, b in wins if a + lo >= start - 1]
         start = end
+
+
+def _safe_start(contig: Contig, pos: int) -> int:
+    """A position at or before ``pos`` where no event window is cut, so a scan can begin there.
+
+    A window cut by the start of a scan shows up as a window at its first
+    base, so the scan goes back until the first window it finds starts
+    later (or the contig starts).
+    """
+    pad = 1024
+    while True:
+        lo = max(0, pos - pad)
+        if lo == 0:
+            return 0
+        p = _Planes(contig, lo, min(contig.length, pos + 1))
+        wins = event_windows(p.h[0], p.h[1], p.ins_any)
+        if not wins or wins[0][0] > 0:
+            return lo
+        pad *= 4
 
 
 def _record(contig: Contig, chrom: str, p: _Planes, a0: int, b0: int, ins: list[dict[int, str]], complex_data: dict) -> str | None:
@@ -298,9 +321,11 @@ def _record(contig: Contig, chrom: str, p: _Planes, a0: int, b0: int, ins: list[
     return "\t".join([chrom, str(a0 + 1), ".", refseq, ",".join(alts) or ".", ".", filt, info, ":".join(fmt), ":".join(vals)])
 
 
-def _nocall_blocks(contig: Contig, chrom: str, windows: np.ndarray, chunk: int) -> Iterator[tuple[int, str]]:
-    """Runs of UNKNOWN outside event windows, as gVCF-style blocks."""
-    n = contig.length
+def _nocall_blocks(
+    contig: Contig, chrom: str, windows: np.ndarray, chunk: int, start: int = 0, end: int | None = None
+) -> Iterator[tuple[int, str]]:
+    """Runs of UNKNOWN outside event windows, as gVCF-style blocks (cut at ``start`` and ``end``)."""
+    n = contig.length if end is None else end
     ws, we = windows[:, 0], windows[:, 1]
     pending = None  # [code, start, ref base] of a run that may continue into the next chunk
 
@@ -313,7 +338,7 @@ def _nocall_blocks(contig: Contig, chrom: str, windows: np.ndarray, chunk: int) 
         filt = "gpxil_filtered" if code & 8 else "."
         return a, "\t".join([chrom, str(a + 1), ".", base, "<*>", ".", filt, f"END={b}", "GT", gt_str])
 
-    for cs in range(0, n, chunk):
+    for cs in range(start, n, chunk):
         ce = min(n, cs + chunk)
         ref_ascii = C.REF_TO_ASCII[np.bitwise_and(contig.read("ref", cs, ce), 0x0F)]
         gt = contig.read("gt", cs, ce)
@@ -356,8 +381,10 @@ def _nocall_blocks(contig: Contig, chrom: str, windows: np.ndarray, chunk: int) 
         yield emit(pending[0], pending[1], n, pending[2])
 
 
-def iter_vcf_records(contig: Contig, chrom: str | None = None, *, nocall_blocks: bool = True, chunk: int = CHUNK) -> Iterator[str]:
-    """Yield VCF body lines (no newline) describing the sample on this contig.
+def iter_vcf_records(
+    contig: Contig, chrom: str | None = None, *, nocall_blocks: bool = True, chunk: int = CHUNK, start: int = 0, end: int | None = None
+) -> Iterator[str]:
+    """Yield VCF body lines (no newline) describing the sample on this contig, or on ``[start, end)`` of it.
 
     One record per event window (see :func:`event_windows`): REF is the
     reference over the window and each haplotype contributes its sequence
@@ -368,10 +395,17 @@ def iter_vcf_records(contig: Contig, chrom: str | None = None, *, nocall_blocks:
     With ``nocall_blocks`` (the default), runs of UNKNOWN outside event
     windows are written as gVCF-style blocks (``ALT=<*>``, ``INFO/END``,
     ``GT=./.``) so that re-encoding the VCF restores them.
+
+    With a region, the records are those whose windows overlap it, exactly
+    as in the whole contig's VCF; no-call blocks are cut at its ends.
     """
     chrom = chrom or contig.name
     if not contig.has("gt"):
         return
+    end = contig.length if end is None else end
+    if not (0 <= start < end <= contig.length):
+        raise IndexError(f"{contig.name}:{start + 1}-{end} outside 1-{contig.length}")
+    begin = _safe_start(contig, start) if start > 0 else 0
     ins: list[dict[int, str]] = [{}, {}]
     complex_data: dict[tuple[int, int], str] = {}
     for ent in contig.sidecar():
@@ -381,8 +415,10 @@ def iter_vcf_records(contig: Contig, chrom: str | None = None, *, nocall_blocks:
             complex_data[(ent.offset, ent.hap)] = ent.data
     events: list[tuple[int, str]] = []
     windows: list[tuple[int, int]] = []
-    for p, wins in _chunked_windows(contig, chunk):
+    for p, wins in _chunked_windows(contig, chunk, begin, end):
         for a0, b0 in wins:
+            if b0 <= start or a0 >= end:
+                continue
             windows.append((a0, b0))
             line = _record(contig, chrom, p, a0, b0, ins, complex_data)
             if line is not None:
@@ -393,14 +429,30 @@ def iter_vcf_records(contig: Contig, chrom: str | None = None, *, nocall_blocks:
             yield line
         return
     warr = np.array(windows, dtype=np.int64).reshape(-1, 2)
-    for _, line in heapq.merge(events, _nocall_blocks(contig, chrom, warr, chunk), key=lambda t: t[0]):
+    for _, line in heapq.merge(events, _nocall_blocks(contig, chrom, warr, chunk, start, end), key=lambda t: t[0]):
         yield line
 
 
-def write_vcf(gfile, out: io.TextIOBase, contigs: list[str] | None = None, *, nocall_blocks: bool = True) -> int:
-    """Write the sample in a gpxil file as VCF. Returns the number of records."""
+def write_vcf(
+    gfile,
+    out: io.TextIOBase,
+    contigs: list[str] | None = None,
+    *,
+    nocall_blocks: bool = True,
+    regions: list[tuple[str, int, int | None]] | None = None,
+) -> int:
+    """Write the sample in a gpxil file as VCF. Returns the number of records.
+
+    ``regions`` are (contig, start, end) with 0-based, half-open coordinates
+    (end None for the rest of the contig); they replace ``contigs``.
+    """
     meta = gfile.metadata
-    names = list(dict.fromkeys(gfile[n].name for n in (contigs or gfile.contigs)))  # canonical names, also for aliases
+    if regions:
+        regions = [(gfile[n].name, s, gfile[n].length if e is None else e) for n, s, e in regions]
+        names = list(dict.fromkeys(n for n, _, _ in regions))
+    else:
+        names = list(dict.fromkeys(gfile[n].name for n in (contigs or gfile.contigs)))  # canonical names, also for aliases
+        regions = [(n, 0, gfile[n].length) for n in names]
     contig_lines = "".join(f"##contig=<ID={n},length={gfile[n].length}>\n" for n in names)
     sample = gfile.sample_id or "SAMPLE"
     ref = meta.get("reference", {}) or {}
@@ -413,8 +465,8 @@ def write_vcf(gfile, out: io.TextIOBase, contigs: list[str] | None = None, *, no
         )
     )
     count = 0
-    for name in names:
-        for line in iter_vcf_records(gfile[name], nocall_blocks=nocall_blocks):
+    for name, s, e in regions:
+        for line in iter_vcf_records(gfile[name], nocall_blocks=nocall_blocks, start=s, end=e):
             out.write(line + "\n")
             count += 1
     return count

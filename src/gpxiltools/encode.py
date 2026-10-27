@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable
 import numpy as np
 
 from .container import DEFAULT_COMPRESSION, DEFAULT_WIDTH, BigTiffNeeded, GpxilWriter, check_contig_name
-from .fasta import iter_fasta, sequence_digests
+from .fasta import FastaRecord, iter_fasta, sequence_digests
 from .palettes import DEFAULT_PALETTE
 from .vcf import TempSplit, encode_calls, load_bed, read_header
 
@@ -68,6 +68,40 @@ def male_haploid_mask(name: str, length: int) -> np.ndarray | None:
     return mask
 
 
+def reference_records(path, *, invalid: str = "error", wanted: Callable[[str], bool] | None = None):
+    """The reference's sequences, one :class:`FastaRecord` per contig.
+
+    ``path`` is a FASTA file, or a gpxil file (a path or URL) whose reference
+    plane is read contig by contig; with ``wanted``, a gpxil file's contigs
+    that it rejects (by name or alias) are skipped without being read.
+    """
+    from .container import GpxilFile, GpxilFormatError, is_tiff
+
+    if not is_tiff(path):
+        yield from iter_fasta(path, invalid=invalid)
+        return
+    with GpxilFile(path) as g:
+        for c in g:
+            names = [c.name, *c.entry.get("aliases", [])]
+            if wanted is not None and not any(wanted(n) for n in names):
+                continue
+            if "ref" not in c.pages:
+                raise GpxilFormatError(f"{path}: {c.name} has no reference plane, so it cannot be a reference")
+            yield FastaRecord(name=c.name, description="", codes=c.read("ref"))
+
+
+def _reference_meta(path, reference_name: str | None) -> dict:
+    from .container import GpxilFile, is_tiff
+    from .remote import is_url
+
+    base = path.rstrip("/").rsplit("/", 1)[-1] if is_url(path) else os.path.basename(str(path))
+    if is_tiff(path):
+        with GpxilFile(path) as g:
+            ref = g.metadata.get("reference") or {}
+        return {"name": reference_name or ref.get("name") or base.split(".")[0], "source": ref.get("source") or base, "via": base}
+    return {"name": reference_name or base.split(".fa")[0], "source": base}
+
+
 def encode(
     fasta: str | os.PathLike,
     out: str | os.PathLike,
@@ -93,7 +127,8 @@ def encode(
 ) -> dict:
     """Encode a reference FASTA, optionally with one sample's VCF, into a gpxil file.
 
-    Returns a summary dict (also stored in the file's metadata). With
+    The reference can also be a gpxil file (a path or URL) with the
+    reference plane, such as the Gpxil browser's GRCh38 files. Returns a summary dict (also stored in the file's metadata). With
     ``bigtiff=None`` the file is classic TIFF unless it would pass 4 GiB, in
     which case the encode restarts as BigTIFF. On any error the partial
     output is removed.
@@ -199,10 +234,7 @@ def _encode_once(
             "haploid_regions": _haploid_description(haploid_bed, haploid_contigs, sex),
             "sex": sex,
         }
-    ref_meta = {
-        "name": reference_name or os.path.basename(str(fasta)).split(".fa")[0],
-        "source": os.path.basename(str(fasta)),
-    }
+    ref_meta = _reference_meta(fasta, reference_name)
     totals: dict = {"contigs": 0, "bases": 0, "records": 0, "conflicts": 0, "ref_mismatches": 0, "skipped": 0}
     used_vcf: set[str] = set()
     t0 = time.time()
@@ -210,7 +242,12 @@ def _encode_once(
         out, width=width, compression=compression, level=level, palette=palette, reference=ref_meta, sample=sample_meta, bigtiff=bigtiff
     )
     try:
-        for rec in iter_fasta(fasta, invalid=invalid):
+
+        def wanted(n: str) -> bool:
+            u = ucsc_name(n) if ucsc_names else n
+            return contigs is None or bool({n, u, *contig_aliases(u)} & contigs)
+
+        for rec in reference_records(fasta, invalid=invalid, wanted=wanted):
             name = ucsc_name(rec.name) if ucsc_names else rec.name
             if contigs is not None and not (name in contigs or rec.name in contigs or any(a in contigs for a in contig_aliases(name))):
                 continue
@@ -288,10 +325,10 @@ def _encode_once(
                 + f"  [{time.time() - t0:.0f}s]"
             )
         if split is not None:
-            unused = [c for c in vcf_contigs if c not in used_vcf]
+            unused = [c for c in vcf_contigs if c not in used_vcf and wanted(c)]  # contigs left out by --contigs are not news
             if unused:
                 totals["vcf_contigs_without_reference"] = unused
-                log(f"  note: VCF contigs not in the FASTA (skipped): {', '.join(unused[:10])}")
+                log(f"  note: VCF contigs not in the reference (skipped): {', '.join(unused[:10])}")
             if not any("gt" in c.pages for c in writer.contigs):
                 # a file without genotype planes describes no sample (spec 9.1)
                 writer.sample = None

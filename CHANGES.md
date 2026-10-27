@@ -1,5 +1,33 @@
 # Changes
 
+## 0.3.0 (unreleased)
+
+For big files, files on the web and Python in the browser, as GpxilStudio
+needs them. Files written by 0.2.0 and 0.3.0 are the same.
+
+- **Files on web servers.** `GpxilFile("https://…")`, and every command
+  (`gpxil info https://…`), reads a file on a web server with HTTP range
+  requests, fetching only the strips that a region needs
+  (`gpxiltools.remote.RangeFile`). A server that does not answer range
+  requests is used only for small files.
+- **File objects.** `GpxilFile` also takes an open binary file, such as
+  `io.BytesIO`.
+- **A gpxil file as the reference.** `gpxil encode` takes a gpxil file (path
+  or URL) with the reference plane in place of the FASTA, reading only the
+  contigs it encodes; the file records where the reference came from
+  (`reference.via`). `--reference` and `GpxilFile(..., reference=...)` take
+  one for files written with `--no-ref`, and read just the regions needed,
+  after checking the digests.
+- **`gpxil vcf --region`** (repeatable): the records whose windows overlap the
+  region, exactly as in the whole contig's VCF (a deletion that starts before
+  the region is written whole); no-call blocks are cut at the region's ends.
+- **imagecodecs** is no longer installed in Pyodide, which has no build of it.
+  Only Zstandard, LZW and PackBits need it; a missing codec is now reported
+  plainly when writing or reading, and the tests of those codecs are skipped
+  without it.
+- `gpxil fasta` writes to consoles whose `sys.stdout` has no byte buffer
+  (notebooks, the browser).
+
 ## 0.2.0 (27 October 2026)
 
 Fixes from a review of 0.1.0 against the specification, each with a

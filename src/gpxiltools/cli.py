@@ -27,8 +27,26 @@ def _region(text: str | None):
     return name, s - 1, e
 
 
+class _TextAsBytes:
+    """Bytes written to a text stream: for consoles whose sys.stdout has no .buffer (notebooks, the browser)."""
+
+    def __init__(self, text):
+        self._text = text
+
+    def write(self, data: bytes) -> int:
+        self._text.write(data.decode("utf-8"))
+        return len(data)
+
+    def flush(self) -> None:
+        self._text.flush()
+
+
+def _stdout_bytes():
+    return getattr(sys.stdout, "buffer", None) or _TextAsBytes(sys.stdout)
+
+
 def _open(a):
-    """Open the input file, with the reference FASTA for files written with --no-ref."""
+    """Open the input file, with the reference (FASTA or gpxil) for files written with --no-ref."""
     from .container import GpxilFile
 
     return GpxilFile(a.file, reference=getattr(a, "reference", None))
@@ -161,7 +179,7 @@ def cmd_book(a) -> int:
 def cmd_fasta(a) -> int:
     from .export import iter_genotype_iupac, iter_haplotype, iter_reference, write_fasta_stream
 
-    out = open(a.output, "wb") if a.output else sys.stdout.buffer
+    out = open(a.output, "wb") if a.output else _stdout_bytes()
     try:
         with _open(a) as g:
             if a.which != "ref" and not g.sample_id:
@@ -193,10 +211,12 @@ def cmd_fasta(a) -> int:
 def cmd_vcf(a) -> int:
     from .export import write_vcf
 
+    if a.contigs and a.region:
+        raise SystemExit("gpxil: error: give --contigs or --region, not both")
     out = open(a.output, "w") if a.output else sys.stdout
     try:
         with _open(a) as g:
-            n = write_vcf(g, out, a.contigs.split(",") if a.contigs else None, nocall_blocks=not a.no_nocall_blocks)
+            n = write_vcf(g, out, a.contigs.split(",") if a.contigs else None, nocall_blocks=not a.no_nocall_blocks, regions=a.region)
     finally:
         if a.output:
             out.close()
@@ -222,7 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     e = sub.add_parser("encode", help="FASTA (+ one sample's VCF) -> .gpxil.tif")
-    e.add_argument("fasta", help="reference FASTA (plain, gzip or bgzip)")
+    e.add_argument("fasta", help="reference FASTA (plain, gzip or bgzip), or a gpxil file (path or URL) with the reference plane")
     e.add_argument("-v", "--vcf", help="VCF/VCF.gz with the sample's calls")
     e.add_argument("-s", "--sample", help="sample column to use (default: first)")
     e.add_argument("-o", "--output", help="output path (default: <name>.gpxil.tif)")
@@ -244,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.set_defaults(fn=cmd_encode)
 
     i = sub.add_parser("info", help="summarise a gpxil file")
-    i.add_argument("file")
+    i.add_argument("file", help="a gpxil file: a path or a URL")
     i.add_argument("--json", action="store_true", help="print the full metadata")
     i.set_defaults(fn=cmd_info)
 
@@ -265,7 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--cmyk", action="store_true", help="CMYK TIFF for print")
     r.add_argument("--dpi", type=int, help="resolution to record in the image")
     r.add_argument("--mark-insertions", action="store_true", help="haplotypes mode: mark insertion anchors")
-    r.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
+    r.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file (path or URL), for files written with --no-ref")
     r.set_defaults(fn=cmd_render)
 
     b = sub.add_parser("book", help="print-ready PDF with one dot per base")
@@ -281,7 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--margin", type=float, default=15.0, help="page margin in mm")
     b.add_argument("--title")
     b.add_argument("--max-pages", type=int, help="stop after this many pages (for proofs)")
-    b.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
+    b.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file (path or URL), for files written with --no-ref")
     b.set_defaults(fn=cmd_book)
 
     f = sub.add_parser("fasta", help="export reference, haplotype or IUPAC-genotype sequence")
@@ -289,15 +309,16 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--which", choices=["ref", "1", "2", "iupac"], default="ref", help="ref, haplotype 1, haplotype 2 or IUPAC genotype")
     f.add_argument("--region", type=_region)
     f.add_argument("-o", "--output")
-    f.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
+    f.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file (path or URL), for files written with --no-ref")
     f.set_defaults(fn=cmd_fasta)
 
     x = sub.add_parser("vcf", help="export the sample's genotypes as VCF")
     x.add_argument("file")
     x.add_argument("-o", "--output")
-    x.add_argument("--contigs")
+    x.add_argument("--contigs", help="comma-separated contigs (default: all)")
+    x.add_argument("--region", type=_region, action="append", help="CONTIG or CONTIG:START-END (1-based, inclusive); repeatable")
     x.add_argument("--no-nocall-blocks", action="store_true", help="omit no-call blocks (ALT=<*>)")
-    x.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
+    x.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file (path or URL), for files written with --no-ref")
     x.set_defaults(fn=cmd_vcf)
 
     pl = sub.add_parser("palettes", help="list the built-in palettes")
