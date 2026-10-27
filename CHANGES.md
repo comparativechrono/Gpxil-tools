@@ -32,6 +32,9 @@ needs them. Files written by 0.2.0 and 0.3.0 are the same.
   a HEAD request.
 - PNG pictures are written without `Image.fromarray(…, mode=…)`, which
   Pillow 11.3 deprecates.
+- `gpxil encode` notes how many records' REF alleles don't match the
+  reference, which is what a VCF called against another reference (GRCh37 on
+  GRCh38) looks like. The count was in the metadata only.
 
 ## 0.2.0 (27 October 2026)
 
