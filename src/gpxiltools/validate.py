@@ -21,6 +21,8 @@ from .container import (
     STANDARD_PLANES,
     GpxilFile,
     GpxilFormatError,
+    _asarray,
+    _decode,
     decode_sidecar,
     rows_for,
     sort_planes,
@@ -165,12 +167,12 @@ def _padding_ok(page, length: int, width: int) -> bool:
     if tail == 0:
         return True
     if page.is_tiled or page.rowsperstrip <= 0:
-        return not page.asarray().reshape(-1)[length:].any()
+        return not _asarray(page).reshape(-1)[length:].any()
     rps = page.rowsperstrip
     s = (rows - 1) // rps
     fh = page.parent.filehandle
     fh.seek(page.dataoffsets[s])
-    seg, _, _ = page.decode(fh.read(page.databytecounts[s]), s)
+    seg, _, _ = _decode(page, fh.read(page.databytecounts[s]), s)
     flat = np.asarray(seg).reshape(-1)
     last = (rows - 1 - s * rps) * width
     return not flat[last + width - tail : last + width].any()

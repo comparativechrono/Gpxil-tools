@@ -44,6 +44,10 @@ def test_encoding_the_example_reproduces_it(tmp_path):
 
 @pytest.mark.parametrize("compression", ["zstd", "lzw", "none"])
 def test_example_independent_of_compression(tmp_path, compression):
+    from gpxiltools.container import codec_available
+
+    if not codec_available(compression):
+        pytest.skip(f"{compression} needs imagecodecs, which this Python does not have")
     out = tmp_path / f"c-{compression}.gpxil.tif"
     encode(
         os.path.join(DATA, "worked-example.fa"),

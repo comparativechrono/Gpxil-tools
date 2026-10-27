@@ -22,7 +22,8 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "tifffile>=2023.7.10",
-    "imagecodecs>=2023.1.23",
+    # Zstandard, LZW and PackBits; deflate, the default, needs only Python. Pyodide (Python in the browser) has no build of it.
+    "imagecodecs>=2023.1.23; sys_platform != 'emscripten'",
     "Pillow>=10.0",
     "jsonschema>=4",
 ]

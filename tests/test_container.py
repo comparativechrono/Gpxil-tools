@@ -17,6 +17,10 @@ def _codes(n, seed=0):
 
 @pytest.mark.parametrize("compression", ["deflate", "zstd", "lzw", "none"])
 def test_write_read_region_access(tmp_path, compression):
+    from gpxiltools.container import codec_available
+
+    if not codec_available(compression):
+        pytest.skip(f"{compression} needs imagecodecs, which this Python does not have")
     a, b = _codes(100_003, 1), _codes(5_000, 2)
     gt = np.zeros(100_003, dtype=np.uint8)
     gt[[10, 99_999]] = [0x04, 0x44]

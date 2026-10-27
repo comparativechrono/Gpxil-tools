@@ -10,6 +10,8 @@ ImageDescription.
 from __future__ import annotations
 
 import datetime as _dt
+import functools
+import io
 import json
 import math
 import os
@@ -24,6 +26,7 @@ import tifffile
 from . import __version__
 from . import codes as C
 from .palettes import DEFAULT_PALETTE, flags_view_colours, gt_view_colours, ref_colours, tiff_colormap
+from .remote import RangeFile, is_url
 from .vcf import SidecarEntry
 
 FORMAT_VERSION = "0.1"
@@ -53,6 +56,64 @@ COMPRESSIONS = {
 DEFAULT_COMPRESSION = "deflate"
 DEFAULT_WIDTH = 8192
 DEFAULT_STRIP_BYTES = 1 << 18
+
+
+TIFF_MAGIC = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+
+
+@functools.cache
+def codec_available(compression: str) -> bool:
+    """True if this Python can write and read the compression.
+
+    Deflate (the default), LZMA and no compression need only Python itself;
+    Zstandard, LZW and PackBits need the imagecodecs package (Zstandard also
+    works on Python 3.14 and later), which is not available everywhere, for
+    example in Pyodide in a web browser.
+    """
+    codec, _ = COMPRESSIONS[compression]
+    if codec is None:
+        return True
+    buf = io.BytesIO()
+    try:
+        tifffile.imwrite(buf, np.zeros((1, 1), dtype=np.uint8), compression=codec)
+        buf.seek(0)
+        tifffile.imread(buf)
+    except Exception:
+        return False
+    return True
+
+
+def _codec_error(page, exc: Exception) -> GpxilFormatError:
+    """A missing codec, said plainly (tifffile raises KeyError or ImportError)."""
+    comp = getattr(getattr(page, "compression", None), "name", "this compression")
+    return GpxilFormatError(
+        f"the file is compressed with {comp}, which this Python cannot decode: install imagecodecs (pip install imagecodecs) ({exc})"
+    )
+
+
+def _decode(page, data: bytes, index: int):
+    try:
+        return page.decode(data, index)
+    except (KeyError, ImportError) as exc:
+        raise _codec_error(page, exc) from None
+
+
+def _asarray(page) -> np.ndarray:
+    try:
+        return page.asarray()
+    except (KeyError, ImportError) as exc:
+        raise _codec_error(page, exc) from None
+
+
+def is_tiff(path) -> bool:
+    """True for a URL ending in .tif/.tiff, or a local file that starts with a TIFF header (a gpxil file, not FASTA)."""
+    if is_url(path):
+        return path.lower().split("?", 1)[0].endswith((".tif", ".tiff"))
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) in TIFF_MAGIC
+    except OSError:
+        return False
 
 
 CLASSIC_TIFF_LIMIT = (1 << 32) - (1 << 26)  #: stay 64 MiB clear of the 4 GiB classic-TIFF offset limit
@@ -173,6 +234,11 @@ class GpxilWriter:
     ):
         if compression not in COMPRESSIONS:
             raise ValueError(f"unknown compression {compression!r}; choose from {', '.join(COMPRESSIONS)}")
+        if not codec_available(compression):
+            raise GpxilFormatError(
+                f"{compression} compression needs the imagecodecs package, which this Python does not have "
+                "(pip install imagecodecs), or use deflate, the default"
+            )
         if width < 1:
             raise ValueError("width must be positive")
         self.path = os.fspath(path)
@@ -368,11 +434,34 @@ class Contig:
         return list(self.pages)
 
     def has(self, plane: str) -> bool:
-        """True if the plane is stored, or is ``ref`` and a reference FASTA is attached."""
+        """True if the plane is stored, or is ``ref`` and a reference (FASTA or gpxil) is attached."""
         return plane in self.pages or (plane == "ref" and self._g._reference_path is not None)
+
+    def _reference_contig(self) -> Contig:
+        """The matching contig of an attached gpxil reference, checked against this contig's digests."""
+        cached = self._g._ref_contigs.get(self.name)
+        if cached is not None:
+            return cached
+        ref = self._g._reference_gpxil()
+        for n in (self.name, *self.entry.get("aliases", [])):
+            for cand in (n, "chr" + n, n.removeprefix("chr")):
+                if cand in ref:
+                    rc = ref[cand]
+                    if rc.length != self.length:
+                        raise GpxilFormatError(f"{rc.name} in {ref.path} has length {rc.length}, not {self.length}")
+                    if "ref" not in rc.pages:
+                        raise GpxilFormatError(f"{rc.name} in {ref.path} has no reference plane either")
+                    for k in ("md5", "refget"):
+                        if k in self.entry and k in rc.entry and self.entry[k] != rc.entry[k]:
+                            raise GpxilFormatError(f"{rc.name} in {ref.path} does not match the {k} of {self.name}")
+                    self._g._ref_contigs[self.name] = rc
+                    return rc
+        raise GpxilFormatError(f"{self.name} not found in {ref.path}")
 
     def _external_ref(self) -> np.ndarray:
         """The reference of a contig stored without a ref plane, from the attached FASTA."""
+        if self._g._reference_is_gpxil:
+            return self._reference_contig().read("ref")
         cached = self._g._ref_cache
         if cached is not None and cached[0] == self.name:
             return cached[1]
@@ -404,7 +493,7 @@ class Contig:
 
     def image(self, plane: str) -> np.ndarray:
         """The plane as stored: a 2-D (rows, width) raster including padding."""
-        return self._page(plane).asarray()
+        return _asarray(self._page(plane))
 
     def read(self, plane: str, start: int = 0, end: int | None = None) -> np.ndarray:
         """Per-base values of ``plane`` for positions ``[start, end)`` (0-based)."""
@@ -412,6 +501,8 @@ class Contig:
         if not (0 <= start <= end <= self.length):
             raise IndexError(f"{self.name}:{start}-{end} outside 0-{self.length}")
         if plane == "ref" and "ref" not in self.pages and self._g._reference_path is not None:
+            if self._g._reference_is_gpxil:  # read just the region from the reference file
+                return self._reference_contig().read("ref", start, end)
             return self._external_ref()[start:end].copy()
         page = self._page(plane)
         if start == end:
@@ -419,7 +510,7 @@ class Contig:
         w = self.width
         r0, r1 = start // w, (end - 1) // w + 1
         if page.is_tiled or page.rowsperstrip <= 0:
-            flat = page.asarray().reshape(-1)
+            flat = _asarray(page).reshape(-1)
             return flat[start:end].copy()
         rps = page.rowsperstrip
         s0, s1 = r0 // rps, (r1 - 1) // rps + 1
@@ -428,7 +519,7 @@ class Contig:
         for s in range(s0, s1):
             fh.seek(page.dataoffsets[s])
             data = fh.read(page.databytecounts[s])
-            seg, _, _ = page.decode(data, s)
+            seg, _, _ = _decode(page, data, s)
             nrows = min(rps, self.rows - s * rps)
             chunks.append(np.asarray(seg).reshape(-1)[: nrows * w])
         flat = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
@@ -450,30 +541,52 @@ class Contig:
 
 
 class GpxilFile:
-    """An open gpxil file.
+    """An open gpxil file: a path, a URL (read with HTTP range requests) or a binary file object.
 
     >>> with GpxilFile("HG002.gpxil.tif") as g:
     ...     chr21 = g["chr21"]
     ...     gt = chr21.read("gt", 5_000_000, 5_010_000)
+
+    ``reference`` is a FASTA file, or a gpxil file (path or URL) with the
+    reference plane, for files written without one (``--no-ref``).
     """
 
     def __init__(self, path, reference=None):
-        self.path = os.fspath(path)
-        self._reference_path = None if reference is None else os.fspath(reference)
+        self._fh = None
+        if hasattr(path, "read") and hasattr(path, "seek"):
+            self.path = str(getattr(path, "name", None) or "<file object>")
+            source = path
+        elif is_url(path):
+            self.path = path
+            source = self._fh = RangeFile(path)
+        else:
+            self.path = os.fspath(path)
+            source = self.path
+        self._reference_path = None
+        self._reference_is_gpxil = False
+        self._ref_file: GpxilFile | None = None
+        self._ref_contigs: dict[str, Contig] = {}
         self._ref_cache: tuple[str, np.ndarray] | None = None
-        self._tf = tifffile.TiffFile(self.path)
+        if reference is not None:
+            self.attach_reference(reference)
+        try:
+            self._tf = tifffile.TiffFile(source)
+        except Exception:
+            if self._fh is not None:
+                self._fh.close()
+            raise
         try:
             desc = self._tf.pages[0].description
             meta = json.loads(desc)
         except Exception as exc:
-            self._tf.close()
+            self.close()
             raise GpxilFormatError(f"{self.path}: first page has no gpxil JSON metadata") from exc
         if not isinstance(meta, dict) or "gpxil" not in meta or "contigs" not in meta:
-            self._tf.close()
+            self.close()
             raise GpxilFormatError(f"{self.path}: not a gpxil file (no 'gpxil'/'contigs' keys in metadata)")
         major = str(meta["gpxil"]).split(".")[0]
         if major != FORMAT_VERSION.split(".")[0]:
-            self._tf.close()
+            self.close()
             raise GpxilFormatError(f"{self.path}: gpxil version {meta['gpxil']} not supported by this reader")
         self.metadata: dict = meta
         self._contigs = {e["name"]: Contig(self, e) for e in meta["contigs"]}
@@ -490,6 +603,11 @@ class GpxilFile:
 
     def close(self) -> None:
         self._tf.close()
+        if self._fh is not None:
+            self._fh.close()
+        if self._ref_file is not None:
+            self._ref_file.close()
+            self._ref_file = None
 
     def __repr__(self) -> str:
         return f"<GpxilFile {self.path} contigs={len(self._contigs)} sample={self.sample_id}>"
@@ -498,10 +616,24 @@ class GpxilFile:
     def contigs(self) -> list[str]:
         return list(self._contigs)
 
-    def attach_reference(self, fasta) -> None:
-        """Use a FASTA for contigs stored without a ref plane (checked against their digests)."""
-        self._reference_path = os.fspath(fasta)
+    def attach_reference(self, reference) -> None:
+        """Use a reference for contigs stored without a ref plane, checked against their digests.
+
+        ``reference`` is a FASTA file, or a gpxil file (path or URL) whose
+        reference plane is then read region by region.
+        """
+        self._reference_path = reference if is_url(reference) else os.fspath(reference)
+        self._reference_is_gpxil = is_tiff(self._reference_path)
+        if self._ref_file is not None:
+            self._ref_file.close()
+        self._ref_file = None
+        self._ref_contigs = {}
         self._ref_cache = None
+
+    def _reference_gpxil(self) -> GpxilFile:
+        if self._ref_file is None:
+            self._ref_file = GpxilFile(self._reference_path)
+        return self._ref_file
 
     @property
     def sample_id(self) -> str | None:
