@@ -265,7 +265,7 @@ def make_book(
         "Pale dots are soft-masked repeats in the reference." if pal.softmask_fade else "",
         "Where the two inherited copies differ (heterozygous), the dot mixes both colours." if mode == "genotype" else "",
         "Each row of bases is drawn twice: the copy from one parent above the other." if mode == "haplotypes" else "",
-        "Grey dots are unknown: gaps in the reference (N), or bases not confidently called in this genome.",
+        f"{pal.n_word.capitalize()} dots are unknown: gaps in the reference (N), or bases not confidently called in this genome.",
         "White space is where a base is missing (deleted on both copies, or past the end of a chromosome).",
     ]
     for line in [t for t in lines if t]:

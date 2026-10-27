@@ -56,6 +56,32 @@ def test_all_palettes_complete():
         assert rgb.shape == (256, 3) and cmyk.shape == (256, 4)
 
 
+def _lab(rgb):
+    """sRGB (0-255) to CIELAB (D65)"""
+    c = np.asarray(rgb, float) / 255
+    c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    xyz = c @ np.array([[0.4124, 0.2126, 0.0193], [0.3576, 0.7152, 0.1192], [0.1805, 0.0722, 0.9505]])
+    xyz = xyz / np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 216 / 24389, np.cbrt(xyz), (24389 / 27 * xyz + 16) / 116)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
+
+
+def test_n_is_never_a_mixture():
+    # N (not known) must not look like any base or mixture, faded or not: in the classic palette a mid-grey N was
+    # exactly the mean of C (blue) and T (yellow), so heterozygous C/T sites read as unknown
+    for name, pal in PALETTES.items():
+        rgb, cmyk = ref_colours(name)
+        n = rgb[C.BASE_N]
+        assert (rgb[C.BASE_N | C.SOFTMASK] == n).all() and (cmyk[C.BASE_N | C.SOFTMASK] == cmyk[C.BASE_N]).all()  # not faded
+        others = [k for k in range(32) if k & 15 != C.BASE_N]
+        assert not any((rgb[k] == n).all() for k in others), name
+        if pal.mix == "mean":  # (clearly apart: CIE76 colour difference)
+            dist = min(float(np.linalg.norm(_lab(rgb[k]) - _lab(n))) for k in others)
+            assert dist > 20, f"{name}: N is only {dist:.1f} from another code"
+    classic, _ = ref_colours("classic")
+    assert classic[C.BASE_C | C.BASE_T].tolist() == [128, 128, 128] and classic[C.BASE_N].tolist() == [32, 32, 32]
+
+
 def test_hilbert_properties():
     for k in (1, 3, 4):
         n = 1 << k
