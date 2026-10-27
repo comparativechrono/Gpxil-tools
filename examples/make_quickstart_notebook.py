@@ -1,6 +1,6 @@
 """Generate examples/quickstart.ipynb (run from the repository root).
 
-    python examples/make_quickstart_notebook.py [--execute]
+python examples/make_quickstart_notebook.py [--execute]
 """
 
 import sys
@@ -219,7 +219,9 @@ else's with the care you would give their VCF.
 """
 )
 
-nb = nbf.v4.new_notebook(cells=cells, metadata={"kernelspec": {"name": "python3", "display_name": "Python 3"}, "language_info": {"name": "python"}})
+nb = nbf.v4.new_notebook(
+    cells=cells, metadata={"kernelspec": {"name": "python3", "display_name": "Python 3"}, "language_info": {"name": "python"}}
+)
 
 if __name__ == "__main__":
     path = "examples/quickstart.ipynb"

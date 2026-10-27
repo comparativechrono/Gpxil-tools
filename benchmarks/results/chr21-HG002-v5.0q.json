@@ -321,9 +321,9 @@
     },
     {
       "name": "gpxil gt + flags planes + sidecar, deflate 9",
-      "bytes": 677021,
+      "bytes": 677032,
       "bits_per_base": 0.116,
-      "encode_s": 4.32,
+      "encode_s": 4.55,
       "decode_s": null,
       "random_access_ms": null,
       "lossless": true,
@@ -331,9 +331,9 @@
     },
     {
       "name": "gpxil gt + flags planes + sidecar, zstd 19",
-      "bytes": 666885,
+      "bytes": 666896,
       "bits_per_base": 0.114,
-      "encode_s": 4.32,
+      "encode_s": 4.55,
       "decode_s": null,
       "random_access_ms": null,
       "lossless": true,
@@ -341,7 +341,7 @@
     },
     {
       "name": "gpxil gt + flags, deflate 9, outside-benchmark = UNKNOWN",
-      "bytes": 659085,
+      "bytes": 659096,
       "bits_per_base": 0.113,
       "encode_s": null,
       "decode_s": null,
@@ -369,7 +369,7 @@
       "positions_with_insertions": 7793,
       "deleted_vs_unknown_ambiguous": 341209,
       "phased_positions": 412392,
-      "het_positions_order_lost": 215993
+      "phased_positions_haplotypes_differ": 230576
     },
     "rgb_both_channels_collisions": {
       "(np.uint8(1), np.uint8(1), np.uint8(0))": [

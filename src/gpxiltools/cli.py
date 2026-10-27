@@ -27,6 +27,13 @@ def _region(text: str | None):
     return name, s - 1, e
 
 
+def _open(a):
+    """Open the input file, with the reference FASTA for files written with --no-ref."""
+    from .container import GpxilFile
+
+    return GpxilFile(a.file, reference=getattr(a, "reference", None))
+
+
 def cmd_encode(a) -> int:
     from .encode import encode
 
@@ -72,13 +79,18 @@ def cmd_info(a) -> int:
         print(f"reference: {ref.get('name')} ({ref.get('source')})")
         if g.sample_id:
             s = m["sample"]
-            print(f"sample: {s.get('id')} from {s.get('source')}" + (f", callable regions {s['callable_regions']}" if s.get("callable_regions") else ""))
+            print(
+                f"sample: {s.get('id')} from {s.get('source')}"
+                + (f", callable regions {s['callable_regions']}" if s.get("callable_regions") else "")
+            )
         print(f"layout: raster, width {m['layout']['width']}; palette {m.get('palette')}")
         print(f"{'contig':<16}{'length':>14}  {'planes':<24}{'records':>10}{'sidecar':>9}")
         for c in g:
             e = c.entry
             rec = e.get("encoding", {}).get("records", "")
-            print(f"{c.name:<16}{c.length:>14,}  {','.join(c.planes):<24}{rec if rec == '' else f'{rec:,}':>10}{e.get('sidecar_entries', 0):>9,}")
+            print(
+                f"{c.name:<16}{c.length:>14,}  {','.join(c.planes):<24}{rec if rec == '' else f'{rec:,}':>10}{e.get('sidecar_entries', 0):>9,}"
+            )
     return 0
 
 
@@ -90,17 +102,18 @@ def cmd_validate(a) -> int:
         print(f"warning: {w}")
     for e in rep.errors:
         print(f"error: {e}")
-    print(f"{a.file}: {'valid' if rep.ok else 'INVALID'} ({len(rep.checked)} contigs checked, {len(rep.errors)} errors, {len(rep.warnings)} warnings)")
+    print(
+        f"{a.file}: {'valid' if rep.ok else 'INVALID'} ({len(rep.checked)} contigs checked, {len(rep.errors)} errors, {len(rep.warnings)} warnings)"
+    )
     return 0 if rep.ok else 1
 
 
 def cmd_render(a) -> int:
-    from .container import GpxilFile
     from .layout import hilbert_image
     from .render import render
 
     name, start, end = a.region
-    with GpxilFile(a.file) as g:
+    with _open(a) as g:
         c = g[name]
         r = render(c, mode=a.mode, palette=a.palette, start=start, end=end, bases_per_row=a.width, mark_insertions=a.mark_insertions)
         if a.layout == "hilbert":
@@ -126,10 +139,9 @@ def cmd_render(a) -> int:
 
 def cmd_book(a) -> int:
     from .book import BookLayout, make_book
-    from .container import GpxilFile
 
     layout = BookLayout(page=a.page, dpi=a.dpi, margin_mm=a.margin, scale=a.scale)
-    with GpxilFile(a.file) as g:
+    with _open(a) as g:
         info = make_book(
             g,
             a.output,
@@ -147,26 +159,31 @@ def cmd_book(a) -> int:
 
 
 def cmd_fasta(a) -> int:
-    from .container import GpxilFile
-    from .export import genotype_iupac_sequence, haplotype_sequence
-    from .fasta import write_fasta
+    from .export import iter_genotype_iupac, iter_haplotype, iter_reference, write_fasta_stream
 
     out = open(a.output, "wb") if a.output else sys.stdout.buffer
     try:
-        with GpxilFile(a.file) as g:
+        with _open(a) as g:
+            if a.which != "ref" and not g.sample_id:
+                raise SystemExit(f"gpxil: error: {a.file} has no sample, so only --which ref can be exported")
             regions = [a.region] if a.region else [(n, 0, None) for n in g.contigs]
             for name, s, e in regions:
                 c = g[name]
                 e = c.length if e is None else e
+                if not (0 <= s < e <= c.length):
+                    raise SystemExit(f"gpxil: error: {name}:{s + 1}-{e} is outside {c.name} (length {c.length:,})")
+                if a.which != "ref" and not c.has("gt"):
+                    print(f"note: {c.name} has no genotype plane (no calls); skipped", file=sys.stderr)
+                    continue
                 if a.which == "ref":
-                    seq = c.sequence(s, e).encode()
+                    pieces = iter_reference(c, s, e)
                 elif a.which == "iupac":
-                    seq = genotype_iupac_sequence(c, s, e)
+                    pieces = iter_genotype_iupac(c, s, e)
                 else:
-                    seq = haplotype_sequence(c, int(a.which), s, e)
-                label = name if (s, e) == (0, c.length) else f"{name}:{s + 1}-{e}"
+                    pieces = iter_haplotype(c, int(a.which), s, e)
+                label = c.name if (s, e) == (0, c.length) else f"{c.name}:{s + 1}-{e}"
                 suffix = "" if a.which == "ref" else f"_{'iupac' if a.which == 'iupac' else 'hap' + a.which}"
-                write_fasta(out, label + suffix, seq)
+                write_fasta_stream(out, label + suffix, pieces)
     finally:
         if a.output:
             out.close()
@@ -174,12 +191,11 @@ def cmd_fasta(a) -> int:
 
 
 def cmd_vcf(a) -> int:
-    from .container import GpxilFile
     from .export import write_vcf
 
     out = open(a.output, "w") if a.output else sys.stdout
     try:
-        with GpxilFile(a.file) as g:
+        with _open(a) as g:
             n = write_vcf(g, out, a.contigs.split(",") if a.contigs else None, nocall_blocks=not a.no_nocall_blocks)
     finally:
         if a.output:
@@ -249,6 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--cmyk", action="store_true", help="CMYK TIFF for print")
     r.add_argument("--dpi", type=int, help="resolution to record in the image")
     r.add_argument("--mark-insertions", action="store_true", help="haplotypes mode: mark insertion anchors")
+    r.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
     r.set_defaults(fn=cmd_render)
 
     b = sub.add_parser("book", help="print-ready PDF with one dot per base")
@@ -264,6 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--margin", type=float, default=15.0, help="page margin in mm")
     b.add_argument("--title")
     b.add_argument("--max-pages", type=int, help="stop after this many pages (for proofs)")
+    b.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
     b.set_defaults(fn=cmd_book)
 
     f = sub.add_parser("fasta", help="export reference, haplotype or IUPAC-genotype sequence")
@@ -271,6 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--which", choices=["ref", "1", "2", "iupac"], default="ref", help="ref, haplotype 1, haplotype 2 or IUPAC genotype")
     f.add_argument("--region", type=_region)
     f.add_argument("-o", "--output")
+    f.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
     f.set_defaults(fn=cmd_fasta)
 
     x = sub.add_parser("vcf", help="export the sample's genotypes as VCF")
@@ -278,6 +297,7 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("-o", "--output")
     x.add_argument("--contigs")
     x.add_argument("--no-nocall-blocks", action="store_true", help="omit no-call blocks (ALT=<*>)")
+    x.add_argument("--reference", metavar="FASTA", help="reference FASTA, for files written with --no-ref")
     x.set_defaults(fn=cmd_vcf)
 
     pl = sub.add_parser("palettes", help="list the built-in palettes")
@@ -286,8 +306,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    from .container import GpxilFormatError
+
     args = build_parser().parse_args(argv)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except BrokenPipeError:  # e.g. `gpxil vcf file | head`
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())  # so the final flush at exit does not complain
+        return 0
+    except (GpxilFormatError, KeyError, IndexError, OSError, ValueError) as exc:
+        # expected problems (bad input, missing contig or plane) get a message, not a traceback
+        msg = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc
+        print(f"gpxil: error: {msg}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

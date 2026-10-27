@@ -198,7 +198,18 @@ def bench_reference(codes: np.ndarray, width: int, fasta_gz_size: int, workdir: 
 
     b, t_enc = timed(png8)
     back, t_dec = timed(lambda: np.array(Image.open(io.BytesIO(b))))
-    rows.append(fmt_row("PNG, 8-bit palette, level 9", len(b), n, t_enc, t_dec, t_dec * 1000, bool((back == img).all()), "any read decodes the whole image"))
+    rows.append(
+        fmt_row(
+            "PNG, 8-bit palette, level 9",
+            len(b),
+            n,
+            t_enc,
+            t_dec,
+            t_dec * 1000,
+            bool((back == img).all()),
+            "any read decodes the whole image",
+        )
+    )
 
     nib_img = to_image(nib, width)
     nib_pil = Image.fromarray(nib_img, mode="P")
@@ -211,7 +222,9 @@ def bench_reference(codes: np.ndarray, width: int, fasta_gz_size: int, workdir: 
 
     b, t_enc = timed(png4)
     back = np.array(Image.open(io.BytesIO(b)))
-    rows.append(fmt_row("PNG, 4-bit palette (mask dropped)", len(b), n, t_enc, None, None, bool((back == nib_img).all()), "loses soft-masking"))
+    rows.append(
+        fmt_row("PNG, 4-bit palette (mask dropped)", len(b), n, t_enc, None, None, bool((back == nib_img).all()), "loses soft-masking")
+    )
 
     rgb = rgb_lut[img]
 
@@ -221,7 +234,11 @@ def bench_reference(codes: np.ndarray, width: int, fasta_gz_size: int, workdir: 
         return buf.getvalue()
 
     b, t_enc = timed(png_rgb)
-    rows.append(fmt_row("PNG, 24-bit RGB colours (notebook approach)", len(b), n, t_enc, note="needs a colour->code reverse lookup to recover bases"))
+    rows.append(
+        fmt_row(
+            "PNG, 24-bit RGB colours (notebook approach)", len(b), n, t_enc, note="needs a colour->code reverse lookup to recover bases"
+        )
+    )
 
     if img.shape[0] <= 16383 and img.shape[1] <= 16383:
 
@@ -239,14 +256,24 @@ def bench_reference(codes: np.ndarray, width: int, fasta_gz_size: int, workdir: 
         try:
             b, t_enc = timed(imagecodecs.jpegxl_encode, img, lossless=True, effort=effort)
             back, t_dec = timed(imagecodecs.jpegxl_decode, b)
-            rows.append(fmt_row(f"JPEG XL lossless, effort {effort} (grey codes)", len(b), n, t_enc, t_dec, t_dec * 1000, bool((back == img).all())))
+            rows.append(
+                fmt_row(f"JPEG XL lossless, effort {effort} (grey codes)", len(b), n, t_enc, t_dec, t_dec * 1000, bool((back == img).all()))
+            )
         except Exception as exc:  # pragma: no cover - depends on codec build
             rows.append(fmt_row(f"JPEG XL lossless, effort {effort}", 0, n, note=f"failed: {exc}"))
 
     log("Hilbert layout")
     himg, order = hilbert_image(codes)
     b, t_enc = timed(tiff_bytes, himg, tile=(256, 256), compression="zlib", compressionargs={"level": 9})
-    rows.append(fmt_row(f"TIFF, Hilbert layout (order {order}), deflate 9, 256 tiles", len(b), n, t_enc, note="2-D locality; each tile is 65,536 consecutive bases"))
+    rows.append(
+        fmt_row(
+            f"TIFF, Hilbert layout (order {order}), deflate 9, 256 tiles",
+            len(b),
+            n,
+            t_enc,
+            note="2-D locality; each tile is 65,536 consecutive bases",
+        )
+    )
     b, t_enc = timed(tiff_bytes, himg, tile=(256, 256), compression="zstd", compressionargs={"level": 19})
     rows.append(fmt_row(f"TIFF, Hilbert layout (order {order}), zstd 19, 256 tiles", len(b), n, t_enc))
     return rows
@@ -260,7 +287,11 @@ def bench_variants(codes: np.ndarray, vcf: str, bed: str | None, width: int, wor
     vcf_text = gzip.decompress(vcf_bytes) if vcf_bytes[:2] == b"\x1f\x8b" else vcf_bytes
     body = [ln for ln in vcf_text.split(b"\n") if ln and not ln.startswith(b"#")]
     gt_only = b"\n".join(b"\t".join(ln.split(b"\t")[:5] + [ln.split(b"\t")[9].split(b":")[0]]) for ln in body)
-    rows.append(fmt_row("VCF.gz (bgzip-level gzip of the input)", len(gzip.compress(vcf_text, 6)), n, note=f"{len(body):,} records, all INFO/FORMAT"))
+    rows.append(
+        fmt_row(
+            "VCF.gz (bgzip-level gzip of the input)", len(gzip.compress(vcf_text, 6)), n, note=f"{len(body):,} records, all INFO/FORMAT"
+        )
+    )
     rows.append(fmt_row("VCF.gz, CHROM-ALT + GT only", len(gzip.compress(gt_only, 9)), n, note="the content the gt plane holds"))
 
     log("encoding genotype planes")
@@ -271,7 +302,7 @@ def bench_variants(codes: np.ndarray, vcf: str, bed: str | None, width: int, wor
     info["gt_nonzero"] = int(np.count_nonzero(planes["gt"]))
     for comp, lvl in (("deflate", 9), ("zstd", 19)):
         path = os.path.join(workdir, f"gt_{comp}.tif")
-        with GpxilWriter(path, width=width, compression=comp, level=lvl) as w:
+        with GpxilWriter(path, width=width, compression=comp, level=lvl, sample={"id": "sample"}) as w:
             w.add_contig("chr", {"gt": planes["gt"], "flags": planes["flags"]}, sidecar=side)
         rows.append(fmt_row(f"gpxil gt + flags planes + sidecar, {comp} {lvl}", os.path.getsize(path), n, t_enc, note="no ref plane"))
     if bed:
@@ -280,9 +311,16 @@ def bench_variants(codes: np.ndarray, vcf: str, bed: str | None, width: int, wor
             calls = (c for _, c in iter_calls(iter_body_lines(vcf), 0))
             planes_b, side_b, _, _ = encode_calls(codes, calls, contig="chr", planes=("gt", "flags"), callable_mask=mask)
             path = os.path.join(workdir, "gt_bed.tif")
-            with GpxilWriter(path, width=width, compression="deflate", level=9) as w:
+            with GpxilWriter(path, width=width, compression="deflate", level=9, sample={"id": "sample"}) as w:
                 w.add_contig("chr", {"gt": planes_b["gt"], "flags": planes_b["flags"]}, sidecar=side_b)
-            rows.append(fmt_row("gpxil gt + flags, deflate 9, outside-benchmark = UNKNOWN", os.path.getsize(path), n, note=f"{int(mask.sum()):,} callable bases"))
+            rows.append(
+                fmt_row(
+                    "gpxil gt + flags, deflate 9, outside-benchmark = UNKNOWN",
+                    os.path.getsize(path),
+                    n,
+                    note=f"{int(mask.sum()):,} callable bases",
+                )
+            )
             info["callable_bases"] = int(mask.sum())
 
     log("CMYK dosage and RGB 'both channels' encodings")
@@ -292,16 +330,25 @@ def bench_variants(codes: np.ndarray, vcf: str, bed: str | None, width: int, wor
     full[:n] = np.minimum(dose * 127, 255)
     cmyk_img = full.reshape(rows_n, width, 4)
     b = tiff_bytes(cmyk_img, photometric="separated", compression="zlib", compressionargs={"level": 9}, rowsperstrip=32)
-    rows.append(fmt_row("CMYK TIFF, one ink per base = allele dosage (0/1/2 copies)", len(b), n, lossless=False, note="loses phase, indel content, no-call vs deletion"))
+    rows.append(
+        fmt_row(
+            "CMYK TIFF, one ink per base = allele dosage (0/1/2 copies)",
+            len(b),
+            n,
+            lossless=False,
+            note="loses phase, indel content, no-call vs deletion",
+        )
+    )
 
     # what the dosage image cannot distinguish
     h1, h2 = C.hap1(planes["gt"]), C.hap2(planes["gt"])
-    phased_het = int(((planes["flags"] & C.FLAG_PHASED) != 0).sum())
+    phased = (planes["flags"] & C.FLAG_PHASED) != 0
     info["dosage_losses"] = {
         "positions_with_insertions": int(((planes["flags"] & (C.FLAG_INS1 | C.FLAG_INS2)) != 0).sum()),
         "deleted_vs_unknown_ambiguous": int(((h1 == C.HAP_DEL) | (h2 == C.HAP_DEL) | (h1 == C.HAP_UNKNOWN) | (h2 == C.HAP_UNKNOWN)).sum()),
-        "phased_positions": phased_het,
-        "het_positions_order_lost": int((((h1 != 0) ^ (h2 != 0)) & ((planes["flags"] & C.FLAG_PHASED) != 0)).sum()),
+        "phased_positions": int(phased.sum()),
+        # a dosage image cannot say which haplotype carries what wherever the two differ
+        "phased_positions_haplotypes_differ": int((phased & (h1 != h2)).sum()),
     }
     # RGB with base colours added channel-wise: A=R, G=G, C=B, T=R+G (notebook colours)
     chan = {C.BASE_A: (1, 0, 0), C.BASE_C: (0, 0, 1), C.BASE_G: (0, 1, 0), C.BASE_T: (1, 1, 0)}
@@ -380,14 +427,21 @@ def main(argv=None):
     ap.add_argument("--width", type=int, default=8192)
     ap.add_argument("--out", default="results.json")
     args = ap.parse_args(argv)
-    log = lambda m: print(m, file=sys.stderr, flush=True)
+
+    def log(m):
+        print(m, file=sys.stderr, flush=True)
 
     rec = next(iter_fasta(args.fasta))
     codes = rec.codes
     n = codes.shape[0]
     log(f"{rec.name}: {n:,} bases")
     result = {
-        "sequence": {"name": rec.name, "length": n, "N": int(((codes & 0x0F) == C.BASE_N).sum()), "softmasked": int(((codes & 0x10) != 0).sum())},
+        "sequence": {
+            "name": rec.name,
+            "length": n,
+            "N": int(((codes & 0x0F) == C.BASE_N).sum()),
+            "softmasked": int(((codes & 0x10) != 0).sum()),
+        },
         "width": args.width,
         "environment": {
             "python": platform.python_version(),

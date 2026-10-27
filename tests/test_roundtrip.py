@@ -4,13 +4,12 @@ import io
 
 import numpy as np
 import pytest
+from simulate import fasta_text, simulate
 
 from gpxiltools import codes as C
 from gpxiltools.container import GpxilFile
 from gpxiltools.encode import encode
 from gpxiltools.export import haplotype_sequence, write_vcf
-
-from simulate import fasta_text, simulate
 
 
 def _encode(tmp_path, sim, **kw):
@@ -81,9 +80,8 @@ def test_callable_bed_and_contig_aliases(tmp_path):
         assert g.metadata["contigs"][0]["callable_bases"] == 4000
 
 
-@pytest.mark.skipif(pytest.importorskip("pysam", reason="pysam not installed") is None, reason="pysam")
 def test_matches_bcftools_consensus(tmp_path):
-    import pysam
+    pysam = pytest.importorskip("pysam", reason="pysam not installed")  # skips this test only
     from pysam import bcftools
 
     sim = simulate(n=15000, n_sites=200, seed=21, nocalls=False)

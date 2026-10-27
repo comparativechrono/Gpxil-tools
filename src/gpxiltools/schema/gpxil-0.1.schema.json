@@ -6,11 +6,7 @@
   "type": "object",
   "required": ["gpxil", "layout", "contigs", "contig", "plane", "length"],
   "properties": {
-    "gpxil": {
-      "description": "Format version, major.minor.",
-      "type": "string",
-      "pattern": "^0\\.[0-9]+$"
-    },
+    "gpxil": {"description": "Format version, major.minor.", "type": "string", "pattern": "^0\\.[0-9]+$"},
     "generator": {"type": "string"},
     "created": {"type": "string", "description": "ISO 8601 date-time"},
     "layout": {
@@ -22,13 +18,7 @@
       }
     },
     "palette": {"type": "string"},
-    "reference": {
-      "type": "object",
-      "properties": {
-        "name": {"type": "string"},
-        "source": {"type": "string"}
-      }
-    },
+    "reference": {"type": "object", "properties": {"name": {"type": "string"}, "source": {"type": "string"}}},
     "sample": {
       "oneOf": [
         {"type": "null"},
@@ -38,9 +28,14 @@
           "properties": {
             "id": {"type": "string", "minLength": 1},
             "source": {"type": ["string", "null"]},
-            "callable_regions": {"type": ["string", "null"]},
-            "haploid_regions": {"type": ["string", "null"]},
-            "haploid_contigs": {"type": ["array", "null"], "items": {"type": "string"}},
+            "callable_regions": {
+              "type": ["string", "null"],
+              "description": "Name of the callable-regions file applied, or null."
+            },
+            "haploid_regions": {
+              "type": ["string", "null"],
+              "description": "Description of the haploid regions applied (region file name, whole contigs, or the sex rule), or null."
+            },
             "sex": {"type": ["string", "null"]}
           }
         }
@@ -60,21 +55,23 @@
         }
       }
     },
-    "contigs": {
-      "type": "array",
-      "minItems": 1,
-      "items": {"$ref": "#/$defs/contig"}
-    },
+    "contigs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/contig"}},
     "contig": {"type": "string", "description": "Contig of page 0 (page metadata, section 8.4)."},
     "plane": {"type": "string", "description": "Plane of page 0."},
-    "length": {"type": "integer", "minimum": 1, "description": "Length of page 0's contig."}
+    "length": {"type": "integer", "minimum": 1, "description": "Length of page 0's contig."},
+    "summary": {"type": "object", "description": "Writer's conversion summary (informative)."}
   },
   "$defs": {
     "contig": {
       "type": "object",
       "required": ["name", "length", "pages"],
       "properties": {
-        "name": {"type": "string", "minLength": 1, "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"},
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[!-~]+$",
+          "description": "Printable ASCII without spaces (SPEC.md 9.3)."
+        },
         "length": {"type": "integer", "minimum": 1},
         "width": {"type": "integer", "minimum": 1, "maximum": 4294967295},
         "pages": {
@@ -86,7 +83,10 @@
         "md5": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "refget": {"type": "string", "pattern": "^SQ\\.[A-Za-z0-9_-]{32}$"},
         "aliases": {"type": "array", "items": {"type": "string"}},
-        "ploidy": {"oneOf": [{"enum": [1, 2]}, {"const": "mixed"}]},
+        "ploidy": {
+          "oneOf": [{"enum": [1, 2]}, {"const": "mixed"}],
+          "description": "From the gt plane: 1 if haplotype 2 is ABSENT at every base, 2 if nowhere, else mixed."
+        },
         "vcf_contig": {"type": ["string", "null"]},
         "callable_bases": {"type": "integer", "minimum": 0},
         "sidecar_entries": {"type": "integer", "minimum": 0},
@@ -104,7 +104,12 @@
             "spanning_deletion_alleles": {"type": "integer", "minimum": 0},
             "symbolic_alleles": {"type": "integer", "minimum": 0},
             "bad_allele_index": {"type": "integer", "minimum": 0},
-            "examples": {"type": "array", "items": {"type": "string"}}
+            "examples": {"type": "array", "items": {"type": "string"}},
+            "clipped_to_contig_end": {"type": "integer", "minimum": 0},
+            "ploidy_mismatches": {"type": "integer", "minimum": 0},
+            "missing_genotypes": {"type": "integer", "minimum": 0},
+            "spanning_deletions_reassigned": {"type": "integer", "minimum": 0},
+            "nonacgt_inserted_bases": {"type": "integer", "minimum": 0}
           }
         }
       },
@@ -116,8 +121,25 @@
         {
           "if": {"properties": {"pages": {"required": ["gt"]}}},
           "then": {"properties": {"pages": {"required": ["flags"]}}}
+        },
+        {
+          "if": {
+            "properties": {"pages": {"anyOf": [{"required": ["gq"]}, {"required": ["dp"]}, {"required": ["ps"]}]}}
+          },
+          "then": {"properties": {"pages": {"required": ["gt"]}}}
         }
       ]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["contigs"],
+        "properties": {
+          "contigs": {"contains": {"required": ["pages"], "properties": {"pages": {"required": ["gt"]}}}}
+        }
+      },
+      "then": {"required": ["sample"], "properties": {"sample": {"type": "object", "required": ["id"]}}}
+    }
+  ]
 }

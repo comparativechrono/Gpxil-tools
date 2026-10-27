@@ -27,3 +27,11 @@ def sim_files(tmp_path, sim):
     vcf = tmp_path / "sample.vcf"
     vcf.write_text("\n".join(sim.vcf_lines("chr1")) + "\n")
     return fa, vcf
+
+
+@pytest.fixture
+def datadir():
+    """The tests/data directory (the spec's worked example)."""
+    from pathlib import Path
+
+    return Path(__file__).parent / "data"

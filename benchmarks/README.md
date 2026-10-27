@@ -36,9 +36,12 @@ python bench_representations.py --fasta Homo_sapiens.GRCh38.dna_sm.chromosome.21
     --vcf HG002_chr21.vcf --bed HG002_GRCh38_v5.0q_smvar.benchmark.bed --out chr21.json
 
 gpxil encode Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz -v HG002_GRCh38_v5.0q_smvar.vcf.gz \
-    --callable HG002_GRCh38_v5.0q_smvar.benchmark.bed --sex XY --ucsc-names -o HG002_GRCh38.gpxil.tif
+    --callable HG002_GRCh38_v5.0q_smvar.benchmark.bed --sex XY --ucsc-names --reference-name GRCh38 \
+    -o HG002_GRCh38.gpxil.tif
+gpxil validate HG002_GRCh38.gpxil.tif
 ```
 
 The chr21 benchmark takes about 15 minutes on two cores, most of it in the
-slow encoders (WebP, xz). The whole-genome encode took 12.5 minutes and
-peaks at about 1.6 GB of memory (chromosome 1 is processed in one piece).
+slow encoders (WebP, xz). The whole-genome encode took 12.6 minutes and
+peaked at 2.0 GB of memory (chromosome 1 is processed in one piece); the
+validation took 1.5 minutes and 0.23 GB.

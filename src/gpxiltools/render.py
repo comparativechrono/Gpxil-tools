@@ -71,7 +71,7 @@ class Rendering:
     def to_cmyk(self) -> np.ndarray:
         return self.cmyk[self.index]
 
-    def scaled(self, factor: int) -> "Rendering":
+    def scaled(self, factor: int) -> Rendering:
         """Nearest-neighbour enlargement (each pixel becomes factor x factor)."""
         if factor == 1:
             return self
@@ -192,9 +192,8 @@ def render_arrays(
     h1, h2 = C.hap1(gt), C.hap2(gt)
     sub1, sub2 = np.isin(h1, C.HAP_SUB_CODES), np.isin(h2, C.HAP_SUB_CODES)
     cls = np.zeros(n, dtype=np.uint8)  # 0 = faded reference, encoded separately below
-    weak = lambda h: (h == C.HAP_REF) | (h == C.HAP_ABSENT)
-    het = (sub1 & weak(h2)) | (sub2 & weak(h1)) | (sub1 & sub2 & (h1 != h2))
-    hom = sub1 & sub2 & (h1 == h2) | (sub1 & (h2 == C.HAP_ABSENT)) | (sub2 & (h1 == C.HAP_ABSENT))
+    het = (sub1 & (h2 == C.HAP_REF)) | (sub2 & (h1 == C.HAP_REF)) | (sub1 & sub2 & (h1 != h2))
+    hom = (sub1 & sub2 & (h1 == h2)) | (sub1 & (h2 == C.HAP_ABSENT)) | (sub2 & (h1 == C.HAP_ABSENT))  # incl. haploid
     cls[het] = 1
     cls[hom] = 2
     cls[(h1 == C.HAP_DEL) | (h2 == C.HAP_DEL)] = 3
@@ -236,7 +235,9 @@ def render(
     flags = contig.read("flags", start, end) if contig.has("flags") else None
     bpr = bases_per_row or contig.width
     title = f"{contig.name}:{start + 1:,}-{end:,}"
-    return render_arrays(ref, gt, flags, mode=mode, palette=palette, bases_per_row=bpr, mark_insertions=mark_insertions, start=start, title=title)
+    return render_arrays(
+        ref, gt, flags, mode=mode, palette=palette, bases_per_row=bpr, mark_insertions=mark_insertions, start=start, title=title
+    )
 
 
 def class_counts(contig, *, bins: int, mode: str = "genotype", palette: str | Palette = DEFAULT_PALETTE, chunk: int = 1 << 23):

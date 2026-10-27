@@ -124,12 +124,26 @@ def ref_base_nibble(ref: np.ndarray) -> np.ndarray:
     return np.bitwise_and(ref, 0x0F)
 
 
+_VALID_STATE_LUT = np.zeros(16, dtype=bool)
+_VALID_STATE_LUT[list(VALID_HAP_STATES)] = True
+
+
+def normalize_states(state: np.ndarray) -> np.ndarray:
+    """Reserved haplotype states read as UNKNOWN (spec 10, reader rule 4)."""
+    state = np.asarray(state, dtype=np.uint8)
+    valid = _VALID_STATE_LUT[state]
+    if valid.all():
+        return state
+    return np.where(valid, state, HAP_UNKNOWN).astype(np.uint8)
+
+
 def haplotype_bases(ref: np.ndarray, state: np.ndarray) -> np.ndarray:
     """Absolute base (IUPAC 4-bit set) carried by one haplotype at each position.
 
     Returns 0 where the haplotype has no base (DEL, ABSENT) and 15 (N) where
-    the base is unknown (UNKNOWN, COMPLEX).
+    the base is unknown (UNKNOWN, COMPLEX, or a reserved state).
     """
+    state = normalize_states(state)
     base = ref_base_nibble(ref).copy()
     sub = np.isin(state, HAP_SUB_CODES)
     base[sub] = state[sub]
