@@ -7,6 +7,7 @@ as much memory as one chunk of every plane of a contig.
 from __future__ import annotations
 
 import json
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -123,6 +124,8 @@ def _check_file(meta: dict, entries: list[dict], rep: Report) -> None:
     sample = meta.get("sample")
     if has_gt and not (isinstance(sample, dict) and sample.get("id")):
         rep.error("the file has gt planes but metadata 'sample' is not an object with an 'id' (sections 9.1, 9.4)")
+    if not has_gt and sample is not None:
+        rep.error("metadata 'sample' must be null in a file without gt planes (section 9.1)")
     plane_meta = meta.get("planes") or {}
     used = {p for e in entries for p in (e.get("pages") or {})}
     for p in sorted(used):
@@ -212,6 +215,8 @@ def _check_contig(g: GpxilFile, entry: dict, rep: Report, seen_pages: dict, n_pa
             rep.warn(f"{where}: compression {page.compression!r} is outside the recommended set")
         try:
             d = json.loads(page.description) if idx != 0 else g.metadata
+            if not isinstance(d.get("gpxil"), str):
+                rep.error(f"{where}: page description has no 'gpxil' version (section 8.4)")
             if d.get("contig") != name or d.get("plane") != plane or d.get("length") != L:
                 rep.error(f"{where}: page description names {d.get('contig')}/{d.get('plane')} of length {d.get('length')}")
         except Exception:
@@ -234,7 +239,11 @@ def _check_contig(g: GpxilFile, entry: dict, rep: Report, seen_pages: dict, n_pa
         tag = ok["gt"].tags.get(SIDECAR_TAG)
         if tag is not None:
             try:
-                side = decode_sidecar(bytes(tag.value))
+                blob = bytes(tag.value)
+                lines = zlib.decompress(blob).decode("utf-8").split("\n", 2)
+                if len(lines) < 2 or not lines[0].startswith("#gpxil-sidecar\t") or lines[1] != "offset\thap\tkind\tdata":
+                    rep.error(f"{name}: sidecar does not start with its two header lines (section 7)")
+                side = decode_sidecar(blob)
             except Exception as exc:
                 rep.error(f"{name}: sidecar cannot be decoded: {exc}")
     complex_entries = sorted((e.offset, e.hap) for e in side if e.kind == "COMPLEX")

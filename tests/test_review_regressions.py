@@ -335,3 +335,127 @@ def test_annotation_precedence_is_per_field(tmp_path):
     assert list(p["gq"][1:9]) == [255, 10, 10, 50, 10, 10, 10, 255]  # the variant's GQ wins at its base
     assert list(p["dp"][1:9]) == [255, 20, 20, 20, 20, 20, 20, 255]  # DP only comes from the block
     assert p["gt"][4] == 0x04
+
+
+# ---- second check: specification text against the code ---------------------------------
+
+
+def test_insertion_counts_as_a_change_for_annotations(tmp_path):
+    rows = [
+        rec(4, "TACG", "T", "1|0:40", fmt="GT:GQ"),  # deletes offsets 4-6 on hap1
+        rec(6, "C", "CTT", "0|1:20", fmt="GT:GQ"),  # insertion after offset 5 on hap2
+    ]
+    p, _, _ = planes(run(tmp_path, FA, rows, name="a"))
+    assert p["gq"][5] == 20  # both calls change offset 5; the later one wins
+    rows = [rec(6, "C", "CTT", "0|1:50", fmt="GT:GQ"), rec(5, "A", "<NON_REF>", "0/0:10", fmt="GT:GQ", info="END=10")]
+    p, _, _ = planes(run(tmp_path, FA, rows, name="b"))
+    assert list(p["gq"][4:10]) == [10, 50, 10, 10, 10, 10]  # the insertion's anchor keeps its call's GQ
+
+
+def test_every_allele_covers_its_record_span(tmp_path):
+    bed = tmp_path / "c.bed"
+    bed.write_text("c1\t0\t2\n")  # only offsets 0-1 callable
+    p, side, _ = planes(run(tmp_path, FA, [rec(3, "G", "A,<DUP>", "1|2", info="END=8")], callable_bed=bed, name="a"))
+    assert list(p["gt"][2:9]) == [0x1C, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0xFF]  # A plus REF to END; <DUP> only at POS
+    assert [(e.offset, e.hap) for e in side] == [(2, 2)]
+    p, _, _ = planes(run(tmp_path, FA, [rec(3, "G", "<DEL>", "0/1", info="END=6")], callable_bed=bed, name="b"))
+    assert list(p["gt"][2:7]) == [0x00, 0x0D, 0x0D, 0x0D, 0xFF]  # the padding base is REF on both haplotypes
+
+
+def test_degenerate_symbolic_deletion_is_complex(tmp_path):
+    _, side, _ = planes(run(tmp_path, FA, [rec(3, "G", "<DEL>", "0|1", info="END=3")]))
+    assert [(e.offset, e.hap, e.kind) for e in side] == [(2, 2, "COMPLEX")]
+
+
+def test_file_without_genotype_planes_has_no_sample(tmp_path):
+    out = run(tmp_path, FA, [rec(2, "C", "T", "0|1", chrom="elsewhere")])
+    with GpxilFile(out) as g:
+        assert g.metadata["sample"] is None and g["c1"].planes == ["ref"]
+        assert g.metadata["summary"]["vcf_contigs_without_reference"] == ["elsewhere"]
+    assert validate(out).ok
+
+    def add_sample(meta):
+        meta["sample"] = {"id": "S"}
+
+    _rewrite_metadata(out, add_sample)
+    assert any("must be null" in e for e in validate(out).errors)
+
+
+def test_alt_u_reads_as_t(tmp_path):
+    p, _, _ = planes(run(tmp_path, FA, [rec(2, "C", "U", "0|1"), rec(4, "T", "U", "0|1")]))
+    assert p["gt"][1] == 0x08 and p["gt"][3] == 0x00
+
+
+def test_negative_allele_index_is_counted(tmp_path):
+    p, _, entry = planes(run(tmp_path, FA, [rec(2, "C", "T,G", "0/-1"), rec(6, "C", "T", "0/-1")]))
+    assert entry["encoding"]["bad_allele_index"] == 2
+    assert p["gt"][1] == 0x00 and p["gt"][5] == 0x00
+
+
+def test_bed_without_intervals_inside_contig_means_reference_only(tmp_path):
+    bed = tmp_path / "c.bed"
+    bed.write_text("c1\t0\t20\nc2\t100\t200\n")
+    fasta = FA + ">c2\nACGTACGTAC\n"
+    out = run(tmp_path, fasta, [rec(2, "C", "T", "0|1")], callable_bed=bed, name="a")
+    with GpxilFile(out) as g:
+        assert g["c2"].planes == ["ref"]
+    out = run(tmp_path, fasta, [rec(2, "C", "T", "0|1")], callable_bed=bed, include_ref=False, name="b")
+    with GpxilFile(out) as g:
+        assert g.contigs == ["c1"] and g.metadata["summary"]["contigs_without_data"] == ["c2"]
+
+
+def test_ref_check_at_gaps(tmp_path):
+    rows = [rec(1, "A", "C", "0|1"), rec(4, "-", "A", "0|1"), rec(5, "N", "A", "0|1"), rec(8, "*", "A", "0|1")]
+    _, _, entry = planes(run(tmp_path, ">c1\nACGN-CGTACGT\n", rows, width=12))
+    assert entry["encoding"]["ref_mismatches"] == 3
+
+
+def test_genotype_edge_cases(tmp_path):
+    # '|.' is a haploid call with a missing allele, not a missing genotype
+    p, _, entry = planes(run(tmp_path, FA, [rec(2, "C", "T", "|.")], name="a"))
+    assert p["gt"][1] == 0xFA and entry["encoding"]["missing_genotypes"] == 0
+    # a missing genotype does not assert the ABSENT haplotype 2 of a haploid region
+    rows = [rec(2, "C", "T", "."), rec(2, "C", "T", "0/0")]
+    p, _, entry = planes(run(tmp_path, FA, rows, haploid_contigs=["c1"], name="b"))
+    assert p["gt"][1] == 0xF0 and entry["encoding"]["ploidy_mismatches"] == 1
+    # an ALT base equal to the reference base is REF when written, so it cannot replace a variant
+    rows = [rec(2, "C", "T", "0|1"), rec(2, "G", "C", "0|1")]
+    p, _, entry = planes(run(tmp_path, FA, rows, name="c"))
+    assert p["gt"][1] == 0x08 and entry["encoding"]["conflicts"] == 0 and entry["encoding"]["ref_mismatches"] == 1
+
+
+def test_insertion_letter_counts(tmp_path):
+    _, side, entry = planes(run(tmp_path, FA, [rec(2, "C", "CANR", "0|1")]))
+    assert side[0].data == "ANN" and entry["encoding"]["nonacgt_inserted_bases"] == 1
+
+
+def test_phase_sets_follow_the_plane(tmp_path):
+    rows = [
+        rec(2, "C", "T", "0|1:7", fmt="GT:PS"),
+        rec(2, "C", "<NON_REF>", "0|0:blockA", fmt="GT:PS"),  # shadowed by the variant: blockA appears, writes nothing
+        rec(6, "C", "A", "1|0:blockB", fmt="GT:PS"),
+        rec(10, "C", "G", "0|1:blockA", fmt="GT:PS"),
+        rec(14, "C", "G", "0|1:0014", fmt="GT:PS"),  # the integer 14
+    ]
+    p, _, entry = planes(run(tmp_path, FA, rows))
+    assert [int(p["ps"][i]) for i in (1, 5, 9, 13)] == [7, 4294967294, 4294967295, 14]
+    assert entry["phase_sets"] == 4
+    assert entry["phase_set_ids"] == {"4294967295": "blockA", "4294967294": "blockB"}
+    rows = [rec(2, "C", "T", "0|1:100", fmt="GT:PS"), rec(2, "C", "<NON_REF>", "0|0:200", fmt="GT:PS")]
+    p, _, entry = planes(run(tmp_path, FA, rows, name="b"))
+    assert int(p["ps"][1]) == 100 and entry["phase_sets"] == 1
+
+
+def test_validator_checks_headers(tmp_path, monkeypatch):
+    from gpxiltools import container
+
+    ref = encode_sequence(b"ACGTACGTAC")
+    fl = np.zeros(10, np.uint8)
+    fl[2] = C.FLAG_INS1
+    p = tmp_path / "h.gpxil.tif"
+    monkeypatch.setattr(container, "SIDECAR_HEADER", "")
+    with GpxilWriter(p, width=5, sample={"id": "S"}) as w:
+        w.add_contig("c", {"ref": ref, "gt": np.zeros(10, np.uint8), "flags": fl}, sidecar=[SidecarEntry(2, 1, "INS", "A")])
+    tifffile.tiffcomment(p, json.dumps({"contig": "c", "plane": "gt", "length": 10}), pageindex=1)
+    text = "\n".join(validate(p).errors)
+    assert "two header lines" in text and "no 'gpxil' version" in text

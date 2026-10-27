@@ -91,7 +91,11 @@
         "callable_bases": {"type": "integer", "minimum": 0},
         "sidecar_entries": {"type": "integer", "minimum": 0},
         "phase_sets": {"type": "integer", "minimum": 0},
-        "phase_set_ids": {"type": "object", "additionalProperties": {"type": "string"}},
+        "phase_set_ids": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[1-9][0-9]*$"},
+          "additionalProperties": {"type": "string"}
+        },
         "invalid_characters_converted_to_N": {"type": "integer", "minimum": 0},
         "encoding": {
           "type": "object",
@@ -139,7 +143,8 @@
           "contigs": {"contains": {"required": ["pages"], "properties": {"pages": {"required": ["gt"]}}}}
         }
       },
-      "then": {"required": ["sample"], "properties": {"sample": {"type": "object", "required": ["id"]}}}
+      "then": {"required": ["sample"], "properties": {"sample": {"type": "object", "required": ["id"]}}},
+      "else": {"properties": {"sample": {"type": "null"}}}
     }
   ]
 }

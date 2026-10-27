@@ -32,6 +32,19 @@ VCF conversion
 - Haploid contigs and `ploidy` are recorded correctly in the metadata;
   diploid calls in haploid regions are counted.
 - Callable and haploid BED files may use spaces.
+- A sequence allele in a record that also has a symbolic allele covers the
+  record's whole span; a `<DEL>` keeps its padding base; an ALT base equal
+  to the reference base is REF before precedence is applied; an insertion
+  counts as a change of its anchor when overlapping calls resolve
+  `GQ`/`DP`/`PS`.
+- Missing genotypes leave an ABSENT haplotype 2 unasserted; `|.` is a
+  haploid no-call; negative allele numbers are counted, not wrapped.
+- The REF check rejects gaps and non-IUPAC characters; ALT `U` reads as T.
+- Phase sets are numbered at first appearance, identifiers that end up on
+  no base are dropped, and integer identifiers compare as integers.
+- A callable BED that has no interval on a contig counts as none; with
+  `--no-ref` such contigs are listed as `contigs_without_data`.
+- A file that ends up without genotype planes has `sample: null`.
 
 Files and tools
 
@@ -42,9 +55,10 @@ Files and tools
 - BigTIFF is chosen by size: classic TIFF unless the file would pass 4 GiB,
   in which case the encode restarts as BigTIFF (0.1.0 used BigTIFF for every
   uncompressed file and never for a compressed one).
-- `gpxil validate` checks much more (page order, photometric tags, sidecar
-  order and duplicates, COMPLEX entries, `ps` against PHASED, plane
-  descriptions, refget without md5) and works chunk by chunk.
+- `gpxil validate` checks much more (page order, photometric tags, page
+  descriptions, sidecar headers, order and duplicates, COMPLEX entries, `ps`
+  against PHASED, plane descriptions, `sample` against `gt`, refget without
+  md5) and works chunk by chunk.
 - `gpxil fasta` streams whole chromosomes; `fasta`, `vcf`, `render` and
   `book` take `--reference` for files written with `--no-ref`.
 - VCF export: merged windows are phased only if every site is; `##contig`

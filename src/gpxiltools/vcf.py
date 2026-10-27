@@ -378,24 +378,26 @@ class PlaneBuilder:
 
     # -- helpers ---------------------------------------------------------
     def _ref_ok(self, start: int, allele: str) -> bool:
-        """Each REF base's IUPAC set must intersect the reference's (N matches anything)."""
+        """Each REF base must be an IUPAC letter whose set meets the reference base's (spec 6.7).
+
+        So N matches any base but not a gap, and '-', '.' or '*' never match.
+        """
         seg = np.bitwise_and(self.ref[start : start + len(allele)], 0x0F)
         raw = np.frombuffer(allele.encode("ascii", "replace"), dtype=np.uint8)
         a = C.ASCII_TO_REF[raw]
-        bad = a == C.INVALID
-        a = np.bitwise_and(a, 0x0F)
-        ok = ((a & seg) != 0) | (a == C.BASE_N) | (seg == C.BASE_N)
-        return bool(ok.all() and not bad.any())
+        ok = (a != C.INVALID) & ((np.bitwise_and(a, 0x0F) & seg) != 0)
+        return bool(ok.all())
 
-    def _write_states(self, h: int, start: int, states: np.ndarray) -> np.ndarray:
+    def _write_states(self, h: int, start: int, states: np.ndarray, where: np.ndarray | None = None) -> np.ndarray:
         """Write states for haplotype ``h`` with the precedence rules of spec 6.4.
 
         Strong states (bases, DEL, COMPLEX) always win; a different strong
         state already asserted is a conflict and the later call wins. Weak
         states (REF, UNKNOWN, ABSENT) only fill bases no call has asserted;
         ABSENT meeting a base asserted with a strong state is also a
-        conflict (a haploid call against a diploid one). Returns the mask of
-        strong states written.
+        conflict (a haploid call against a diploid one). With ``where``,
+        only those bases are touched. Returns the mask of strong states
+        written.
         """
         w = self.w[h]
         end = start + states.shape[0]
@@ -403,17 +405,23 @@ class PlaneBuilder:
         asserted = (seg & _ASSERTED) != 0
         cur = seg & _STATE_MASK
         strong = _strong(states)
+        if where is not None:
+            strong &= where
         cur_strong = _strong(cur)
         conflict = asserted & cur_strong & ((strong & (cur != states)) | (states == C.HAP_ABSENT))
+        if where is not None:
+            conflict &= where
         if conflict.any():
             self.stats.conflicts += int(conflict.sum())
             self.stats.note(f"{self.contig}:{start + int(np.flatnonzero(conflict)[0]) + 1} conflicting states on hap{h + 1}")
         if h == 1:
             mism = (cur == C.HAP_ABSENT) & ~asserted & (states != C.HAP_ABSENT)
+            if where is not None:
+                mism &= where
             if mism.any():
                 self.stats.ploidy_mismatches += int(mism.sum())
-        new = np.where(strong, states, np.where(asserted, cur, states))
-        w[start:end] = new.astype(np.uint8) | _ASSERTED | (seg & (_INS | _QBITS))
+        new = np.where(strong, states, np.where(asserted, cur, states)).astype(np.uint8) | _ASSERTED | (seg & (_INS | _QBITS))
+        w[start:end] = new if where is None else np.where(where, new, seg)
         return strong
 
     def _write_scalar(self, h: int, pos: int, state: int) -> bool:
@@ -452,6 +460,12 @@ class PlaneBuilder:
         self.w[h][anchor] |= _INS
 
     def _ps_ordinal(self, ps: str) -> int:
+        try:
+            v = int(ps)
+            if 1 <= v <= 0xFFFFFFFF:
+                ps = str(v)  # '077' and '77' are the same VCF integer
+        except ValueError:
+            pass
         i = self._ps_index.get(ps)
         if i is None:
             self.ps_keys.append(ps)
@@ -497,11 +511,12 @@ class PlaneBuilder:
         span = span_end - p0
         strong = np.zeros(span, dtype=bool)
         if not alleles:
-            # missing genotype: both haplotypes unknown, but an absent haplotype stays absent
+            # missing genotype: both haplotypes unknown, but an absent haplotype 2 is
+            # left as it is (and not asserted: the call says nothing about ploidy)
             st.missing_genotypes += 1
-            self._write_states(0, p0, np.full(span, C.HAP_UNKNOWN, dtype=np.uint8))
-            cur2 = self.w[1][p0:span_end] & _STATE_MASK
-            self._write_states(1, p0, np.where(cur2 == C.HAP_ABSENT, C.HAP_ABSENT, C.HAP_UNKNOWN).astype(np.uint8))
+            unknown = np.full(span, C.HAP_UNKNOWN, dtype=np.uint8)
+            self._write_states(0, p0, unknown)
+            self._write_states(1, p0, unknown, where=(self.w[1][p0:span_end] & _STATE_MASK) != C.HAP_ABSENT)
         else:
             if len(alleles) == 2 and not phased:
                 alleles = self._place_spanning_deletion(alleles, call, p0, span_end)
@@ -536,7 +551,8 @@ class PlaneBuilder:
         if self.dp is not None and call.dp is not None:
             jobs.append((self.dp, _Q_DP, lambda: min(max(call.dp, 0), C.QUAL_MAX)))
         if self.ps_ord is not None and phased and call.ps not in (None, ".", ""):
-            jobs.append((None, _Q_PS, lambda: self._ps_ordinal(call.ps)))
+            ordinal = self._ps_ordinal(call.ps)  # numbered at first appearance (spec 5.5)
+            jobs.append((None, _Q_PS, lambda: ordinal))
         any_strong = bool(strong.any())
         for arr, (h, bit), value in jobs:
             w = self.w[h][p0:span_end]
@@ -593,9 +609,9 @@ class PlaneBuilder:
             else:
                 self._write_states(h, p0, np.zeros(span, dtype=np.uint8))
             return None
-        if idx > len(call.alts):
+        if idx < 0 or idx > len(call.alts):
             st.bad_allele_index += 1
-            st.note(f"{self.contig}:{call.pos} GT allele {idx} but only {len(call.alts)} ALT alleles")
+            st.note(f"{self.contig}:{call.pos} GT allele {idx} but {len(call.alts)} ALT alleles")
             return None
         alt = call.alts[idx - 1]
         if alt == "*":
@@ -611,18 +627,24 @@ class PlaneBuilder:
             return self._apply_symbolic(h, alt, idx - 1, call, p0, span_end)
         ev = allele_events(call.ref, alt)
         out = np.zeros(span, dtype=bool)
-        if m == 1 and not ev.dels and not ev.ins and len(ev.subs) == 1:
-            out[0] = self._write_scalar(h, p0, ev.subs[0][1])  # plain SNV, the common case
+        if span == 1 and not ev.dels and not ev.ins and len(ev.subs) == 1:
+            state = ev.subs[0][1]
+            if state == self.ref[p0] & 0x0F:  # possible only when REF disagrees with the reference
+                state = C.HAP_REF
+            out[0] = self._write_scalar(h, p0, state)  # plain SNV, the common case
             return out
-        states = np.zeros(m, dtype=np.uint8)
+        # states over the record's whole span: REF wherever the allele does not differ
+        states = np.zeros(span, dtype=np.uint8)
         for off, s in ev.subs:
             states[off] = s
         for off, length in ev.dels:
             states[off : off + length] = C.HAP_DEL
-        out[:m] = self._write_states(h, p0, states)
+        same = np.isin(states, C.HAP_SUB_CODES) & (states == np.bitwise_and(self.ref[p0:span_end], 0x0F))
+        states[same] = C.HAP_REF  # a "substitution" to the reference base itself is REF (spec 5.2)
+        out[:] = self._write_states(h, p0, states)
         for anchor, seq in ev.ins:
             self._add_insertion(h, p0 + anchor, seq)
-            out[anchor] = True
+            out[anchor] = True  # an insertion changes the haplotype at its anchor (spec 6.5)
         return out
 
     def _apply_symbolic(self, h: int, alt: str, alt_index: int, call: Call, p0: int, span_end: int) -> np.ndarray:
@@ -631,7 +653,8 @@ class PlaneBuilder:
         if end is None and alt.startswith("<DEL") and call.svlen and alt_index < len(call.svlen) and call.svlen[alt_index]:
             end = call.pos + abs(call.svlen[alt_index])
         if alt.startswith("<DEL") and end is not None and end > call.pos:
-            # SV deletion: POS is the padding base; bases POS+1..END are deleted
+            # SV deletion: POS is the padding base, kept; bases POS+1..END are deleted
+            self._write_scalar(h, p0, C.HAP_REF)
             del_start, del_end = p0 + 1, min(end, self.length)
             if del_end > del_start:
                 s = self._write_states(h, del_start, np.full(del_end - del_start, C.HAP_DEL, dtype=np.uint8))
@@ -691,31 +714,36 @@ class PlaneBuilder:
     def _finish_ps(self, chunk: int) -> np.ndarray:
         """Map phase-set ordinals to stored values (spec 5.5).
 
-        An integer PS in 1..2^32-1 is stored as is; any other identifier gets
-        the largest value not used by an integer PS on this contig.
+        An integer PS in 1..2^32-1 is stored as is. Other identifiers get the
+        largest values not used by an integer PS on this contig, in order of
+        first appearance. Identifiers that end up on no base (every base of
+        their calls taken by other calls) are dropped.
         """
-        used = set()
-        for k in self.ps_keys:
+        nkeys = len(self.ps_keys)
+        counts = np.zeros(nkeys + 1, dtype=np.int64)
+        for s in range(0, self.length, chunk):
+            counts += np.bincount(self.ps_ord[s : s + chunk], minlength=nkeys + 1)
+        used = [i for i in range(1, nkeys + 1) if counts[i]]
+        ints: dict[int, int] = {}
+        for i in used:
             try:
-                v = int(k)
+                v = int(self.ps_keys[i - 1])
             except ValueError:
                 continue
             if 1 <= v <= 0xFFFFFFFF:
-                used.add(v)
-        lut = np.zeros(len(self.ps_keys) + 1, dtype=np.uint32)
+                ints[i] = v
+        taken = set(ints.values())
+        lut = np.zeros(nkeys + 1, dtype=np.uint32)
         nxt = 0xFFFFFFFF
-        for i, k in enumerate(self.ps_keys, start=1):
-            try:
-                v = int(k)
-            except ValueError:
-                v = -1
-            if not (1 <= v <= 0xFFFFFFFF):
-                while nxt in used:
+        for i in used:
+            v = ints.get(i)
+            if v is None:
+                while nxt in taken:
                     nxt -= 1
                 v = nxt
-                used.add(v)
+                taken.add(v)
             lut[i] = v
-            self.ps_ids[k] = int(v)
+            self.ps_ids[self.ps_keys[i - 1]] = int(v)
         ps = np.empty(self.length, dtype=np.uint32)
         for s in range(0, self.length, chunk):
             ps[s : s + chunk] = lut[self.ps_ord[s : s + chunk]]

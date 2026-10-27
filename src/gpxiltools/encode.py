@@ -228,13 +228,16 @@ def _encode_once(
             if split is not None:
                 vname = _match(name, vcf_contigs) or _match(rec.name, vcf_contigs)
                 callable_mask = load_bed(callable_bed, name, rec.length, [rec.name, *aliases]) if callable_bed else None
-                if vname is None and callable_mask is None:
-                    # no calls and no callable regions: nothing is known about the sample here (spec 6.1)
+                if vname is None and (callable_mask is None or not callable_mask.any()):
+                    # no calls and no callable interval: nothing is known about the sample here (spec 6.1)
                     if data:
                         writer.add_contig(name, data, length=rec.length, **entry)
                         totals["contigs"] += 1
                         totals["bases"] += rec.length
                         log(f"  {name}: {rec.length:,} bp, no calls (reference only)  [{time.time() - t0:.0f}s]")
+                    else:
+                        totals.setdefault("contigs_without_data", []).append(name)
+                        log(f"  {name}: no calls, and --no-ref leaves nothing to store: skipped")
                     continue
                 if callable_bed and callable_mask is None:
                     log(f"  note: {os.path.basename(str(callable_bed))} has no intervals on {name}; bases without calls are UNKNOWN")
@@ -289,6 +292,10 @@ def _encode_once(
             if unused:
                 totals["vcf_contigs_without_reference"] = unused
                 log(f"  note: VCF contigs not in the FASTA (skipped): {', '.join(unused[:10])}")
+            if not any("gt" in c.pages for c in writer.contigs):
+                # a file without genotype planes describes no sample (spec 9.1)
+                writer.sample = None
+                log("  note: no contig received genotype planes, so the file is reference only")
         writer.extra_metadata["summary"] = totals
         writer.close()
     except BaseException:

@@ -323,7 +323,8 @@ class GpxilWriter:
             "layout": {"type": "raster", "width": self.width},
             "palette": self.palette,
             "reference": self.reference,
-            "sample": self.sample,
+            # a file without genotype planes describes no sample (spec 9.1)
+            "sample": self.sample if any("gt" in c.pages for c in self.contigs) else None,
             "planes": planes,
             "contigs": [c.as_dict() for c in self.contigs],
         }
