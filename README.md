@@ -15,12 +15,12 @@ TIFF) and as a whole "genome book" PDF with one printed dot per base.
 ## Install
 
 ```sh
-pip install git+https://github.com/comparativechrono/Gpxil-tools
+pip install gpxiltools
 ```
 
 Requires Python 3.10 or later, NumPy, tifffile, imagecodecs, Pillow and jsonschema. For
-the tests: `pip install "gpxiltools[test] @ git+https://github.com/comparativechrono/Gpxil-tools"`
-(adds pytest, pysam and pikepdf).
+the tests: `pip install "gpxiltools[test]"` (adds pytest, pysam and pikepdf). The
+latest code, before it is released: `pip install git+https://github.com/comparativechrono/Gpxil-tools`.
 
 ## Command line
 
@@ -169,6 +169,12 @@ git clone https://github.com/comparativechrono/Gpxil-tools && cd Gpxil-tools
 pip install -e ".[test]"
 pytest
 ```
+
+To release a version: set it in `src/gpxiltools/__init__.py`, add it to
+`CHANGES.md`, merge, and publish a GitHub release tagged with the version
+(`v0.2.0`). The workflow `release.yml` then tests the package, builds it and
+publishes it to [PyPI](https://pypi.org/project/gpxiltools/) by trusted
+publishing, so no token is stored anywhere.
 
 ## Licence
 

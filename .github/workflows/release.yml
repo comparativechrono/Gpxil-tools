@@ -1,0 +1,78 @@
+# Publishes gpxiltools to PyPI.
+#
+# It uses PyPI's trusted publishing, so no token is stored anywhere: PyPI must be told once that this repository's
+# workflow "release.yml", with the environment "pypi", may publish the project gpxiltools (on PyPI, the project's
+# Settings > Publishing; before the first release, your account's Publishing page, as a "pending publisher").
+#
+# To release: set the new version in src/gpxiltools/__init__.py (pyproject.toml reads it from there), add it to
+# CHANGES.md, merge, and publish a GitHub release with a new tag of the version, such as v0.2.0. Pushing the tag does
+# the same. The workflow can also be run by hand from the Actions tab, choosing the tag to run it on.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# a tag pushed and a release published for it would start two runs: the second waits, and finds nothing to upload
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Check that the tag matches the version
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/gpxiltools/__init__.py)
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::Run the release on a tag, such as v$version, not on a branch."
+            exit 1
+          fi
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::The tag ($GITHUB_REF_NAME) and gpxiltools.__version__ ($version) must agree."
+            exit 1
+          fi
+      - name: Test
+        run: |
+          python -m pip install ".[test]" scikit-image
+          python -m pytest
+          gpxil validate tests/data/worked-example.gpxil.tif
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/gpxiltools/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
