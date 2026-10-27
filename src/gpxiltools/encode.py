@@ -325,10 +325,10 @@ def _encode_once(
                 + f"  [{time.time() - t0:.0f}s]"
             )
         if split is not None:
-            unused = [c for c in vcf_contigs if c not in used_vcf]
+            unused = [c for c in vcf_contigs if c not in used_vcf and wanted(c)]  # contigs left out by --contigs are not news
             if unused:
                 totals["vcf_contigs_without_reference"] = unused
-                log(f"  note: VCF contigs not in the FASTA (skipped): {', '.join(unused[:10])}")
+                log(f"  note: VCF contigs not in the reference (skipped): {', '.join(unused[:10])}")
             if not any("gt" in c.pages for c in writer.contigs):
                 # a file without genotype planes describes no sample (spec 9.1)
                 writer.sample = None
