@@ -1,6 +1,6 @@
 # Changes
 
-## 0.3.0 (unreleased)
+## 0.3.0 (27 October 2026)
 
 For big files, files on the web and Python in the browser, as GpxilStudio
 needs them. Files written by 0.2.0 and 0.3.0 are the same.
