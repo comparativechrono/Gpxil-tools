@@ -237,7 +237,7 @@ def cmd_palettes(a) -> int:
     from .palettes import describe
 
     for p in describe():
-        bases = ", ".join(f"{b} {tuple(p['srgb'][b])} / CMYK {tuple(p['cmyk_percent'][b])}" for b in "ACGT")
+        bases = ", ".join(f"{b} {tuple(p['srgb'][b])} / CMYK {tuple(p['cmyk_percent'][b])}" for b in "ACGTN")
         print(f"{p['name']}: {p['description']}\n    {bases}")
     return 0
 
