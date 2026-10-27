@@ -169,3 +169,8 @@ git clone https://github.com/comparativechrono/Gpxil-tools && cd Gpxil-tools
 pip install -e ".[test]"
 pytest
 ```
+
+## Licence
+
+Copyright © 2026 Chronomic Medicine Group, Department of Genomic Medicine,
+University of Cambridge. Released under the [MIT licence](LICENSE).
