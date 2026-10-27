@@ -13,24 +13,35 @@ import os
 import re
 import tempfile
 from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator
 
 import numpy as np
 
 from . import codes as C
 from .fasta import open_maybe_gzip
 
-_STATE_MASK = 0x0F
-_ASSERTED = 0x10
-_INS = 0x20
+# Working arrays: one byte per base and haplotype.
+_STATE_MASK = 0x0F  # bits 0-3: state (spec 5.2)
+_ASSERTED = 0x10  # bit 4: a call has asserted this base (spec 6.4)
+_INS = 0x20  # bit 5: an insertion follows this base
+# bits 6-7: the value of an annotation plane at this base came from a call that
+# wrote a strong state here (spec 6.5): hap-1 array 0x40 gq, 0x80 dp; hap-2 array 0x40 ps
+_Q_GQ, _Q_DP, _Q_PS = (0, 0x40), (0, 0x80), (1, 0x40)
+_QBITS = 0xC0
 
+_WEAK = (C.HAP_REF, C.HAP_UNKNOWN, C.HAP_ABSENT)
 _REFBLOCK_ALTS = {"<NON_REF>", "<*>", "<X>"}
-_SYMBOLIC = re.compile(r"^<.*>$")
+_ACGTN = re.compile(r"[^ACGTN]")
 
 
 class VcfError(ValueError):
     pass
+
+
+def is_symbolic(alt: str) -> bool:
+    """Symbolic (``<DEL>``), breakend (``G]chr2:5]``) or single-breakend (``G.``) allele."""
+    return alt.startswith("<") or "[" in alt or "]" in alt or (alt != "*" and "." in alt)
 
 
 # ----------------------------------------------------------------- reading
@@ -40,6 +51,7 @@ class VcfError(ValueError):
 class VcfHeader:
     samples: list[str]
     contigs: dict[str, int | None]
+    formats: set[str]
     lines: list[str]
 
 
@@ -47,6 +59,7 @@ def read_header(path) -> VcfHeader:
     lines: list[str] = []
     samples: list[str] = []
     contigs: dict[str, int | None] = {}
+    formats: set[str] = set()
     with open_maybe_gzip(path) as fh:
         for raw in fh:
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
@@ -57,13 +70,17 @@ def read_header(path) -> VcfHeader:
                     m_len = re.search(r"[<,]length=(\d+)", line)
                     if m_id:
                         contigs[m_id.group(1)] = int(m_len.group(1)) if m_len else None
+                elif line.startswith("##FORMAT=<"):
+                    m_id = re.search(r"[<,]ID=([^,>]+)", line)
+                    if m_id:
+                        formats.add(m_id.group(1))
                 continue
             if line.startswith("#CHROM"):
                 lines.append(line)
                 cols = line.split("\t")
                 samples = cols[9:]
             break
-    return VcfHeader(samples=samples, contigs=contigs, lines=lines)
+    return VcfHeader(samples=samples, contigs=contigs, formats=formats, lines=lines)
 
 
 @dataclass
@@ -76,22 +93,18 @@ class Call:
     filter: str
     gt: str
     end: int | None = None  # INFO END (1-based, inclusive)
-    svlen: int | None = None
+    svlen: list[int] | None = None  # INFO SVLEN, one value per ALT
     gq: int | None = None
     dp: int | None = None
     ps: str | None = None
 
 
-def _info_int(info: str, key: str) -> int | None:
+def _info_values(info: str, key: str) -> list[str] | None:
     if info == "." or (key + "=") not in info:
         return None
     for item in info.split(";"):
         if item.startswith(key + "="):
-            value = item[len(key) + 1 :].split(",")[0]
-            try:
-                return int(value)
-            except ValueError:
-                return None
+            return item[len(key) + 1 :].split(",")
     return None
 
 
@@ -108,7 +121,7 @@ def iter_calls(lines: Iterable[str], sample_index: int) -> Iterator[tuple[str, C
     """Parse VCF body lines into ``(chrom, Call)`` for one sample."""
     col = 9 + sample_index
     for line in lines:
-        if not line or line.startswith("#"):
+        if not line.strip() or line.startswith("#"):
             continue
         f = line.rstrip("\r\n").split("\t")
         if len(f) <= col:
@@ -119,68 +132,106 @@ def iter_calls(lines: Iterable[str], sample_index: int) -> Iterator[tuple[str, C
         gt = sample.get("GT", ".")
         alts = [] if f[4] == "." else f[4].split(",")
         info = f[7]
-        need_end = not alts or any(a.startswith("<") or "[" in a or "]" in a for a in alts)
-        yield f[0], Call(
-            pos=int(f[1]),
-            ref=f[3].upper(),
-            alts=[a if a.startswith("<") else a.upper() for a in alts],
-            filter=f[6],
-            gt=gt,
-            end=_info_int(info, "END") if need_end else None,
-            svlen=_info_int(info, "SVLEN") if need_end else None,
-            gq=_to_int(sample.get("GQ")),
-            dp=_to_int(sample.get("DP")),
-            ps=sample.get("PS"),
+        sym = [is_symbolic(a) for a in alts]
+        need_end = not alts or any(sym)
+        end_v = _info_values(info, "END") if need_end else None
+        svlen_v = _info_values(info, "SVLEN") if need_end else None
+        yield (
+            f[0],
+            Call(
+                pos=int(f[1]),
+                ref=f[3].upper(),
+                alts=[a if s else a.upper() for a, s in zip(alts, sym)],
+                filter=f[6],
+                gt=gt,
+                end=_to_int(end_v[0]) if end_v else None,
+                svlen=[v if v is not None else 0 for v in (_to_int(x) for x in svlen_v)] if svlen_v else None,
+                gq=_to_int(sample.get("GQ")),
+                dp=_to_int(sample.get("DP")),
+                ps=sample.get("PS"),
+            ),
         )
 
 
 def iter_body_lines(path) -> Iterator[str]:
     with open_maybe_gzip(path) as fh:
         for raw in fh:
-            if raw.startswith(b"#"):
+            if raw.startswith(b"#") or not raw.strip():
                 continue
             yield raw.decode("utf-8", "replace")
 
 
-def split_by_contig(path, sample_index: int, workdir: str) -> dict[str, tuple[str, int]]:
+@dataclass
+class SplitResult:
+    index: dict[str, tuple[str, int]]  # contig -> (temp path, records)
+    format_keys: set[str]  # FORMAT keys used by any record
+
+
+def split_by_contig(path, sample_index: int, workdir: str, buffer_bytes: int = 32 << 20) -> SplitResult:
     """Stream a VCF once, writing each contig's calls for one sample to a temp file.
 
-    Returns ``{contig: (temp_path, n_records)}``. This lets the encoder handle
-    one chromosome at a time whatever the record order of the VCF.
+    This lets the encoder handle one chromosome at a time whatever the record
+    order of the VCF. Lines are buffered in memory and appended to the
+    per-contig files in batches, so only one file is open at a time however
+    many contigs there are. The FORMAT keys of every record are collected on
+    the way, so the choice of optional planes sees the whole file.
     """
-    handles: dict[str, object] = {}
+    buffers: dict[str, list[str]] = {}
     counts: Counter[str] = Counter()
     paths: dict[str, str] = {}
+    formats_seen: set[str] = set()
+    format_keys: set[str] = set()
+    buffered = 0
     col = 9 + sample_index
-    try:
-        for line in iter_body_lines(path):
-            tab = line.find("\t")
-            chrom = line[:tab]
-            fh = handles.get(chrom)
-            if fh is None:
-                p = os.path.join(workdir, f"contig{len(handles):05d}.vcf")
-                paths[chrom] = p
-                fh = handles[chrom] = open(p, "w", encoding="utf-8")
-            # keep the fixed columns plus the chosen sample only
-            parts = line.rstrip("\r\n").split("\t")
-            if len(parts) <= col:
-                raise VcfError(f"record at {parts[0]}:{parts[1]} has no column for sample {sample_index}")
-            fh.write("\t".join(parts[:9] + [parts[col]]) + "\n")
-            counts[chrom] += 1
-    finally:
-        for fh in handles.values():
-            fh.close()
-    return {c: (paths[c], counts[c]) for c in paths}
+
+    def flush() -> None:
+        nonlocal buffered
+        for chrom, lines in buffers.items():
+            if lines:
+                with open(paths[chrom], "a", encoding="utf-8") as fh:
+                    fh.writelines(lines)
+                lines.clear()
+        buffered = 0
+
+    for line in iter_body_lines(path):
+        parts = line.rstrip("\r\n").split("\t")
+        if len(parts) <= col:
+            raise VcfError(f"record at {parts[0]}:{parts[1] if len(parts) > 1 else '?'} has no column for sample {sample_index}")
+        chrom = parts[0]
+        if chrom not in paths:
+            paths[chrom] = os.path.join(workdir, f"contig{len(paths):05d}.vcf")
+            buffers[chrom] = []
+        if len(parts) > 8 and parts[8] not in formats_seen:
+            formats_seen.add(parts[8])
+            format_keys.update(parts[8].split(":"))
+        out = "\t".join(parts[:9] + [parts[col]]) + "\n"  # fixed columns plus the chosen sample
+        buffers[chrom].append(out)
+        buffered += len(out)
+        counts[chrom] += 1
+        if buffered >= buffer_bytes:
+            flush()
+    flush()
+    return SplitResult({c: (paths[c], counts[c]) for c in paths}, format_keys)
 
 
 # ----------------------------------------------------------------- alleles
 
 
 def parse_gt(gt: str) -> tuple[list[str], bool]:
-    """'0|1' -> (['0', '1'], True); '1/2' -> (['1', '2'], False); '1' -> (['1'], False)."""
-    if "|" in gt and "/" not in gt:
-        return gt.split("|"), True
-    return gt.replace("|", "/").split("/"), False
+    """'0|1' -> (['0', '1'], True); '1/2' -> (['1', '2'], False); '1' -> (['1'], False).
+
+    A missing genotype ('.' or empty) gives an empty list: the number of
+    alleles is unknown. A leading phase indicator (VCF 4.4, e.g. '|0|1') is
+    dropped.
+    """
+    g = gt.strip()
+    if g in ("", "."):
+        return [], False
+    if g[0] in "|/":
+        g = g[1:]
+    if "|" in g and "/" not in g:
+        return g.split("|"), True
+    return g.replace("|", "/").split("/"), False
 
 
 @dataclass
@@ -220,6 +271,7 @@ def allele_events(ref: str, alt: str) -> AlleleEvents:
         if rc[i] != ac[i]:
             ev.subs.append((p + i, C.BASE_TO_SUB.get(ac[i], C.HAP_UNKNOWN)))
     if len(ac) > k:
+        # p + k >= 1 here: with ALT longer, the suffix trim leaves REF's first base
         ev.ins.append((p + k - 1, ac[k:]))
     elif len(rc) > k:
         ev.dels.append((p + k, len(rc) - k))
@@ -233,12 +285,18 @@ def allele_events(ref: str, alt: str) -> AlleleEvents:
 class EncodeStats:
     records: int = 0
     skipped_out_of_range: int = 0
+    clipped_to_contig_end: int = 0
     ref_mismatches: int = 0
     conflicts: int = 0
+    ploidy_mismatches: int = 0
+    missing_genotypes: int = 0
     spanning_deletion_alleles: int = 0
+    spanning_deletions_reassigned: int = 0
     symbolic_alleles: int = 0
+    nonacgt_inserted_bases: int = 0
     polyploid_skipped: int = 0
     bad_allele_index: int = 0
+    ploidy: int | str = 2
     gt_counts: Counter = field(default_factory=Counter)
     examples: list[str] = field(default_factory=list)
 
@@ -247,16 +305,22 @@ class EncodeStats:
             self.examples.append(msg)
 
     def as_dict(self) -> dict:
-        return {
-            "records": self.records,
-            "skipped_out_of_range": self.skipped_out_of_range,
-            "ref_mismatches": self.ref_mismatches,
-            "conflicts": self.conflicts,
-            "spanning_deletion_alleles": self.spanning_deletion_alleles,
-            "symbolic_alleles": self.symbolic_alleles,
-            "polyploid_skipped": self.polyploid_skipped,
-            "bad_allele_index": self.bad_allele_index,
-        }
+        keys = (
+            "records",
+            "skipped_out_of_range",
+            "clipped_to_contig_end",
+            "ref_mismatches",
+            "conflicts",
+            "ploidy_mismatches",
+            "missing_genotypes",
+            "spanning_deletion_alleles",
+            "spanning_deletions_reassigned",
+            "symbolic_alleles",
+            "nonacgt_inserted_bases",
+            "polyploid_skipped",
+            "bad_allele_index",
+        )
+        return {k: getattr(self, k) for k in keys}
 
 
 @dataclass
@@ -268,6 +332,10 @@ class SidecarEntry:
 
     def to_tsv(self) -> str:
         return f"{self.offset}\t{self.hap}\t{self.kind}\t{self.data}"
+
+
+def _strong(states: np.ndarray) -> np.ndarray:
+    return (states != C.HAP_REF) & (states != C.HAP_UNKNOWN) & (states != C.HAP_ABSENT)
 
 
 class PlaneBuilder:
@@ -289,73 +357,101 @@ class PlaneBuilder:
         self.contig = contig
         self.length = n
         self.w = [np.zeros(n, dtype=np.uint8), np.zeros(n, dtype=np.uint8)]
+        # initial states (spec 6.1): callable regions first, then haploid regions
         if callable_mask is not None:
-            outside = ~callable_mask
-            self.w[0][outside] = C.HAP_UNKNOWN
-            self.w[1][outside] = C.HAP_UNKNOWN
+            np.copyto(self.w[0], C.HAP_UNKNOWN, where=~callable_mask)
+            np.copyto(self.w[1], C.HAP_UNKNOWN, where=~callable_mask)
         if haploid_mask is not None:
-            self.w[1][haploid_mask] = C.HAP_ABSENT
+            np.copyto(self.w[1], C.HAP_ABSENT, where=haploid_mask)
         self.flags = np.zeros(n, dtype=np.uint8)
         self.gq = np.full(n, C.QUAL_MISSING, dtype=np.uint8) if want_gq else None
         self.dp = np.full(n, C.QUAL_MISSING, dtype=np.uint8) if want_dp else None
-        self.ps = np.zeros(n, dtype=np.uint32) if want_ps else None
+        # phase sets are kept as ordinals (1, 2, ... in order of first use) while
+        # building and mapped to their final values in finish()
+        self.ps_ord = np.zeros(n, dtype=np.uint16) if want_ps else None
+        self.ps_keys: list[str] = []
+        self._ps_index: dict[str, int] = {}
         self.ps_ids: dict[str, int] = {}
-        self.ps_synthetic: dict[str, str] = {}
-        self.ins: dict[tuple[int, int], str] = {}
-        self.complex: list[SidecarEntry] = []
+        self.ins: dict[tuple[int, int], str] = {}  # (anchor offset, hap) -> inserted bases
+        self.complex: dict[tuple[int, int], str] = {}  # (offset, hap) -> COMPLEX sidecar data
         self.stats = EncodeStats()
-        self._ref_upper = None
 
     # -- helpers ---------------------------------------------------------
     def _ref_ok(self, start: int, allele: str) -> bool:
-        """REF allele bases must be compatible with the reference (IUPAC-aware)."""
+        """Each REF base must be an IUPAC letter whose set meets the reference base's (spec 6.7).
+
+        So N matches any base but not a gap, and '-', '.' or '*' never match.
+        """
         seg = np.bitwise_and(self.ref[start : start + len(allele)], 0x0F)
-        for i, ch in enumerate(allele):
-            bit = C.BASE_TO_SUB.get(ch)
-            if bit is None:
-                continue  # N or IUPAC in REF: accept
-            code = int(seg[i])
-            if code != C.BASE_N and not (code & bit):
-                return False
-        return True
+        raw = np.frombuffer(allele.encode("ascii", "replace"), dtype=np.uint8)
+        a = C.ASCII_TO_REF[raw]
+        ok = (a != C.INVALID) & ((np.bitwise_and(a, 0x0F) & seg) != 0)
+        return bool(ok.all())
 
-    def _write_states(self, h: int, start: int, states: np.ndarray) -> None:
-        """Write per-base states for haplotype ``h`` with the precedence rules.
+    def _write_states(self, h: int, start: int, states: np.ndarray, where: np.ndarray | None = None) -> np.ndarray:
+        """Write states for haplotype ``h`` with the precedence rules of spec 6.4.
 
-        Non-REF states always win (a different non-REF state already asserted
-        counts as a conflict; the later record wins). REF and UNKNOWN only
-        fill positions no record has asserted yet.
+        Strong states (bases, DEL, COMPLEX) always win; a different strong
+        state already asserted is a conflict and the later call wins. Weak
+        states (REF, UNKNOWN, ABSENT) only fill bases no call has asserted;
+        ABSENT meeting a base asserted with a strong state is also a
+        conflict (a haploid call against a diploid one). With ``where``,
+        only those bases are touched. Returns the mask of strong states
+        written.
         """
         w = self.w[h]
         end = start + states.shape[0]
         seg = w[start:end]
         asserted = (seg & _ASSERTED) != 0
         cur = seg & _STATE_MASK
-        weak = (states == C.HAP_REF) | (states == C.HAP_UNKNOWN)
-        strong = ~weak
-        conflict = asserted & strong & (cur != C.HAP_REF) & (cur != states) & (cur != C.HAP_UNKNOWN)
+        strong = _strong(states)
+        if where is not None:
+            strong &= where
+        cur_strong = _strong(cur)
+        conflict = asserted & cur_strong & ((strong & (cur != states)) | (states == C.HAP_ABSENT))
+        if where is not None:
+            conflict &= where
         if conflict.any():
             self.stats.conflicts += int(conflict.sum())
             self.stats.note(f"{self.contig}:{start + int(np.flatnonzero(conflict)[0]) + 1} conflicting states on hap{h + 1}")
-        new = np.where(strong, states, np.where(asserted, cur, states))
-        w[start:end] = new.astype(np.uint8) | _ASSERTED | (seg & _INS)
+        if h == 1:
+            mism = (cur == C.HAP_ABSENT) & ~asserted & (states != C.HAP_ABSENT)
+            if where is not None:
+                mism &= where
+            if mism.any():
+                self.stats.ploidy_mismatches += int(mism.sum())
+        new = np.where(strong, states, np.where(asserted, cur, states)).astype(np.uint8) | _ASSERTED | (seg & (_INS | _QBITS))
+        w[start:end] = new if where is None else np.where(where, new, seg)
+        return strong
 
-    def _write_scalar(self, h: int, pos: int, state: int) -> None:
+    def _write_scalar(self, h: int, pos: int, state: int) -> bool:
         w = self.w[h]
         v = int(w[pos])
         asserted = v & _ASSERTED
         cur = v & _STATE_MASK
-        if state in (C.HAP_REF, C.HAP_UNKNOWN):
+        keep = v & (_INS | _QBITS)
+        if h == 1 and cur == C.HAP_ABSENT and not asserted and state != C.HAP_ABSENT:
+            self.stats.ploidy_mismatches += 1
+        if state in _WEAK:
             if asserted:
-                return
-            w[pos] = state | _ASSERTED | (v & _INS)
-            return
-        if asserted and cur not in (C.HAP_REF, C.HAP_UNKNOWN, state):
+                if state == C.HAP_ABSENT and cur not in _WEAK:
+                    self.stats.conflicts += 1
+                    self.stats.note(f"{self.contig}:{pos + 1} haploid call meets a variant on hap2")
+                return False
+            w[pos] = state | _ASSERTED | keep
+            return False
+        if asserted and cur not in _WEAK and cur != state:
             self.stats.conflicts += 1
             self.stats.note(f"{self.contig}:{pos + 1} conflicting states on hap{h + 1}")
-        w[pos] = state | _ASSERTED | (v & _INS)
+        w[pos] = state | _ASSERTED | keep
+        return True
 
     def _add_insertion(self, h: int, anchor: int, seq: str) -> None:
+        seq = seq.upper().replace("U", "T")
+        bad = len(_ACGTN.findall(seq))
+        if bad:
+            self.stats.nonacgt_inserted_bases += bad
+            seq = _ACGTN.sub("N", seq)
         key = (anchor, h + 1)
         if key in self.ins and self.ins[key] != seq:
             self.stats.conflicts += 1
@@ -363,24 +459,20 @@ class PlaneBuilder:
         self.ins[key] = seq
         self.w[h][anchor] |= _INS
 
-    def _ps_value(self, ps: str) -> int:
-        """VCF PS -> ps-plane value: the PS integer itself when it fits in 1..2^32-1.
-
-        Other identifiers (0, negative, non-numeric) get synthetic values
-        counting down from 2^32-1; the mapping is kept in ``ps_synthetic``.
-        """
-        v = self.ps_ids.get(ps)
-        if v is not None:
-            return v
+    def _ps_ordinal(self, ps: str) -> int:
         try:
             v = int(ps)
+            if 1 <= v <= 0xFFFFFFFF:
+                ps = str(v)  # '077' and '77' are the same VCF integer
         except ValueError:
-            v = -1
-        if not (1 <= v <= 0xFFFFFFFF):
-            v = 0xFFFFFFFF - len(self.ps_synthetic)
-            self.ps_synthetic[str(v)] = ps
-        self.ps_ids[ps] = v
-        return v
+            pass
+        i = self._ps_index.get(ps)
+        if i is None:
+            self.ps_keys.append(ps)
+            i = self._ps_index[ps] = len(self.ps_keys)
+            if i > 0xFFFF and self.ps_ord.dtype == np.uint16:
+                self.ps_ord = self.ps_ord.astype(np.uint32)
+        return i
 
     # -- main entry ------------------------------------------------------
     def add(self, call: Call) -> None:
@@ -388,18 +480,24 @@ class PlaneBuilder:
         st.records += 1
         p0 = call.pos - 1
         alts = call.alts
-        only_refblock = not alts or all(a in _REFBLOCK_ALTS for a in alts)
-        symbolic = any(_SYMBOLIC.match(a) for a in alts)
-        span_end = p0 + max(len(call.ref), 1)
-        end = call.end
-        if end is None and symbolic and call.svlen is not None:
-            end = call.pos + abs(call.svlen)
-        if end is not None and (only_refblock or symbolic):
-            span_end = max(span_end, end)
-        if p0 < 0 or span_end > self.length:
+        n = self.length
+        if p0 < 0 or p0 >= n or p0 + len(call.ref) > n:
             st.skipped_out_of_range += 1
-            st.note(f"{self.contig}:{call.pos} outside contig (length {self.length})")
+            st.note(f"{self.contig}:{call.pos} outside the contig (length {n})")
             return
+        only_refblock = not alts or all(a in _REFBLOCK_ALTS for a in alts)
+        symbolic = any(is_symbolic(a) for a in alts)
+        span_end = p0 + max(len(call.ref), 1)
+        if call.end is not None and (only_refblock or symbolic):
+            span_end = max(span_end, call.end)
+        elif symbolic and call.svlen:
+            for i, a in enumerate(alts):
+                if a.startswith("<DEL") and i < len(call.svlen) and call.svlen[i]:
+                    span_end = max(span_end, call.pos + abs(call.svlen[i]))
+        if span_end > n:
+            st.clipped_to_contig_end += 1
+            st.note(f"{self.contig}:{call.pos} span clipped at the contig end")
+            span_end = n
         if not self._ref_ok(p0, call.ref):
             st.ref_mismatches += 1
             st.note(f"{self.contig}:{call.pos} REF {call.ref} does not match the reference")
@@ -410,107 +508,180 @@ class PlaneBuilder:
             st.polyploid_skipped += 1
             st.note(f"{self.contig}:{call.pos} ploidy {len(alleles)} not supported in gpxil 0.1")
             return
-        haploid = len(alleles) == 1
-
-        m = len(call.ref)
-        for h, a in enumerate(alleles):
-            self._apply_allele(h, a, call, p0, m, span_end)
-        if haploid:
-            span = span_end - p0
-            if span == 1:
-                self._write_scalar(1, p0, C.HAP_ABSENT)
-            else:
-                self._write_states(1, p0, np.full(span, C.HAP_ABSENT, dtype=np.uint8))
+        span = span_end - p0
+        strong = np.zeros(span, dtype=bool)
+        if not alleles:
+            # missing genotype: both haplotypes unknown, but an absent haplotype 2 is
+            # left as it is (and not asserted: the call says nothing about ploidy)
+            st.missing_genotypes += 1
+            unknown = np.full(span, C.HAP_UNKNOWN, dtype=np.uint8)
+            self._write_states(0, p0, unknown)
+            self._write_states(1, p0, unknown, where=(self.w[1][p0:span_end] & _STATE_MASK) != C.HAP_ABSENT)
+        else:
+            if len(alleles) == 2 and not phased:
+                alleles = self._place_spanning_deletion(alleles, call, p0, span_end)
+            for h, a in enumerate(alleles):
+                s = self._apply_allele(h, a, call, p0, len(call.ref), span_end)
+                if s is not None:
+                    strong |= s
+            if len(alleles) == 1:  # haploid call
+                if span == 1:
+                    self._write_scalar(1, p0, C.HAP_ABSENT)
+                else:
+                    self._write_states(1, p0, np.full(span, C.HAP_ABSENT, dtype=np.uint8))
 
         f = C.FLAG_VARIANT_SITE
-        if phased and not haploid:
+        if phased and len(alleles) == 2:
             f |= C.FLAG_PHASED
         if call.filter not in ("PASS", "."):
             f |= C.FLAG_FILTERED
         self.flags[p0:span_end] |= f
-        if self.gq is not None and call.gq is not None:
-            self.gq[p0:span_end] = min(max(call.gq, 0), C.QUAL_MAX)
-        if self.dp is not None and call.dp is not None:
-            self.dp[p0:span_end] = min(max(call.dp, 0), C.QUAL_MAX)
-        if self.ps is not None and phased and call.ps not in (None, ".", ""):
-            self.ps[p0:span_end] = self._ps_value(call.ps)
+        self._annotate(call, p0, span_end, strong, phased and len(alleles) == 2)
 
-    def _apply_allele(self, h: int, a: str, call: Call, p0: int, m: int, span_end: int) -> None:
+    def _annotate(self, call: Call, p0: int, span_end: int, strong: np.ndarray, phased: bool) -> None:
+        """gq, dp and ps over the call's span (spec 6.5).
+
+        For each field separately, a call that wrote a strong state to a base
+        (on either haplotype) takes precedence there over calls that did not;
+        among equals the later call wins.
+        """
+        jobs = []
+        if self.gq is not None and call.gq is not None:
+            jobs.append((self.gq, _Q_GQ, lambda: min(max(call.gq, 0), C.QUAL_MAX)))
+        if self.dp is not None and call.dp is not None:
+            jobs.append((self.dp, _Q_DP, lambda: min(max(call.dp, 0), C.QUAL_MAX)))
+        if self.ps_ord is not None and phased and call.ps not in (None, ".", ""):
+            ordinal = self._ps_ordinal(call.ps)  # numbered at first appearance (spec 5.5)
+            jobs.append((None, _Q_PS, lambda: ordinal))
+        any_strong = bool(strong.any())
+        for arr, (h, bit), value in jobs:
+            w = self.w[h][p0:span_end]
+            write = strong | ((w & bit) == 0)
+            if write.any():
+                v = value()  # for ps this may widen self.ps_ord, so look the array up afterwards
+                target = self.ps_ord if arr is None else arr
+                target[p0:span_end][write] = v
+            if any_strong:
+                w[strong] |= bit
+
+    def _place_spanning_deletion(self, alleles: list[str], call: Call, p0: int, span_end: int) -> list[str]:
+        """Unphased genotype with a '*' allele: put '*' on the haplotype with the deletion.
+
+        In an unphased genotype the allele order means nothing, so when exactly
+        one haplotype already carries an asserted deletion over this record,
+        '*' (the overlapping deletion) belongs to that haplotype (spec 6.5).
+        """
+        star = []
+        for i, a in enumerate(alleles):
+            if a.isdigit() and 0 < int(a) <= len(call.alts) and call.alts[int(a) - 1] == "*":
+                star.append(i)
+        if len(star) != 1:
+            return alleles
+        deleted = []
+        for h in (0, 1):
+            seg = self.w[h][p0:span_end]
+            if (((seg & _STATE_MASK) == C.HAP_DEL) & ((seg & _ASSERTED) != 0)).any():
+                deleted.append(h)
+        if len(deleted) == 1 and deleted[0] != star[0]:
+            self.stats.spanning_deletions_reassigned += 1
+            return [alleles[1], alleles[0]]
+        return alleles
+
+    def _apply_allele(self, h: int, a: str, call: Call, p0: int, m: int, span_end: int) -> np.ndarray | None:
+        """Apply one haplotype's allele; returns the mask of strong states written (or None)."""
         st = self.stats
+        span = span_end - p0
         if a == ".":
-            span = span_end - p0
             if span == 1:
                 self._write_scalar(h, p0, C.HAP_UNKNOWN)
             else:
                 self._write_states(h, p0, np.full(span, C.HAP_UNKNOWN, dtype=np.uint8))
-            return
+            return None
         try:
             idx = int(a)
         except ValueError:
             st.bad_allele_index += 1
-            return
+            st.note(f"{self.contig}:{call.pos} GT allele {a!r} is not a number")
+            return None
         if idx == 0:
-            span = span_end - p0
             if span == 1:
                 self._write_scalar(h, p0, C.HAP_REF)
             else:
                 self._write_states(h, p0, np.zeros(span, dtype=np.uint8))
-            return
-        if idx > len(call.alts):
+            return None
+        if idx < 0 or idx > len(call.alts):
             st.bad_allele_index += 1
-            st.note(f"{self.contig}:{call.pos} GT allele {idx} but only {len(call.alts)} ALT alleles")
-            return
+            st.note(f"{self.contig}:{call.pos} GT allele {idx} but {len(call.alts)} ALT alleles")
+            return None
         alt = call.alts[idx - 1]
         if alt == "*":
-            # Spanning deletion: the deleting record upstream already set DEL.
+            # spanning deletion: the record that starts the deletion set DEL
             st.spanning_deletion_alleles += 1
-            return
+            return None
         if alt in _REFBLOCK_ALTS:
-            # "some other allele" placeholder from gVCF: base unknown
-            self._write_states(h, p0, np.full(span_end - p0, C.HAP_UNKNOWN, dtype=np.uint8))
-            return
-        if alt.startswith("<") or "[" in alt or "]" in alt:
+            # "any other allele" placeholder from gVCF: the bases are unknown
+            self._write_states(h, p0, np.full(span, C.HAP_UNKNOWN, dtype=np.uint8))
+            return None
+        if is_symbolic(alt):
             st.symbolic_alleles += 1
-            self._apply_symbolic(h, alt, call, p0, span_end)
-            return
+            return self._apply_symbolic(h, alt, idx - 1, call, p0, span_end)
         ev = allele_events(call.ref, alt)
-        if m == 1 and not ev.dels and not ev.ins and len(ev.subs) == 1:
-            self._write_scalar(h, p0, ev.subs[0][1])  # plain SNV, the common case
-            return
-        states = np.zeros(m, dtype=np.uint8)
+        out = np.zeros(span, dtype=bool)
+        if span == 1 and not ev.dels and not ev.ins and len(ev.subs) == 1:
+            state = ev.subs[0][1]
+            if state == self.ref[p0] & 0x0F:  # possible only when REF disagrees with the reference
+                state = C.HAP_REF
+            out[0] = self._write_scalar(h, p0, state)  # plain SNV, the common case
+            return out
+        # states over the record's whole span: REF wherever the allele does not differ
+        states = np.zeros(span, dtype=np.uint8)
         for off, s in ev.subs:
             states[off] = s
         for off, length in ev.dels:
             states[off : off + length] = C.HAP_DEL
-        self._write_states(h, p0, states)
+        same = np.isin(states, C.HAP_SUB_CODES) & (states == np.bitwise_and(self.ref[p0:span_end], 0x0F))
+        states[same] = C.HAP_REF  # a "substitution" to the reference base itself is REF (spec 5.2)
+        out[:] = self._write_states(h, p0, states)
         for anchor, seq in ev.ins:
-            pos = p0 + anchor
-            if pos < 0:
-                self._mark_complex(h, p0, p0 + m, f"REF={call.ref};ALT={alt}")
-                continue
-            self._add_insertion(h, pos, seq)
+            self._add_insertion(h, p0 + anchor, seq)
+            out[anchor] = True  # an insertion changes the haplotype at its anchor (spec 6.5)
+        return out
 
-    def _apply_symbolic(self, h: int, alt: str, call: Call, p0: int, span_end: int) -> None:
+    def _apply_symbolic(self, h: int, alt: str, alt_index: int, call: Call, p0: int, span_end: int) -> np.ndarray:
+        out = np.zeros(span_end - p0, dtype=bool)
         end = call.end
-        if end is None and call.svlen is not None:
-            end = call.pos + abs(call.svlen)
+        if end is None and alt.startswith("<DEL") and call.svlen and alt_index < len(call.svlen) and call.svlen[alt_index]:
+            end = call.pos + abs(call.svlen[alt_index])
         if alt.startswith("<DEL") and end is not None and end > call.pos:
-            # SV deletion: POS is the padding base; bases POS+1..END are deleted
+            # SV deletion: POS is the padding base, kept; bases POS+1..END are deleted
+            self._write_scalar(h, p0, C.HAP_REF)
             del_start, del_end = p0 + 1, min(end, self.length)
-            self._write_states(h, del_start, np.full(del_end - del_start, C.HAP_DEL, dtype=np.uint8))
-            return
+            if del_end > del_start:
+                s = self._write_states(h, del_start, np.full(del_end - del_start, C.HAP_DEL, dtype=np.uint8))
+                out[1 : 1 + s.shape[0]] = s
+            return out
         data = f"REF={call.ref};ALT={alt}" + (f";END={end}" if end is not None else "")
-        self._mark_complex(h, p0, p0 + 1, data)
-
-    def _mark_complex(self, h: int, start: int, end: int, data: str) -> None:
-        self._write_states(h, start, np.full(end - start, C.HAP_COMPLEX, dtype=np.uint8))
-        self.complex.append(SidecarEntry(start, h + 1, "COMPLEX", data))
+        self._write_states(h, p0, np.array([C.HAP_COMPLEX], dtype=np.uint8))
+        key = (p0, h + 1)
+        if key in self.complex and self.complex[key] != data:
+            self.stats.conflicts += 1  # two different structural alleles on one haplotype base
+            self.stats.note(f"{self.contig}:{call.pos} two COMPLEX alleles on hap{h + 1}")
+        self.complex[key] = data
+        out[0] = True
+        return out
 
     # -- result ----------------------------------------------------------
     def finish(self, chunk: int = 1 << 24) -> tuple[dict[str, np.ndarray], list[SidecarEntry]]:
         n = self.length
+        # a COMPLEX allele later replaced by another call's variant leaves no COMPLEX state: drop its entry
+        complex_entries = [
+            SidecarEntry(off, hap, "COMPLEX", data)
+            for (off, hap), data in self.complex.items()
+            if (self.w[hap - 1][off] & _STATE_MASK) == C.HAP_COMPLEX
+        ]
         gt = np.empty(n, dtype=np.uint8)
         flags = self.flags
+        absent2 = 0
         for s in range(0, n, chunk):  # chunked, so no full-length temporaries
             e = min(n, s + chunk)
             rb = np.bitwise_and(self.ref[s:e], 0x0F)
@@ -523,26 +694,68 @@ class PlaneBuilder:
                 if same.any():
                     w[same] &= ~np.uint8(_STATE_MASK)
             gt[s:e] = ((w1 & _STATE_MASK) << 4) | (w2 & _STATE_MASK)
+            absent2 += int(((w2 & _STATE_MASK) == C.HAP_ABSENT).sum())
             fl = flags[s:e]
             fl[(w1 & _INS) != 0] |= C.FLAG_INS1
             fl[(w2 & _INS) != 0] |= C.FLAG_INS2
         self.w = [None, None]  # release the working arrays
+        self.stats.ploidy = 1 if absent2 == n else (2 if absent2 == 0 else "mixed")
         planes = {"gt": gt, "flags": flags}
         if self.gq is not None:
             planes["gq"] = self.gq
         if self.dp is not None:
             planes["dp"] = self.dp
-        if self.ps is not None:
-            planes["ps"] = self.ps
-        side = [SidecarEntry(a, h, "INS", s) for (a, h), s in self.ins.items()] + self.complex
+        if self.ps_ord is not None:
+            planes["ps"] = self._finish_ps(chunk)
+        side = [SidecarEntry(a, h, "INS", s) for (a, h), s in self.ins.items()] + complex_entries
         side.sort(key=lambda e: (e.offset, e.hap, e.kind))
         return planes, side
+
+    def _finish_ps(self, chunk: int) -> np.ndarray:
+        """Map phase-set ordinals to stored values (spec 5.5).
+
+        An integer PS in 1..2^32-1 is stored as is. Other identifiers get the
+        largest values not used by an integer PS on this contig, in order of
+        first appearance. Identifiers that end up on no base (every base of
+        their calls taken by other calls) are dropped.
+        """
+        nkeys = len(self.ps_keys)
+        counts = np.zeros(nkeys + 1, dtype=np.int64)
+        for s in range(0, self.length, chunk):
+            counts += np.bincount(self.ps_ord[s : s + chunk], minlength=nkeys + 1)
+        used = [i for i in range(1, nkeys + 1) if counts[i]]
+        ints: dict[int, int] = {}
+        for i in used:
+            try:
+                v = int(self.ps_keys[i - 1])
+            except ValueError:
+                continue
+            if 1 <= v <= 0xFFFFFFFF:
+                ints[i] = v
+        taken = set(ints.values())
+        lut = np.zeros(nkeys + 1, dtype=np.uint32)
+        nxt = 0xFFFFFFFF
+        for i in used:
+            v = ints.get(i)
+            if v is None:
+                while nxt in taken:
+                    nxt -= 1
+                v = nxt
+                taken.add(v)
+            lut[i] = v
+            self.ps_ids[self.ps_keys[i - 1]] = int(v)
+        ps = np.empty(self.length, dtype=np.uint32)
+        for s in range(0, self.length, chunk):
+            ps[s : s + chunk] = lut[self.ps_ord[s : s + chunk]]
+        self.ps_ord = None
+        return ps
 
 
 def load_bed(path, contig: str, length: int, aliases: Iterable[str] = ()) -> np.ndarray | None:
     """Boolean mask of positions covered by BED intervals on ``contig``.
 
-    Returns None if the BED has no intervals for this contig under any alias.
+    Columns may be separated by tabs or spaces. Returns None if the BED has
+    no intervals for this contig under any alias.
     """
     names = {contig, *aliases}
     mask = np.zeros(length, dtype=bool)
@@ -551,7 +764,7 @@ def load_bed(path, contig: str, length: int, aliases: Iterable[str] = ()) -> np.
         for raw in fh:
             if raw.startswith((b"#", b"track", b"browser")) or not raw.strip():
                 continue
-            f = raw.decode().split("\t")
+            f = raw.decode().split()
             if f[0] in names:
                 seen = True
                 s, e = int(f[1]), int(f[2])
@@ -585,21 +798,6 @@ def encode_calls(
     return out, side, builder.stats, builder.ps_ids
 
 
-def scan_formats(path, sample_index: int, max_records: int = 20000) -> set[str]:
-    """FORMAT keys present (with a value) for the sample in the first records."""
-    keys: set[str] = set()
-    col = 9 + sample_index
-    for i, line in enumerate(iter_body_lines(path)):
-        if i >= max_records:
-            break
-        f = line.rstrip("\r\n").split("\t")
-        if len(f) > col:
-            for k, v in zip(f[8].split(":"), f[col].split(":")):
-                if v not in (".", ""):
-                    keys.add(k)
-    return keys
-
-
 class TempSplit:
     """Context manager around :func:`split_by_contig` with automatic cleanup."""
 
@@ -608,10 +806,12 @@ class TempSplit:
         self.sample_index = sample_index
         self._tmp = None
         self.index: dict[str, tuple[str, int]] = {}
+        self.format_keys: set[str] = set()
 
-    def __enter__(self) -> "TempSplit":
+    def __enter__(self) -> TempSplit:
         self._tmp = tempfile.TemporaryDirectory(prefix="gpxil-vcf-")
-        self.index = split_by_contig(self.path, self.sample_index, self._tmp.name)
+        res = split_by_contig(self.path, self.sample_index, self._tmp.name)
+        self.index, self.format_keys = res.index, res.format_keys
         return self
 
     def calls(self, chrom: str) -> Iterator[Call]:

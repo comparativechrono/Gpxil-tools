@@ -12,8 +12,9 @@ import base64
 import gzip
 import hashlib
 import io
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import BinaryIO, Iterator
+from typing import BinaryIO
 
 import numpy as np
 
@@ -71,14 +72,24 @@ def encode_sequence(seq: bytes, *, name: str = "", offset: int = 0, invalid: str
     return codes
 
 
-def iter_fasta(path, *, invalid: str = "error") -> Iterator[FastaRecord]:
-    """Yield one :class:`FastaRecord` per sequence in a FASTA file."""
+def iter_fasta(path, *, invalid: str = "error", only: set[str] | None = None) -> Iterator[FastaRecord]:
+    """Yield one :class:`FastaRecord` per sequence in a FASTA file.
+
+    With ``only``, records with other names are skipped without being
+    decoded, which makes finding one chromosome in a genome fast.
+    """
     with open_maybe_gzip(path) as fh:
-        yield from _iter_fasta_stream(fh, invalid=invalid)
+        yield from _iter_fasta_stream(fh, invalid=invalid, only=only)
 
 
-def _iter_fasta_stream(fh: BinaryIO, *, invalid: str) -> Iterator[FastaRecord]:
+def _header_name(header: bytes) -> str:
+    parts = header.decode("utf-8", "replace").split(None, 1)
+    return parts[0] if parts else ""
+
+
+def _iter_fasta_stream(fh: BinaryIO, *, invalid: str, only: set[str] | None = None) -> Iterator[FastaRecord]:
     header: bytes | None = None
+    skip = False
     parts: list[bytes] = []
     pending = b""
     while True:
@@ -96,11 +107,12 @@ def _iter_fasta_stream(fh: BinaryIO, *, invalid: str) -> Iterator[FastaRecord]:
         n = len(data)
         while pos < n:
             if data.startswith(b">", pos):
-                if header is not None:
+                if header is not None and not skip:
                     yield _make_record(header, parts, invalid)
                 eol = data.find(b"\n", pos)
                 eol = n if eol == -1 else eol
                 header = data[pos + 1 : eol].rstrip(b"\r")
+                skip = only is not None and _header_name(header) not in only
                 parts = []
                 pos = eol + 1
                 continue
@@ -109,12 +121,12 @@ def _iter_fasta_stream(fh: BinaryIO, *, invalid: str) -> Iterator[FastaRecord]:
             if header is None:
                 if data[pos:end].strip():
                     raise FastaError("sequence data before the first '>' header line")
-            else:
+            elif not skip:
                 parts.append(data[pos:end])
             pos = end
         if final:
             break
-    if header is not None:
+    if header is not None and not skip:
         yield _make_record(header, parts, invalid)
 
 
@@ -122,7 +134,7 @@ def _make_record(header: bytes, parts: list[bytes], invalid: str) -> FastaRecord
     text = header.decode("utf-8", "replace").strip()
     if not text:
         raise FastaError("empty FASTA header")
-    name, _, desc = text.partition(" ")
+    name, desc = (text.split(None, 1) + [""])[:2]  # the name ends at any whitespace (tab or space)
     # Encode block by block into one preallocated array, releasing each text
     # block as soon as it is encoded: peak memory stays near 2 bytes per base.
     total = 0
@@ -145,23 +157,35 @@ def read_fasta(path, *, invalid: str = "error") -> list[FastaRecord]:
     return list(iter_fasta(path, invalid=invalid))
 
 
+class SequenceDigester:
+    """Incremental :func:`sequence_digests`: feed ref codes chunk by chunk."""
+
+    def __init__(self) -> None:
+        self._md5 = hashlib.md5()
+        self._sha = hashlib.sha512()
+
+    def update(self, codes: np.ndarray, step: int = 1 << 24) -> None:
+        for s in range(0, codes.shape[0], step):
+            upper = REF_TO_ASCII[np.bitwise_and(codes[s : s + step], 0x0F)].tobytes()
+            self._md5.update(upper)
+            self._sha.update(upper)
+
+    def result(self) -> dict[str, str]:
+        refget = "SQ." + base64.urlsafe_b64encode(self._sha.digest()[:24]).decode("ascii")
+        return {"md5": self._md5.hexdigest(), "refget": refget}
+
+
 def sequence_digests(codes: np.ndarray) -> dict[str, str]:
     """MD5 (as in SAM ``@SQ M5``) and GA4GH refget ``sha512t24u`` of a sequence.
 
-    Both digests are over the uppercase sequence, so they identify the
-    reference independently of soft-masking.
+    Both digests are over the sequence as decoded from the ref plane, in
+    uppercase: one IUPAC letter per base, ``-`` for "no base". They identify
+    the reference independently of soft-masking, and for a FASTA of IUPAC
+    letters they equal the digests other tools compute from the FASTA.
     """
-    md5_h = hashlib.md5()
-    sha_h = hashlib.sha512()
-    step = 1 << 24
-    for s in range(0, codes.shape[0], step):
-        upper = REF_TO_ASCII[np.bitwise_and(codes[s : s + step], 0x0F)].tobytes()
-        md5_h.update(upper)
-        sha_h.update(upper)
-    md5 = md5_h.hexdigest()
-    sha = sha_h.digest()[:24]
-    refget = "SQ." + base64.urlsafe_b64encode(sha).decode("ascii")
-    return {"md5": md5, "refget": refget}
+    d = SequenceDigester()
+    d.update(codes)
+    return d.result()
 
 
 def write_fasta(out: io.TextIOBase | BinaryIO, name: str, seq: bytes, *, line_width: int = 60, description: str = "") -> None:

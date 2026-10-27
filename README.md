@@ -50,6 +50,9 @@ gpxil book HG002.gpxil.tif -o proof.pdf --max-pages 10 --rgb
 gpxil fasta HG002.gpxil.tif --which 1 --region chr21:5,000,001-6,000,000 -o hap1.fa
 gpxil vcf HG002.gpxil.tif -o HG002.from-gpxil.vcf
 
+# a file written with --no-ref holds only the sample; give the reference back
+gpxil vcf HG002.noref.gpxil.tif --reference GRCh38.fa.gz -o HG002.from-gpxil.vcf
+
 gpxil palettes
 ```
 
@@ -73,7 +76,9 @@ with GpxilFile("HG002.gpxil.tif") as g:
     chr21 = g["chr21"]                                 # "21" works too (aliases)
     ref = chr21.read("ref", 30_000_000, 30_010_000)    # uint8, one value per base
     gt = chr21.read("gt", 30_000_000, 30_010_000)      # high nibble hap 1, low nibble hap 2
-    het = (codes.hap1(gt) == 0) != (codes.hap2(gt) == 0)
+    h1, h2 = codes.hap1(gt), codes.hap2(gt)
+    sub1, sub2 = np.isin(h1, codes.HAP_SUB_CODES), np.isin(h2, codes.HAP_SUB_CODES)
+    het_snv = (sub1 & (h2 == 0)) | (sub2 & (h1 == 0)) | (sub1 & sub2 & (h1 != h2))
     dose = codes.dosage(ref, gt)                       # (10000, 4) copies of A, C, G, T
     seq1 = haplotype_sequence(chr21, 1, 30_000_000, 30_010_000)
     picture = render(chr21, start=30_000_000, end=30_250_000, bases_per_row=500)
@@ -128,7 +133,7 @@ Measured on 2 cores with GRCh38 (Ensembl 116) and the GIAB HG002 v5.0q calls:
 | chr21 reference, Deflate | 11.3 MB (1.93 bits per base; the FASTA.gz is 12.6 MB) |
 | chr21 genotype, flags and side table | 0.68 MB (the VCF.gz is 0.94 MB) |
 | read a random 1 kb interval | 0.6 ms |
-| whole genome, HG002 | 889 MB, encoded in 12.5 minutes, validated in 2 minutes |
+| whole genome, HG002 | 888 MB, encoded in 12.6 minutes (at most 2 GB of memory), validated in 1.5 minutes |
 
 [`benchmarks/bench_representations.py`](benchmarks/bench_representations.py)
 reproduces the comparison with PNG, WebP, JPEG XL, tiles, Hilbert layout,
@@ -138,10 +143,11 @@ discusses the results.
 ## Correctness
 
 The tests compare reconstructed haplotypes against simulated genomes with
-known haplotypes and against `bcftools consensus`, and check that exporting
-to VCF and re-encoding gives back the same planes. On HG002 chr21 the
-haplotypes agree with bcftools on every non-overlapping record; where records
-overlap (`*` alleles), gpxiltools applies both records and bcftools skips one.
+known haplotypes and against `bcftools consensus`, check that exporting to
+VCF and re-encoding gives back the same haplotypes, and pin down each rule of
+the conversion with small hand-made cases. On HG002 chr21 the haplotypes
+agree with bcftools on every non-overlapping record; where records overlap
+(`*` alleles), gpxiltools applies both records and bcftools skips one.
 
 ## Limits of version 0.1
 
@@ -163,3 +169,8 @@ git clone https://github.com/comparativechrono/Gpxil-tools && cd Gpxil-tools
 pip install -e ".[test]"
 pytest
 ```
+
+## Licence
+
+Copyright © 2026 Chronomic Medicine Group, Department of Genomic Medicine,
+University of Cambridge. Released under the [MIT licence](LICENSE).

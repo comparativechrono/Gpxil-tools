@@ -24,7 +24,7 @@ def test_write_read_region_access(tmp_path, compression):
     flags[10] = C.FLAG_VARIANT_SITE | C.FLAG_INS2
     side = [SidecarEntry(10, 2, "INS", "ACGT")]
     p = tmp_path / "x.gpxil.tif"
-    with GpxilWriter(p, width=1000, compression=compression, strip_bytes=4096, reference={"name": "test"}) as w:
+    with GpxilWriter(p, width=1000, compression=compression, strip_bytes=4096, reference={"name": "test"}, sample={"id": "S"}) as w:
         w.add_contig("chrA", {"ref": a, "gt": gt, "flags": flags}, sidecar=side, aliases=["A"])
         w.add_contig("chrB", {"ref": b}, width=64)
     with GpxilFile(p) as g:
@@ -97,11 +97,11 @@ def test_validator_catches_bad_codes(tmp_path):
     gt[4] = ref[4] & 0x0F  # substitution equal to the reference base
     flags = np.zeros(500, dtype=np.uint8)
     flags[9] = C.FLAG_INS1  # flag without a sidecar entry
-    with GpxilWriter(p, width=50) as w:
+    with GpxilWriter(p, width=50, sample={"id": "S"}) as w:
         w.add_contig("c", {"ref": ref, "gt": gt, "flags": flags}, md5="0" * 32)
     rep = validate(p)
     text = "\n".join(rep.errors)
-    assert "invalid hap1 state 0x7" in text
+    assert "invalid hap1 states at 1 positions (first offset 3)" in text
     assert "equals the reference base" in text
     assert "INS1 flags" in text
     assert "md5" in text

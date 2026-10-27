@@ -1,4 +1,4 @@
-"""Reading and writing the GPXIL-TIFF container (spec section 7).
+"""Reading and writing the GPXIL-TIFF container (spec section 8).
 
 A gpxil file is an ordinary multi-page TIFF: one page per (contig, plane),
 8-bit palette pages for the categorical planes so any image viewer shows a
@@ -15,8 +15,8 @@ import math
 import os
 import re
 import zlib
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 import tifffile
@@ -55,21 +55,39 @@ DEFAULT_WIDTH = 8192
 DEFAULT_STRIP_BYTES = 1 << 18
 
 
+CLASSIC_TIFF_LIMIT = (1 << 32) - (1 << 26)  #: stay 64 MiB clear of the 4 GiB classic-TIFF offset limit
+
+
 class GpxilFormatError(ValueError):
     pass
 
 
+class BigTiffNeeded(GpxilFormatError):
+    """Raised by a writer in automatic mode when the file would pass 4 GiB as classic TIFF."""
+
+
+class MissingPlaneError(KeyError):
+    """A contig does not have the requested plane."""
+
+    def __str__(self) -> str:
+        return str(self.args[0]) if self.args else ""
+
+
 _EXT_NAME = re.compile(r"^x-[A-Za-z0-9_-]+$")
-_BAD_CONTIG_CHARS = re.compile(r"[\s\x00-\x1f\x7f]")
+_CONTIG_NAME = re.compile(r"^[\x21-\x7e]+$")
+
+
+def check_contig_name(name: str) -> None:
+    """Contig names are printable ASCII without spaces (spec 9.3)."""
+    if not isinstance(name, str) or not _CONTIG_NAME.match(name):
+        raise GpxilFormatError(f"contig name {name!r} must be non-empty printable ASCII without whitespace")
 
 
 def plane_dtype(name: str, arr: np.ndarray | None = None) -> np.dtype:
     if name in STANDARD_PLANES:
         return np.dtype(STANDARD_PLANES[name]["dtype"])
     if not _EXT_NAME.match(name):
-        raise GpxilFormatError(
-            f"plane name {name!r} is neither standard ({', '.join(PLANE_ORDER)}) nor an extension name x-[A-Za-z0-9_-]+"
-        )
+        raise GpxilFormatError(f"plane name {name!r} is neither standard ({', '.join(PLANE_ORDER)}) nor an extension name x-[A-Za-z0-9_-]+")
     if arr is None:
         raise GpxilFormatError(f"extension plane {name!r} needs data to infer its dtype")
     if arr.dtype.name not in EXTENSION_DTYPES:
@@ -168,8 +186,9 @@ class GpxilWriter:
         self.reference = reference or {}
         self.sample = sample
         self.extra_metadata = metadata or {}
-        if bigtiff is None:
-            bigtiff = compression == "none"
+        # bigtiff=None: classic TIFF, raising BigTiffNeeded before the file
+        # could pass 4 GiB (gpxiltools.encode then starts again as BigTIFF)
+        self._auto_bigtiff = bigtiff is None
         self.bigtiff = bool(bigtiff)
         self._tw = tifffile.TiffWriter(self.path, bigtiff=self.bigtiff)
         self._page = 0
@@ -184,15 +203,27 @@ class GpxilWriter:
         self._plane_dtypes: dict[str, str] = {}
         self._closed = False
 
-    def __enter__(self) -> "GpxilWriter":
+    def __enter__(self) -> GpxilWriter:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if exc_type is None:
             self.close()
         else:
-            self._tw.close()
+            self.abort()
+
+    def abort(self) -> None:
+        """Close and delete a file that could not be completed."""
+        if not self._closed:
+            try:
+                self._tw.close()
+            except Exception:
+                pass
             self._closed = True
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
 
     def add_contig(
         self,
@@ -207,8 +238,7 @@ class GpxilWriter:
         """Write all planes of one contig. ``extra`` goes into its metadata entry."""
         if self._closed:
             raise RuntimeError("writer is closed")
-        if not name or _BAD_CONTIG_CHARS.search(name):
-            raise GpxilFormatError(f"contig name {name!r} is empty or contains whitespace/control characters")
+        check_contig_name(name)
         if name in self._names:
             raise GpxilFormatError(f"duplicate contig name {name!r}")
         if not planes:
@@ -219,10 +249,24 @@ class GpxilWriter:
         bad = {p: n for p, n in lengths.items() if n != length}
         if bad:
             raise GpxilFormatError(f"contig {name!r}: planes {bad} differ from length {length}")
+        if length < 1:
+            raise GpxilFormatError(f"contig {name!r} is empty; contigs must have at least one base")
         if sidecar and "gt" not in planes:
             raise GpxilFormatError("a sidecar is stored with the gt plane, which is missing")
+        if "gt" in planes and "flags" not in planes:
+            raise GpxilFormatError(f"contig {name!r}: a gt plane needs a flags plane")
+        if "gt" not in planes and any(p in planes for p in ("gq", "dp", "ps")):
+            raise GpxilFormatError(f"contig {name!r}: gq, dp and ps planes need a gt plane")
+        if "gt" in planes and not (isinstance(self.sample, dict) and self.sample.get("id")):
+            raise GpxilFormatError("a gt plane describes a sample: give GpxilWriter(sample={'id': ...})")
         w = int(width or self.width)
         rows = rows_for(length, w)
+        if not self.bigtiff:
+            raw = sum(rows * w * plane_dtype(p, a).itemsize for p, a in planes.items())
+            if self._tw.filehandle.tell() + raw > CLASSIC_TIFF_LIMIT:
+                if self._auto_bigtiff:
+                    raise BigTiffNeeded(f"{self.path} may pass 4 GiB")
+                raise GpxilFormatError(f"{self.path} may pass 4 GiB: write it with bigtiff=True")
         pages: dict[str, int] = {}
         for plane in sort_planes(planes):
             arr = np.ascontiguousarray(planes[plane])
@@ -279,7 +323,8 @@ class GpxilWriter:
             "layout": {"type": "raster", "width": self.width},
             "palette": self.palette,
             "reference": self.reference,
-            "sample": self.sample,
+            # a file without genotype planes describes no sample (spec 9.1)
+            "sample": self.sample if any("gt" in c.pages for c in self.contigs) else None,
             "planes": planes,
             "contigs": [c.as_dict() for c in self.contigs],
         }
@@ -306,7 +351,7 @@ class GpxilWriter:
 class Contig:
     """One contig of an open gpxil file. Reads planes lazily, strip by strip."""
 
-    def __init__(self, gfile: "GpxilFile", entry: dict):
+    def __init__(self, gfile: GpxilFile, entry: dict):
         self._g = gfile
         self.entry = entry
         self.name: str = entry["name"]
@@ -323,11 +368,38 @@ class Contig:
         return list(self.pages)
 
     def has(self, plane: str) -> bool:
-        return plane in self.pages
+        """True if the plane is stored, or is ``ref`` and a reference FASTA is attached."""
+        return plane in self.pages or (plane == "ref" and self._g._reference_path is not None)
+
+    def _external_ref(self) -> np.ndarray:
+        """The reference of a contig stored without a ref plane, from the attached FASTA."""
+        cached = self._g._ref_cache
+        if cached is not None and cached[0] == self.name:
+            return cached[1]
+        from .fasta import iter_fasta, sequence_digests
+
+        names = set()
+        for n in (self.name, *self.entry.get("aliases", [])):
+            names |= {n, "chr" + n, n.removeprefix("chr")}
+        for rec in iter_fasta(self._g._reference_path, invalid="N", only=names):
+            if rec.length != self.length:
+                raise GpxilFormatError(f"{rec.name} in {self._g._reference_path} has length {rec.length}, not {self.length}")
+            dig = sequence_digests(rec.codes)
+            for k in ("md5", "refget"):
+                if k in self.entry and self.entry[k] != dig[k]:
+                    raise GpxilFormatError(f"{rec.name} in {self._g._reference_path} does not match the {k} of {self.name}")
+            self._g._ref_cache = (self.name, rec.codes)
+            return rec.codes
+        raise GpxilFormatError(f"{self.name} not found in {self._g._reference_path}")
 
     def _page(self, plane: str):
         if plane not in self.pages:
-            raise KeyError(f"contig {self.name} has no {plane!r} plane (has {', '.join(self.pages)})")
+            if plane == "ref":
+                raise MissingPlaneError(
+                    f"contig {self.name} is stored without its reference sequence; give the reference FASTA "
+                    "(GpxilFile(path, reference=...), or --reference on the command line)"
+                )
+            raise MissingPlaneError(f"contig {self.name} has no {plane!r} plane (has {', '.join(self.pages)})")
         return self._g._tf.pages[self.pages[plane]]
 
     def image(self, plane: str) -> np.ndarray:
@@ -339,6 +411,8 @@ class Contig:
         end = self.length if end is None else end
         if not (0 <= start <= end <= self.length):
             raise IndexError(f"{self.name}:{start}-{end} outside 0-{self.length}")
+        if plane == "ref" and "ref" not in self.pages and self._g._reference_path is not None:
+            return self._external_ref()[start:end].copy()
         page = self._page(plane)
         if start == end:
             return np.zeros(0, dtype=page.dtype)
@@ -383,8 +457,10 @@ class GpxilFile:
     ...     gt = chr21.read("gt", 5_000_000, 5_010_000)
     """
 
-    def __init__(self, path):
+    def __init__(self, path, reference=None):
         self.path = os.fspath(path)
+        self._reference_path = None if reference is None else os.fspath(reference)
+        self._ref_cache: tuple[str, np.ndarray] | None = None
         self._tf = tifffile.TiffFile(self.path)
         try:
             desc = self._tf.pages[0].description
@@ -406,7 +482,7 @@ class GpxilFile:
             for a in e.get("aliases", []):
                 self._aliases.setdefault(a, e["name"])
 
-    def __enter__(self) -> "GpxilFile":
+    def __enter__(self) -> GpxilFile:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -421,6 +497,11 @@ class GpxilFile:
     @property
     def contigs(self) -> list[str]:
         return list(self._contigs)
+
+    def attach_reference(self, fasta) -> None:
+        """Use a FASTA for contigs stored without a ref plane (checked against their digests)."""
+        self._reference_path = os.fspath(fasta)
+        self._ref_cache = None
 
     @property
     def sample_id(self) -> str | None:
@@ -444,5 +525,5 @@ class GpxilFile:
         raise KeyError(f"no contig {name!r} in {self.path}")
 
 
-def open_gpxil(path) -> GpxilFile:
-    return GpxilFile(path)
+def open_gpxil(path, reference=None) -> GpxilFile:
+    return GpxilFile(path, reference=reference)
