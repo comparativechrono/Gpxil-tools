@@ -7,6 +7,12 @@ CMYK, without converting pixel data between colour spaces.
 Each palette defines the four bases in both colour spaces. Other IUPAC codes,
 soft-masked bases and haplotype mixtures are derived by fixed rules
 (:func:`ref_colours`), so a palette is fully described by a handful of values.
+
+N (not known) has a colour of its own, which no mixture of the bases can
+produce: in the classic and Okabe-Ito palettes, whose mixtures include greys
+(classic C and T average to mid-grey), it is near-black. N and "no base" are
+never faded for soft-masking, so an unknown base in a repeat still reads as
+unknown.
 """
 
 from __future__ import annotations
@@ -31,8 +37,10 @@ class Palette:
     #: "mean" averages the component colours; "overprint" lays down every
     #: component ink at full strength (subtractive mixing on paper).
     mix: str = "mean"
-    #: soft-masked (repeat) bases are blended this far towards paper white
+    #: soft-masked (repeat) bases are blended this far towards paper white (N and "no base" are not)
     softmask_fade: float = 0.45
+    #: N's colour in a word, for a book's page on how to read it
+    n_word: str = "grey"
     notes: str = ""
     extra: dict = field(default_factory=dict)
 
@@ -44,16 +52,20 @@ PALETTES: dict[str, Palette] = {
     "classic": Palette(
         name="classic",
         description="A red, C blue, G green, T yellow: the colours of the original gpxil notebooks.",
-        rgb={"A": (255, 0, 0), "C": (0, 0, 255), "G": (0, 255, 0), "T": (255, 255, 0), "N": (128, 128, 128), "gap": _PAPER_RGB},
+        rgb={"A": (255, 0, 0), "C": (0, 0, 255), "G": (0, 255, 0), "T": (255, 255, 0), "N": (32, 32, 32), "gap": _PAPER_RGB},
         cmyk={
             "A": (0.0, 1.0, 1.0, 0.0),
             "C": (1.0, 0.8, 0.0, 0.0),
             "G": (0.8, 0.0, 1.0, 0.0),
             "T": (0.0, 0.0, 1.0, 0.0),
-            "N": (0.0, 0.0, 0.0, 0.5),
+            "N": (0.0, 0.0, 0.0, 0.9),
             "gap": _PAPER_CMYK,
         },
-        notes="Pure RGB green and blue are outside every print gamut; the CMYK values are the nearest process mixes.",
+        n_word="near-black",
+        notes=(
+            "Pure RGB green and blue are outside every print gamut; the CMYK values are the nearest process mixes. "
+            "N is near-black: a mid-grey N would be the colour of a heterozygous C/T site, the mean of blue and yellow."
+        ),
     ),
     "gpxi": Palette(
         name="gpxi",
@@ -68,20 +80,23 @@ PALETTES: dict[str, Palette] = {
             "gap": (0.0, 0.02, 0.1, 0.0),
         },
         softmask_fade=0.0,
+        n_word="pale blue",
         notes="Grey levels follow PLoS ONE 4(3):e4701. N and padding get pale tints so they are not mistaken for G.",
     ),
     "okabe-ito": Palette(
         name="okabe-ito",
         description="Colour-blind-safe Okabe-Ito colours in the IGV convention: A green, C blue, G orange, T vermillion.",
-        rgb={"A": (0, 158, 115), "C": (0, 114, 178), "G": (230, 159, 0), "T": (213, 94, 0), "N": (153, 153, 153), "gap": _PAPER_RGB},
+        rgb={"A": (0, 158, 115), "C": (0, 114, 178), "G": (230, 159, 0), "T": (213, 94, 0), "N": (32, 32, 32), "gap": _PAPER_RGB},
         cmyk={
             "A": (0.97, 0.0, 0.75, 0.0),
             "C": (1.0, 0.5, 0.0, 0.0),
             "G": (0.0, 0.5, 1.0, 0.0),
             "T": (0.0, 0.8, 1.0, 0.0),
-            "N": (0.0, 0.0, 0.0, 0.4),
+            "N": (0.0, 0.0, 0.0, 0.9),
             "gap": _PAPER_CMYK,
         },
+        n_word="near-black",
+        notes="N is near-black, as in the classic palette: a grey N would be close to a heterozygous C/T site in a repeat.",
     ),
     "process": Palette(
         name="process",
@@ -162,7 +177,8 @@ def ref_colours(palette: str | Palette = DEFAULT_PALETTE) -> tuple[np.ndarray, n
         for masked in (False, True):
             idx = code | (C.SOFTMASK if masked else 0)
             r, k = c_rgb, c_cmyk
-            if masked and code not in (C.NO_BASE,):
+            # (N and no base are not faded: an unknown base in a repeat is still unknown, and not a mixture)
+            if masked and code not in (C.NO_BASE, C.BASE_N):
                 r, k = _fade_rgb(r, pal.softmask_fade), _fade_cmyk(k, pal.softmask_fade)
             rgb[idx] = r
             cmyk[idx] = np.round(np.array(k) * 255)

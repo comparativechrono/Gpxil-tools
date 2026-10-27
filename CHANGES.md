@@ -1,5 +1,17 @@
 # Changes
 
+## 0.3.1 (28 October 2026)
+
+- **N is near-black** in the `classic` and `okabe-ito` palettes, and is no
+  longer faded when soft-masked. In `classic`, a mid-grey N was exactly the
+  mean of C (blue) and T (yellow), so in the genotype view a heterozygous C/T
+  site, the commonest kind, looked like a base that wasn't known; in
+  `okabe-ito`, a grey N was close to a C/T site in a repeat. Every palette's
+  N now differs from every base and mixture, faded or not, and a test says
+  so. CMYK: N is 90 % black in both. A book's page on how to read it names
+  N's colour. Files are unchanged: palettes are rendering choices, so only
+  the colour maps stored for image viewers in newly written files differ.
+
 ## 0.3.0 (27 October 2026)
 
 For big files, files on the web and Python in the browser, as GpxilStudio
