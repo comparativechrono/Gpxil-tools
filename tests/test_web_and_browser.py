@@ -318,11 +318,9 @@ def test_missing_codecs_are_said_plainly(tmp_path, monkeypatch):
 
 
 def test_imagecodecs_is_not_needed_in_the_browser():
-    import tomllib
-
-    with open(os.path.join(os.path.dirname(__file__), "..", "pyproject.toml"), "rb") as fh:
-        deps = tomllib.load(fh)["project"]["dependencies"]
-    (codecs,) = [d for d in deps if d.startswith("imagecodecs")]
+    # (the dependency's line of pyproject.toml, read as text: tomllib is Python 3.11 and later)
+    with open(os.path.join(os.path.dirname(__file__), "..", "pyproject.toml"), encoding="utf-8") as fh:
+        (codecs,) = re.findall(r'^\s*"(imagecodecs[^"]*)"', fh.read(), re.M)
     assert "sys_platform != 'emscripten'" in codecs
 
 
