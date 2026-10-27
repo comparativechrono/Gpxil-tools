@@ -100,7 +100,7 @@ def fig_hilbert(c, out):
     r = render(c, mode="reference", bases_per_row=c.length)
     img, order = hilbert_image(r.index.reshape(-1)[: c.length])
     rgb = r.rgb[img]
-    small = Image.fromarray(rgb).resize((1024, 1024), Image.BOX)
+    small = Image.fromarray(rgb).resize((768, 768), Image.BOX)
     small.save(os.path.join(out, "hilbert-chr21.png"))
 
 
@@ -178,7 +178,7 @@ def fig_karyotype(g, out, names=None, bins_longest=600):
         ax.spines[s].set_visible(False)
     ax.set_title(
         "HG002 on GRCh38: mean colour of each slice of every chromosome\n"
-        "dark grey: assembly gaps (N); light grey: soft-masked or not confidently called",
+        "near-black: assembly gaps, or bases not confidently called (N); paler: soft-masked repeats",
         loc="left",
         fontsize=10,
     )
