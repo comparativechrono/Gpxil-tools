@@ -315,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .container import COMPRESSIONS, DEFAULT_COMPRESSION, DEFAULT_WIDTH
     from .palettes import PALETTES
 
-    p = argparse.ArgumentParser(prog="gpxil", description="Genome pixel images: encode, inspect, render and export gpxil files.")
+    p = argparse.ArgumentParser(prog="gpxil", description="Genome pixel images: encode, inspect, compare, render and export gpxil files.")
     p.add_argument("--version", action="version", version=f"gpxiltools {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
