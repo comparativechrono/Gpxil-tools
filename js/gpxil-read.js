@@ -5,10 +5,15 @@
  * js/README.md says how to update the copies.
  *
  * A gpxil file (https://github.com/comparativechrono/gpxil) is a TIFF with one page per plane of each contig,
- * stored in strips of whole rows. This reads its metadata, then any interval of a plane by reading only the strips
- * that hold it: from a Blob, from bytes, or from the web with HTTP range requests. Strips are inflated with the
- * DecompressionStream that browsers and Node 18 or later have. It reads files of any version 0.x of the
- * specification (it implements 0.2), uncompressed or Deflate, classic TIFF or BigTIFF, in either byte order.
+ * stored in strips of whole rows or in tiles. This reads its metadata, then any interval of a plane by reading only
+ * the strips or tiles that hold it: from a Blob, from bytes, or from the web with HTTP range requests. Data are
+ * inflated with the DecompressionStream that browsers and Node 18 or later have. It reads files of any version 0.x
+ * of the specification (it implements 0.2), uncompressed or Deflate, with or without a predictor, classic TIFF or
+ * BigTIFF, in either byte order.
+ *
+ * Files are untrusted input (specification section 13): a file that claims more than this reader decodes at once
+ * (a strip or tile of more than 256 MiB, a tag of more than 64 MiB, a sidecar of more than 256 MiB, more than 2^20
+ * pages), that loops, or whose sizes disagree, is refused with an error, and no strip inflates past its size.
  *
  * Load it as a classic script (<script src="gpxil-read.js">), import it for its side effect (import
  * "./gpxil-read.js"), or require() it in Node: it defines globalThis.GpxilRead, and module.exports in Node.
@@ -19,9 +24,10 @@
  *   const side = await g.sidecar("chr17");                      // [{offset, hap, kind, data}]
  *
  * A source is {key, size, read(start, end, what) -> Promise<Uint8Array>}, the end excluded; `what` says what is
- * read ("header", "directory", "tags" or "strips"), for a page that shows what it is loading. Lower down,
- * new GpxilRead.TiffFile(source) reads pages by index, or by the offset of their directory, and readPage(page,
- * start, end) the values at 1-D positions [start, end) of a page.
+ * read ("header", "directory", "tags" or "strips"), for a page that shows what it is loading. Decoded strips are
+ * cached by the source's key, so a key must change when its file does. Lower down, new GpxilRead.TiffFile(source)
+ * reads pages by index, or by the offset of their directory, and readPage(page, start, end) the values at 1-D
+ * positions [start, end) of a page.
  */
 (function (root) {
   "use strict";
@@ -42,6 +48,9 @@
     PageName: 285,
     Predictor: 317,
     TileWidth: 322,
+    TileLength: 323,
+    TileOffsets: 324,
+    TileByteCounts: 325,
     SampleFormat: 339,
     Sidecar: 65400, // GPXIL_SIDECAR: the zlib-compressed sidecar, on a contig's gt page (section 8.3)
   };
@@ -49,15 +58,22 @@
   const COMPRESSION = { 1: "none", 5: "LZW", 7: "JPEG", 8: "Deflate", 32773: "PackBits", 32946: "Deflate", 34925: "LZMA", 50000: "Zstandard" };
   const PROBE = 16384; // bytes read at a directory: its tags and, as tifffile lays files out, their arrays
   const GROUP = 8 << 20; // strips next to each other in the file are read together, up to this many bytes
-  const MAX_TAGS = 4096; // a directory claiming more is not a gpxil page (section 13: inputs are untrusted)
+  // what a file may claim before it is refused (section 13: inputs are untrusted)
+  const MAX_TAGS = 4096; // tags in a directory
+  const MAX_TAG_BYTES = 64 << 20; // bytes of one tag's value (the sidecar's, compressed, included)
+  const MAX_SEGMENT = 256 << 20; // bytes of one strip or tile, decoded (a whole human chromosome 1 in one strip fits)
+  const MAX_SEGMENTS = 1 << 24; // strips or tiles in a page
+  const MAX_SIDECAR = 256 << 20; // bytes of a sidecar, inflated
+  const MAX_PAGES = 1 << 20; // pages in a file
 
   /** an Error with a code, so that a page can say it in its own words: http, not-tiff, not-gpxil, version, format,
-      tiles, layout, compression, predictor, contig, plane */
+      limit, layout, compression, predictor, contig, plane */
   function fail(code, message) {
     const e = new Error(message);
     e.code = code;
     return e;
   }
+  const MiB = (n) => `${Math.round(n / 1048576)} MiB`;
 
   /* ---------------- sources ---------------- */
   let unnamed = 0;
@@ -89,13 +105,37 @@
         }
         throw fail("http", `${u}: HTTP ${r.status}`);
       });
-    return { key: o.key || url, size: o.size || 0, read: (a, b, what) => get(url, a, b, what) };
+    // (an empty range is never asked for: "bytes=18-17" is invalid, and a server answers it with the whole file)
+    return { key: o.key || url, size: o.size || 0, read: async (a, b, what) => (b > a ? get(url, a, b, what) : new Uint8Array(0)) };
   }
 
-  /** zlib-wrapped Deflate (TIFF compression 8, and the sidecar) */
-  async function inflate(bytes) {
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
+  /** zlib-wrapped Deflate (TIFF compression 8, and the sidecar). With a limit, an error (code "limit") as soon as
+      more than that many bytes come out, so that a small file can't inflate to fill the memory */
+  async function inflate(bytes, limit) {
+    const max = limit === undefined ? Infinity : limit;
+    const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate")).getReader();
+    const parts = [];
+    let n = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        n += value.length;
+        if (n > max) throw fail("limit", `compressed data that inflate to more than ${max} bytes`);
+        parts.push(value);
+      }
+    } catch (e) {
+      reader.cancel().catch(() => {});
+      throw e && e.code === "limit" ? e : fail("format", `compressed data that don't inflate (${(e && e.message) || e})`);
+    }
+    if (parts.length === 1) return parts[0];
+    const out = new Uint8Array(n);
+    let o = 0;
+    for (const p of parts) {
+      out.set(p, o);
+      o += p.length;
+    }
+    return out;
   }
 
   /* ---------------- decoded strips, shared by every file: the least recently used go first ---------------- */
@@ -156,13 +196,23 @@
       if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw fail("format", "an offset too large to read");
       return Number(v);
     }
+    /** a value of a TIFF type that holds integers; NaN for the others */
+    num(type, off) {
+      if (type === 1 || type === 2 || type === 6 || type === 7) return this.u8(off);
+      if (type === 3 || type === 8) return this.u16(off);
+      if (type === 4 || type === 9 || type === 13) return this.u32(off);
+      if (type === 16 || type === 17 || type === 18) return this.u64(off);
+      return NaN;
+    }
   }
+  const count = (n) => Number.isSafeInteger(n) && n >= 0;
 
   class TiffFile {
     constructor(source) {
       this.source = source;
       this.h = null;
       this.offsets = []; // directory offsets, page by page, as far as walked
+      this.seen = new Set(); // the same, to find a chain of directories that loops back
       this.byOffset = new Map(); // directory offset -> page promise
       this.byIndex = new Map(); // page index -> page promise
       this._walking = Promise.resolve();
@@ -183,6 +233,7 @@
           else if (magic === 43 && b.length >= 16) h = { little, big: true, first: r.u64(8) };
           else throw fail("not-tiff", `not a TIFF file (magic number ${magic})`);
           this.offsets = [h.first];
+          this.seen = new Set([h.first]);
           this.h = h;
           return h;
         })();
@@ -190,14 +241,16 @@
     }
     async _dir(at) {
       const h = await this.header();
-      let bytes = await this.source.read(at, this.source.size ? Math.min(this.source.size, at + PROBE) : at + PROBE, "directory");
+      const size = this.source.size;
+      if (!count(at) || at < (h.big ? 16 : 8) || (size && at >= size)) throw fail("format", `a directory at ${at}, outside the file`);
+      let bytes = await this.source.read(at, size ? Math.min(size, at + PROBE) : at + PROBE, "directory");
       let r = new View(bytes, at, h.little);
       if (!r.has(at, h.big ? 8 : 2)) throw fail("format", `the file ends before the directory at ${at}`);
       const n = h.big ? r.u64(at) : r.u16(at);
       if (n > MAX_TAGS) throw fail("format", `a directory of ${n} tags: not a gpxil page`);
-      const size = h.big ? 20 : 12;
+      const entry = h.big ? 20 : 12;
       const first = at + (h.big ? 8 : 2);
-      const end = first + n * size + (h.big ? 8 : 4);
+      const end = first + n * entry + (h.big ? 8 : 4);
       if (!r.has(first, end - first)) {
         bytes = await this.source.read(at, end, "directory");
         r = new View(bytes, at, h.little);
@@ -205,25 +258,32 @@
       }
       const tags = new Map();
       for (let i = 0; i < n; i++) {
-        const e = first + i * size;
+        const e = first + i * entry;
         const tag = r.u16(e);
         const type = r.u16(e + 2);
-        const count = h.big ? r.u64(e + 4) : r.u32(e + 4);
-        const bytesOf = (TYPE_SIZE[type] || 1) * count;
+        const k = h.big ? r.u64(e + 4) : r.u32(e + 4);
+        const bytesOf = (TYPE_SIZE[type] || 1) * k;
         const inline = bytesOf <= (h.big ? 8 : 4);
-        tags.set(tag, { type, count, at: inline ? e + (h.big ? 12 : 8) : h.big ? r.u64(e + 12) : r.u32(e + 8), bytes: bytesOf });
+        if (!tags.has(tag)) tags.set(tag, { type, count: k, at: inline ? e + (h.big ? 12 : 8) : h.big ? r.u64(e + 12) : r.u32(e + 8), bytes: bytesOf });
       }
-      return { r, tags, next: h.big ? r.u64(first + n * size) : r.u32(first + n * size) };
+      return { r, tags, next: h.big ? r.u64(first + n * entry) : r.u32(first + n * entry) };
     }
     /** the directory offset of page k, walking the chain of directories as far as it. One walk at a time: two at
         once would both add the directory after the last one known, and every later page would be off by one */
     ifd(k) {
+      if (!count(k) || k >= MAX_PAGES) return Promise.reject(fail("format", `the file has no page ${k}`));
       const walk = this._walking.then(async () => {
         await this.header();
         while (this.offsets.length <= k) {
           const at = this.offsets[this.offsets.length - 1];
           if (!at) throw fail("format", `the file has no page ${k}`);
-          this.offsets.push((await this._dir(at)).next);
+          const next = (await this._dir(at)).next;
+          if (next) {
+            if (this.seen.has(next))
+              throw fail("format", `the file's directories loop back (page ${this.offsets.length} is page ${this.offsets.indexOf(next)} again)`);
+            this.seen.add(next);
+          }
+          this.offsets.push(next);
         }
         if (!this.offsets[k]) throw fail("format", `the file has no page ${k}`);
         return this.offsets[k];
@@ -252,34 +312,38 @@
     async _page(at) {
       const { r, tags } = await this._dir(at);
       const h = this.h;
-      const values = async (tag) => {
+      /** a View holding the first n values of a tag, read from the file if the directory's bytes don't */
+      const view = async (t, n) => {
+        const bytes = n * (TYPE_SIZE[t.type] || 1);
+        if (bytes > MAX_TAG_BYTES) throw fail("limit", `a tag of ${MiB(bytes)}, more than this reader reads (${MiB(MAX_TAG_BYTES)})`);
+        if (r.has(t.at, bytes)) return r;
+        const v = new View(await this.source.read(t.at, t.at + bytes, "tags"), t.at, h.little);
+        if (!v.has(t.at, bytes)) throw fail("format", "the file ends inside a tag");
+        return v;
+      };
+      /** up to n values of a tag (all of them without n), or null if the page hasn't the tag */
+      const values = async (tag, n) => {
         const t = tags.get(tag);
         if (!t) return null;
-        let rr = r;
-        if (!rr.has(t.at, t.bytes)) {
-          rr = new View(await this.source.read(t.at, t.at + t.bytes, "tags"), t.at, h.little);
-          if (!rr.has(t.at, t.bytes)) throw fail("format", `the file ends inside tag ${tag}`);
-        }
+        const k = n === undefined ? t.count : Math.min(n, t.count);
+        const v = await view(t, k);
         const step = TYPE_SIZE[t.type] || 1;
-        const out = new Array(t.count);
-        for (let i = 0; i < t.count; i++) {
-          const o = t.at + i * step;
-          out[i] =
-            t.type === 3
-              ? rr.u16(o)
-              : t.type === 4 || t.type === 9 || t.type === 13
-                ? rr.u32(o)
-                : t.type === 16 || t.type === 17 || t.type === 18
-                  ? rr.u64(o)
-                  : rr.u8(o);
-        }
+        const out = new Array(k);
+        for (let i = 0; i < k; i++) out[i] = v.num(t.type, t.at + i * step);
         return out;
       };
       const one = async (tag, fallback) => {
-        const v = await values(tag);
+        const v = await values(tag, 1);
         return v && v.length ? v[0] : fallback;
       };
-      if (tags.has(TAG.TileWidth)) throw fail("tiles", "a tiled page: this reader reads pages stored in strips, as gpxil files are");
+      /** a tag's value as bytes (ASCII, UNDEFINED), or null */
+      const raw = async (tag) => {
+        const t = tags.get(tag);
+        if (!t) return null;
+        const v = await view(t, t.count);
+        return new Uint8Array(v.v.buffer, v.v.byteOffset + (t.at - v.base), t.bytes).slice();
+      };
+      const tiled = tags.has(TAG.TileWidth) || tags.has(TAG.TileOffsets);
       const page = {
         offset: at,
         width: await one(TAG.ImageWidth, 0),
@@ -289,29 +353,23 @@
         format: await one(TAG.SampleFormat, 1),
         compression: await one(TAG.Compression, 1),
         predictor: await one(TAG.Predictor, 1),
-        rowsPerStrip: await one(TAG.RowsPerStrip, 2 ** 32 - 1),
-        offsets: (await values(TAG.StripOffsets)) || [],
-        counts: (await values(TAG.StripByteCounts)) || [],
+        tiled,
         /** the page's ImageDescription (its JSON metadata), or null */
         description: async () => {
-          const v = await values(TAG.ImageDescription);
+          const v = await raw(TAG.ImageDescription);
           if (!v) return null;
           let n = v.length;
           while (n && v[n - 1] === 0) n--;
-          return new TextDecoder().decode(Uint8Array.from(v.slice(0, n)));
+          return new TextDecoder().decode(v.subarray(0, n));
         },
         /** the raw bytes of a tag's value (the sidecar's, say), or null */
-        tagBytes: async (tag) => {
-          const t = tags.get(tag);
-          if (!t) return null;
-          return r.has(t.at, t.bytes)
-            ? new Uint8Array(r.v.buffer, r.v.byteOffset + (t.at - r.base), t.bytes).slice()
-            : this.source.read(t.at, t.at + t.bytes, "tags");
-        },
+        tagBytes: raw,
       };
-      if (page.samples !== 1 || ![8, 16, 32].includes(page.bits))
-        throw fail("format", `a page of ${page.samples} samples of ${page.bits} bits: not a gpxil plane`);
-      if (!(page.width >= 1 && page.height >= 1)) throw fail("format", "a page without a width or height");
+      const { width: W, height: H, bits } = page;
+      if (page.samples !== 1 || ![8, 16, 32].includes(bits)) throw fail("format", `a page of ${page.samples} samples of ${bits} bits: not a gpxil plane`);
+      if (![1, 2, 3].includes(page.format) || (page.format === 3 && bits !== 32))
+        throw fail("format", `a page of ${bits}-bit samples of format ${page.format}: not a gpxil plane`);
+      if (!(count(W) && count(H) && W >= 1 && H >= 1 && count(W * H))) throw fail("format", "a page without a width and height");
       if (![1, 8, 32946].includes(page.compression)) {
         const name = COMPRESSION[page.compression] || "compression " + page.compression;
         const e = fail(
@@ -321,53 +379,95 @@
         e.compression = name;
         throw e;
       }
-      if (page.predictor !== 1) throw fail("predictor", `a page with a predictor (${page.predictor}), which this reader doesn't undo`);
-      page.rowsPerStrip = Math.max(1, Math.min(page.rowsPerStrip, page.height));
-      const strips = Math.ceil(page.height / page.rowsPerStrip);
-      if (page.offsets.length < strips || page.counts.length < strips)
-        throw fail("format", `a page of ${strips} strips lists ${Math.min(page.offsets.length, page.counts.length)}`);
+      if (!(page.predictor === 1 || (page.predictor === 2 && page.format !== 3) || (page.predictor === 3 && page.format === 3)))
+        throw fail("predictor", `a page of format ${page.format} with predictor ${page.predictor}, which this reader doesn't undo`);
+      const bps = bits / 8;
+      let n;
+      if (tiled) {
+        page.tileWidth = await one(TAG.TileWidth, 0);
+        page.tileLength = await one(TAG.TileLength, 0);
+        if (!(count(page.tileWidth) && count(page.tileLength) && page.tileWidth >= 1 && page.tileLength >= 1))
+          throw fail("format", "a tiled page without a tile size");
+        page.across = Math.ceil(W / page.tileWidth);
+        n = page.across * Math.ceil(H / page.tileLength);
+        page.segmentBytes = page.tileWidth * page.tileLength * bps;
+      } else {
+        const rps = await one(TAG.RowsPerStrip, 2 ** 32 - 1);
+        page.rowsPerStrip = Math.max(1, Math.min(count(rps) ? rps : H, H));
+        n = Math.ceil(H / page.rowsPerStrip);
+        page.segmentBytes = page.rowsPerStrip * W * bps;
+      }
+      const what = tiled ? "tiles" : "strips";
+      if (page.segmentBytes > MAX_SEGMENT)
+        throw fail("limit", `${what} of ${MiB(page.segmentBytes)}, more than this reader decodes at once (${MiB(MAX_SEGMENT)})`);
+      if (n > MAX_SEGMENTS) throw fail("limit", `a page of ${n} ${what}, more than this reader reads (${MAX_SEGMENTS})`);
+      page.offsets = (await values(tiled ? TAG.TileOffsets : TAG.StripOffsets, n)) || [];
+      page.counts = (await values(tiled ? TAG.TileByteCounts : TAG.StripByteCounts, n)) || [];
+      if (page.offsets.length < n || page.counts.length < n)
+        throw fail("format", `a page of ${n} ${what} lists ${Math.min(page.offsets.length, page.counts.length)}`);
+      for (let s = 0; s < n; s++) if (!(count(page.offsets[s]) && count(page.counts[s]))) throw fail("format", `${what} at offsets that aren't`);
       return page;
     }
     _key(page, s) {
-      return `${this.source.key}#${page.offset}#${s}`;
+      return `${this.source.key}#${page.offset}#${s}#${page.offsets[s]}+${page.counts[s]}`;
     }
-    /** decoded strips s0..s1 of a page, those next to each other in the file read together */
-    _strips(page, s0, s1) {
-      const out = new Array(s1 - s0 + 1);
+    /** strip or tile s of a page, decoded: its stored bytes inflated (no further than its size) and checked */
+    async _decode(page, s, stored) {
+      const bps = page.bits / 8;
+      const full = page.segmentBytes;
+      const need = page.tiled ? full : Math.min(page.rowsPerStrip, page.height - s * page.rowsPerStrip) * page.width * bps;
+      const what = page.tiled ? "tile" : "strip";
+      let data;
+      if (page.compression === 1) data = stored.slice(0, Math.min(stored.length, full));
+      else {
+        try {
+          data = await inflate(stored, full);
+        } catch (e) {
+          throw e.code === "limit" ? fail("format", `${what} ${s} inflates to more than the ${full} bytes it holds`) : e;
+        }
+      }
+      if (data.length < need) throw fail("format", `${what} ${s} holds ${data.length} bytes, and its pixels need ${need}`);
+      if (page.predictor !== 1) unpredict(page, data, page.tiled ? page.tileWidth : page.width, this.h.little);
+      return data;
+    }
+    /** strips or tiles of a page (indices in increasing order), decoded; those next to each other in the file read
+        together, those read before taken from the cache, those being read awaited */
+    _segments(page, idx) {
+      const out = new Array(idx.length);
       const missing = [];
-      for (let s = s0; s <= s1; s++) {
+      idx.forEach((s, i) => {
         const key = this._key(page, s);
         const hit = recall(key);
-        if (hit) out[s - s0] = hit;
-        else if (pending.has(key)) out[s - s0] = pending.get(key);
-        else missing.push(s);
-      }
+        if (hit) out[i] = hit;
+        else if (pending.has(key)) out[i] = pending.get(key);
+        else missing.push([s, i]);
+      });
       const groups = [];
-      for (const s of missing) {
+      for (const [s, i] of missing) {
         const g = groups[groups.length - 1];
         const off = page.offsets[s];
         const n = page.counts[s];
         if (g && off === g.end && g.end - g.start + n <= GROUP) {
-          g.strips.push(s);
+          g.items.push([s, i]);
           g.end = off + n;
-        } else groups.push({ start: off, end: off + n, strips: [s] });
+        } else groups.push({ start: off, end: off + n, items: [[s, i]] });
       }
       for (const g of groups) {
         const fetched = this.source.read(g.start, g.end, "strips");
-        for (const s of g.strips) {
+        for (const [s, i] of g.items) {
           const key = this._key(page, s);
           const p = fetched
             .then(async (bytes) => {
               const o = page.offsets[s] - g.start;
-              const raw = bytes.subarray(o, o + page.counts[s]);
-              if (raw.length < page.counts[s]) throw fail("format", "the file ends inside a strip");
-              const data = page.compression === 1 ? raw.slice() : await inflate(raw);
+              const stored = bytes.subarray(o, o + page.counts[s]);
+              if (stored.length < page.counts[s]) throw fail("format", "the file ends inside a strip");
+              const data = await this._decode(page, s, stored);
               remember(key, data);
               return data;
             })
             .finally(() => pending.delete(key));
           pending.set(key, p);
-          out[s - s0] = p;
+          out[i] = p;
         }
       }
       return Promise.all(out);
@@ -383,19 +483,72 @@
       const n = Math.max(0, end - start);
       const out = new Uint8Array(n * bps);
       if (n) {
-        const rps = page.rowsPerStrip;
-        const s0 = Math.floor(Math.floor(start / W) / rps);
-        const s1 = Math.floor(Math.floor((end - 1) / W) / rps);
-        const strips = await this._strips(page, s0, s1);
-        for (let s = s0; s <= s1; s++) {
-          const data = strips[s - s0];
-          const first = s * rps * W; // the 1-D position of the strip's first pixel
-          const a = Math.max(start, first) - first;
-          const b = Math.min(end, first + Math.floor(data.length / bps)) - first;
-          if (b > a) out.set(data.subarray(a * bps, b * bps), (first + a - start) * bps);
+        const r0 = Math.floor(start / W);
+        const r1 = Math.floor((end - 1) / W);
+        if (!page.tiled) {
+          const rps = page.rowsPerStrip;
+          const idx = [];
+          for (let s = Math.floor(r0 / rps); s <= Math.floor(r1 / rps); s++) idx.push(s);
+          const data = await this._segments(page, idx);
+          idx.forEach((s, i) => {
+            const first = s * rps * W; // the 1-D position of the strip's first pixel
+            const a = Math.max(start, first) - first;
+            const b = Math.min(end, first + rps * W) - first;
+            if (b > a) out.set(data[i].subarray(a * bps, b * bps), (first + a - start) * bps);
+          });
+        } else {
+          // tiles: rows r0..r1 of the image, the first from start's column, the last to end's
+          const TW = page.tileWidth;
+          const TL = page.tileLength;
+          const lo = (y) => (y === r0 ? start - r0 * W : 0);
+          const hi = (y) => (y === r1 ? end - r1 * W : W);
+          const wanted = new Set();
+          const mark = (y, xa, xb) => {
+            for (let tc = Math.floor(xa / TW); tc <= Math.floor((xb - 1) / TW); tc++) wanted.add(Math.floor(y / TL) * page.across + tc);
+          };
+          mark(r0, lo(r0), hi(r0));
+          if (r1 > r0) mark(r1, lo(r1), hi(r1));
+          for (let y = r0 + 1; y < r1; y = (Math.floor(y / TL) + 1) * TL) mark(y, 0, W); // (one row of each tile row between)
+          const idx = [...wanted].sort((a, b) => a - b);
+          const data = await this._segments(page, idx);
+          idx.forEach((t, i) => {
+            const tr = Math.floor(t / page.across);
+            const tc = t % page.across;
+            for (let y = Math.max(r0, tr * TL); y <= Math.min(r1, tr * TL + TL - 1); y++) {
+              const xa = Math.max(lo(y), tc * TW);
+              const xb = Math.min(hi(y), tc * TW + TW);
+              if (xb > xa)
+                out.set(data[i].subarray(((y - tr * TL) * TW + xa - tc * TW) * bps, ((y - tr * TL) * TW + xb - tc * TW) * bps), (y * W + xa - start) * bps);
+            }
+          });
         }
       }
       return typed(page, out, h.little);
+    }
+  }
+  /** undo a predictor, row by row of a decoded strip or tile whose rows are `width` samples wide: 2, horizontal
+      differencing of integers; 3, the floating-point predictor (bytes of each row in planes, most significant
+      first, then differenced) of Adobe's TIFF Technical Note 3 */
+  function unpredict(page, data, width, little) {
+    const bps = page.bits / 8;
+    const rowBytes = width * bps;
+    const rows = Math.floor(data.length / rowBytes);
+    if (page.predictor === 2) {
+      const v = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      for (let y = 0; y < rows; y++) {
+        const o = y * rowBytes;
+        if (bps === 1) for (let x = 1; x < width; x++) data[o + x] += data[o + x - 1];
+        else if (bps === 2) for (let x = 1; x < width; x++) v.setUint16(o + 2 * x, v.getUint16(o + 2 * x, little) + v.getUint16(o + 2 * x - 2, little), little);
+        else for (let x = 1; x < width; x++) v.setUint32(o + 4 * x, v.getUint32(o + 4 * x, little) + v.getUint32(o + 4 * x - 4, little), little);
+      }
+      return;
+    }
+    const tmp = new Uint8Array(rowBytes);
+    for (let y = 0; y < rows; y++) {
+      const row = data.subarray(y * rowBytes, (y + 1) * rowBytes);
+      for (let i = 1; i < rowBytes; i++) row[i] += row[i - 1];
+      tmp.set(row);
+      for (let x = 0; x < width; x++) for (let b = 0; b < bps; b++) row[x * bps + (little ? bps - 1 - b : b)] = tmp[b * width + x];
     }
   }
   function typed(page, bytes, little) {
@@ -456,16 +609,22 @@
         aliases: (c.aliases || []).map(String),
         entry: c,
       }));
-      this._byName = new Map();
-      for (const c of this.contigs) this._byName.set(c.name.toLowerCase(), c);
-      for (const c of this.contigs) for (const a of c.aliases) if (!this._byName.has(a.toLowerCase())) this._byName.set(a.toLowerCase(), c);
+      // names first, then aliases; exactly as written, then ignoring case; where two match, the first contig
+      this._exact = new Map();
+      this._folded = new Map();
+      const add = (m, k, c) => m.has(k) || m.set(k, c);
+      for (const c of this.contigs) add(this._exact, c.name, c);
+      for (const c of this.contigs) for (const a of c.aliases) add(this._exact, a, c);
+      for (const c of this.contigs) add(this._folded, c.name.toLowerCase(), c);
+      for (const c of this.contigs) for (const a of c.aliases) add(this._folded, a.toLowerCase(), c);
       this._sidecars = new Map();
     }
-    /** a contig by name or alias, ignoring case, with or without "chr" (null if there is none) */
+    /** a contig by name or alias: as written, else ignoring case, with or without "chr" (null if there is none) */
     contig(name) {
       if (name && typeof name === "object") return name;
-      const n = String(name).toLowerCase();
-      return this._byName.get(n) || this._byName.get("chr" + n) || this._byName.get(n.replace(/^chr/, "")) || null;
+      const s = String(name);
+      const n = s.toLowerCase();
+      return this._exact.get(s) || this._folded.get(n) || this._folded.get("chr" + n) || this._folded.get(n.replace(/^chr/, "")) || null;
     }
     _contig(contig) {
       const c = this.contig(contig);
@@ -475,8 +634,10 @@
     /** the page of a contig's plane */
     page(contig, plane) {
       const c = this._contig(contig);
-      if (!(plane in c.pages)) return Promise.reject(fail("plane", `${c.name} has no ${plane} plane`));
-      return this.file.page(Number(c.pages[plane]));
+      if (!Object.prototype.hasOwnProperty.call(c.pages, plane)) return Promise.reject(fail("plane", `${c.name} has no ${plane} plane`));
+      const k = Number(c.pages[plane]);
+      if (!count(k)) return Promise.reject(fail("format", `${c.name}'s ${plane} plane is on page ${c.pages[plane]}, which isn't a page number`));
+      return this.file.page(k);
     }
     /** a plane's values over [start, end) of a contig (0-based, the end excluded; clipped to the contig) */
     async read(contig, plane, start, end) {
@@ -493,7 +654,14 @@
         const p = (async () => {
           const page = await this.page(c, "gt");
           const raw = await page.tagBytes(TAG.Sidecar);
-          return raw ? parseSidecar(new TextDecoder().decode(await inflate(raw))) : [];
+          if (!raw) return [];
+          let text;
+          try {
+            text = await inflate(raw, MAX_SIDECAR);
+          } catch (e) {
+            throw e.code === "limit" ? fail("limit", `${c.name}'s sidecar inflates to more than this reader reads (${MiB(MAX_SIDECAR)})`) : e;
+          }
+          return parseSidecar(new TextDecoder().decode(text));
         })();
         p.catch(() => this._sidecars.delete(c.name));
         this._sidecars.set(c.name, p);

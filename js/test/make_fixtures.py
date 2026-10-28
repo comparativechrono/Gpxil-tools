@@ -3,10 +3,13 @@ back from each: its metadata, every plane (as little-endian bytes in a .bin file
 
     python3 js/test/make_fixtures.py OUTDIR      -> OUTDIR/expected.json and the files
 
-The files differ in what a reader must cope with: Deflate or none; many strips of a few rows, in classic TIFF,
-BigTIFF or big-endian TIFF; 8-, 16- and 32-bit planes, signed and float; a sidecar with insertions and a COMPLEX
-allele; a contig without a sample; the specification's worked example. Others must be refused, each with the code
-the reader gives: another major version, a page compressed with LZW, tiles, a TIFF that isn't gpxil, not a TIFF.
+The files differ in what a reader must cope with: Deflate or none; many strips of a few rows, or tiles, in classic
+TIFF, BigTIFF or big-endian TIFF; 8-, 16- and 32-bit planes, signed and float, with the predictors extension planes
+may have; a sidecar with insertions and a COMPLEX allele; a contig without a sample; the specification's worked
+example; names that differ only in case. Others must be refused, each with the code the reader gives: another major
+version, a page compressed with LZW, a TIFF that isn't gpxil, not a TIFF, and files made to hurt a reader (section 13):
+directories that loop, a strip that inflates to 200 MB, strips shorter than their rows, a strip of no bytes, a tag
+or a strip larger than a reader takes.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import json
 import os
 import random
 import shutil
+import struct
 import sys
 import zlib
 
@@ -82,14 +86,221 @@ def rewrite(src: str, out: str, **kw) -> None:
             w.add_contig(name, planes, sidecar=side or None, **entry)
 
 
-def big_endian(src: str, out: str) -> None:
-    """The same file, page for page, written big-endian by tifffile (the writer of gpxiltools writes little-endian)."""
+def retiff(src: str, out: str, byteorder: str = "<", tile: tuple[int, int] | None = None, predictors: bool = False) -> None:
+    """The same file, page for page, written by tifffile (the writer of gpxiltools writes little-endian strips, with no
+    predictor): big-endian, or in tiles (length, width), and with a predictor on each extension plane (2, horizontal
+    differencing, for integers; 3, floating point, for floats), which section 8.3 allows."""
     with tifffile.TiffFile(src) as t:
         pages = [(p.asarray(), p.description, p.rowsperstrip, p.tags[65400].value if 65400 in p.tags else None) for p in t.pages]
-    with tifffile.TiffWriter(out, byteorder=">") as tw:
+    with tifffile.TiffWriter(out, byteorder=byteorder) as tw:
         for img, desc, rps, side in pages:
             extra = [(65400, 7, len(side), side, False)] if side is not None else []
-            tw.write(img, compression="zlib", rowsperstrip=rps, description=desc, metadata=None, photometric="minisblack", extratags=extra)
+            plane = json.loads(desc)["plane"]
+            predictor = (3 if img.dtype.kind == "f" else 2) if predictors and plane.startswith("x-") else None
+            layout = dict(tile=tile) if tile else dict(rowsperstrip=rps)
+            tw.write(
+                img,
+                compression="zlib",
+                predictor=predictor,
+                description=desc,
+                metadata=None,
+                photometric="minisblack",
+                extratags=extra,
+                **layout,
+            )
+
+
+def hand_tiff(pages: list[dict], loop_to: int | None = None) -> bytes:
+    """A little-endian classic TIFF built by hand, so that it can be wrong: pages of dict(W, H, rps, strips (bytes
+    each), desc, comp=1, counts=None (strip byte counts other than the strips' sizes), patch=None ({tag: (type,
+    count, value or offset)} for entries to write as given)); the last directory pointing back to page loop_to."""
+    buf = bytearray(b"II*\x00\x00\x00\x00\x00")
+
+    def array(typ: int, vals: list[int]) -> tuple[int, bytes]:
+        raw = b"".join(struct.pack("<H" if typ == 3 else "<I", v) for v in vals)
+        if len(raw) <= 4:
+            return len(vals), raw.ljust(4, b"\x00")
+        at = len(buf)
+        buf.extend(raw)
+        return len(vals), struct.pack("<I", at)
+
+    ifds, link = [], 4
+    for pg in pages:
+        offs = []
+        for st in pg["strips"]:
+            offs.append(len(buf))
+            buf.extend(st + (b"\x00" if len(st) % 2 else b""))
+        desc = pg["desc"].encode() + b"\x00"
+        desc_at = len(buf)
+        buf.extend(desc + (b"\x00" if len(desc) % 2 else b""))
+        entries = {
+            256: (4, *array(4, [pg["W"]])),
+            257: (4, *array(4, [pg["H"]])),
+            258: (3, *array(3, [8])),
+            259: (3, *array(3, [pg.get("comp", 1)])),
+            262: (3, *array(3, [1])),
+            270: (2, len(desc), struct.pack("<I", desc_at)),
+            273: (4, *array(4, offs)),
+            277: (3, *array(3, [1])),
+            278: (4, *array(4, [pg["rps"]])),
+            279: (4, *array(4, pg.get("counts") or [len(st) for st in pg["strips"]])),
+        }
+        for tag, (typ, n, value) in (pg.get("patch") or {}).items():
+            entries[tag] = (typ, n, struct.pack("<I", value))
+        ifds.append(len(buf))
+        struct.pack_into("<I", buf, link, len(buf))
+        buf.extend(struct.pack("<H", len(entries)))
+        for tag in sorted(entries):
+            typ, n, value = entries[tag]
+            buf.extend(struct.pack("<HHI", tag, typ, n) + value)
+        link = len(buf)
+        buf.extend(b"\x00\x00\x00\x00")
+    if loop_to is not None:
+        struct.pack_into("<I", buf, link, ifds[loop_to])
+    return bytes(buf)
+
+
+def hand_meta(contigs: list[dict], width: int) -> str:
+    c = contigs[0]
+    meta = {
+        "gpxil": "0.2",
+        "layout": {"type": "raster", "width": width},
+        "contigs": contigs,
+        "contig": c["name"],
+        "plane": "ref",
+        "length": c["length"],
+    }
+    return json.dumps(meta)
+
+
+def hand_files(out_dir: str) -> dict:
+    """Files made to hurt a reader, each with the code it must give (at "open", or "read" of a contig's plane)."""
+    acgt = bytes([1, 2, 4, 8]) * 5
+    one = [{"name": "c", "length": 20, "pages": {"ref": 0}}]
+    bad = {}
+
+    def put(name: str, data: bytes, **want) -> None:
+        with open(os.path.join(out_dir, name + ".tif"), "wb") as fh:
+            fh.write(data)
+        bad[name] = {"file": name + ".tif", **want}
+
+    # a chain of directories that loops back, with the gt plane on page 1; on page 1e400 (Infinity); on page 3,000,000
+    looped = [{"name": "c", "length": 20, "pages": {"ref": 0, "gt": 1}}]
+    put(
+        "loop",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": hand_meta(looped, 10)}], loop_to=0),
+        code="format",
+        at="read",
+        contig="c",
+        plane="gt",
+    )
+    desc = hand_meta(looped, 10).replace('"gt": 1', '"gt": 1e400')
+    put(
+        "loop-infinity",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": desc}], loop_to=0),
+        code="format",
+        at="read",
+        contig="c",
+        plane="gt",
+    )
+    desc = hand_meta(looped, 10).replace('"gt": 1', '"gt": 3000000')
+    put(
+        "loop-far",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": desc}], loop_to=0),
+        code="format",
+        at="read",
+        contig="c",
+        plane="gt",
+    )
+    # a 10-base page whose one strip inflates to 200 MB
+    tiny = [{"name": "c", "length": 10, "pages": {"ref": 0}}]
+    bomb = zlib.compress(b"\x00" * (200 << 20), 9)
+    put(
+        "bomb",
+        hand_tiff([{"W": 10, "H": 1, "rps": 1, "strips": [bomb], "comp": 8, "desc": hand_meta(tiny, 10)}]),
+        code="format",
+        at="read",
+        contig="c",
+        plane="ref",
+    )
+    # strips shorter than their rows: 20 pixels in one strip of 10 bytes, stored and compressed
+    put(
+        "short",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt[:10]], "desc": hand_meta(one, 10)}]),
+        code="format",
+        at="read",
+        contig="c",
+        plane="ref",
+    )
+    put(
+        "short-deflate",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [zlib.compress(acgt[:10])], "comp": 8, "desc": hand_meta(one, 10)}]),
+        code="format",
+        at="read",
+        contig="c",
+        plane="ref",
+    )
+    # a strip of no bytes (row 2 of 2): no range of the file is asked for that isn't one (see the test)
+    put(
+        "zero",
+        hand_tiff([{"W": 10, "H": 2, "rps": 1, "strips": [acgt[:10], b""], "desc": hand_meta(one, 10)}]),
+        code="format",
+        at="read",
+        contig="c",
+        plane="ref",
+    )
+    # an ImageDescription said to be 128 MiB; a gt page in strips of 300 MiB (one row 300 Mi bases wide)
+    put(
+        "huge-tag",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": hand_meta(one, 10), "patch": {270: (2, 128 << 20, 8)}}]),
+        code="limit",
+        at="open",
+    )
+    two = [{"name": "c", "length": 20, "pages": {"ref": 0, "gt": 1}}]
+    gt_desc = json.dumps({"gpxil": "0.2", "contig": "c", "plane": "gt", "length": 20})
+    put(
+        "huge-strip",
+        hand_tiff(
+            [
+                {"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": hand_meta(two, 10)},
+                {"W": 300 << 20, "H": 1, "rps": 1, "strips": [acgt], "desc": gt_desc},
+            ]
+        ),
+        code="limit",
+        at="read",
+        contig="c",
+        plane="gt",
+    )
+    return bad
+
+
+def odd_files(out_dir: str) -> dict:
+    """Files that are odd but must be read: an ImageWidth said to hold 2^30 values (only the first is read); two
+    contigs whose names differ only in case, and an alias that is another contig's name."""
+    acgt = bytes([1, 2, 4, 8]) * 5
+    files = {}
+    one = [{"name": "c", "length": 20, "pages": {"ref": 0}}]
+    data = bytearray(hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": hand_meta(one, 10)}]))
+    ifd = struct.unpack_from("<I", data, 4)[0]
+    for i in range(struct.unpack_from("<H", data, ifd)[0]):
+        if struct.unpack_from("<H", data, ifd + 2 + 12 * i)[0] == 256:  # ImageWidth: 2^30 values, the first 10, at the end
+            struct.pack_into("<HHII", data, ifd + 2 + 12 * i, 256, 4, 1 << 30, len(data))
+    data += struct.pack("<I", 10)
+    with open(os.path.join(out_dir, "many-values.tif"), "wb") as fh:
+        fh.write(data)
+    files["many-values"] = "many-values.tif"
+    two = [
+        {"name": "a", "length": 20, "pages": {"ref": 0}, "aliases": ["b"]},
+        {"name": "A", "length": 20, "pages": {"ref": 1}},
+        {"name": "b", "length": 20, "pages": {"ref": 2}},
+    ]
+    pages = [{"W": 10, "H": 2, "rps": 2, "strips": [bytes([code]) * 20], "desc": hand_meta(two, 10)} for code in (1, 2, 4)]
+    for k, pg in enumerate(pages[1:], 1):
+        pg["desc"] = json.dumps({"gpxil": "0.2", "contig": two[k]["name"], "plane": "ref", "length": 20})
+    with open(os.path.join(out_dir, "case.tif"), "wb") as fh:
+        fh.write(hand_tiff(pages))
+    files["case"] = "case.tif"
+    return files
 
 
 def expected_of(path: str, name: str, out_dir: str) -> dict:
@@ -136,7 +347,11 @@ def main(out_dir: str) -> None:
         rewrite(base, path, **kw)
         good[name] = path
     good["bigendian"] = os.path.join(out_dir, "bigendian.gpxil.tif")
-    big_endian(good["strips"], good["bigendian"])
+    retiff(good["strips"], good["bigendian"], byteorder=">")
+    good["tiled"] = os.path.join(out_dir, "tiled.gpxil.tif")  # (tiles 32 wide across rows of 97, 16 rows long)
+    retiff(good["strips"], good["tiled"], tile=(16, 32), predictors=True)
+    good["predictors"] = os.path.join(out_dir, "predictors.gpxil.tif")
+    retiff(good["strips"], good["predictors"], byteorder=">", predictors=True)
     good["example"] = os.path.join(out_dir, "example.gpxil.tif")
     shutil.copy(os.path.join(ROOT, "tests", "data", "worked-example.gpxil.tif"), good["example"])
     newer = os.path.join(out_dir, "newer.gpxil.tif")  # (a later 0.x: read as it is)
@@ -166,19 +381,6 @@ def main(out_dir: str) -> None:
         "plane": "gt",
         "compression": "LZW",
     }
-    path = os.path.join(out_dir, "tiled.gpxil.tif")
-    desc = json.dumps(
-        {
-            "gpxil": "0.2",
-            "layout": {"type": "raster", "width": 32},
-            "contigs": [{"name": "c1", "length": 1024, "pages": {"ref": 0}}],
-            "contig": "c1",
-            "plane": "ref",
-            "length": 1024,
-        }
-    )
-    tifffile.imwrite(path, np.ones((32, 32), np.uint8), tile=(16, 16), description=desc, metadata=None)
-    bad["tiled"] = {"file": os.path.basename(path), "code": "tiles", "at": "open"}
     path = os.path.join(out_dir, "picture.tif")
     tifffile.imwrite(path, np.zeros((8, 8), np.uint8))
     bad["picture"] = {"file": os.path.basename(path), "code": "not-gpxil", "at": "open"}
@@ -187,7 +389,8 @@ def main(out_dir: str) -> None:
         fh.write(zlib.compress(b"not a tiff at all" * 20))
     bad["noise"] = {"file": os.path.basename(path), "code": "not-tiff", "at": "open"}
 
-    expected = {"good": {name: expected_of(path, name, out_dir) for name, path in good.items()}, "bad": bad}
+    bad.update(hand_files(out_dir))
+    expected = {"good": {name: expected_of(path, name, out_dir) for name, path in good.items()}, "bad": bad, "odd": odd_files(out_dir)}
     with open(os.path.join(out_dir, "expected.json"), "w") as fh:
         json.dump(expected, fh, indent=1)
     shutil.rmtree(work)

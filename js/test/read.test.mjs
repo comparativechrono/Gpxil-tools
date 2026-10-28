@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
+import zlib from "node:zlib";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -23,6 +24,7 @@ let expected;
 let server;
 let base;
 let requests = 0;
+let wholeAnswers = 0; // (requests answered with the whole file: an invalid range, or none)
 before(async () => {
   execFileSync(process.env.PYTHON || "python3", [path.join(HERE, "make_fixtures.py"), OUT], { stdio: "inherit" });
   expected = JSON.parse(fs.readFileSync(path.join(OUT, "expected.json"), "utf8"));
@@ -36,6 +38,11 @@ before(async () => {
     }
     const size = fs.statSync(file).size;
     const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || "");
+    if (m && m[2] && +m[2] < +m[1]) {
+      wholeAnswers++; // an invalid range is ignored (RFC 9110), as by GitHub Pages: the whole file
+      res.writeHead(200, { "Content-Length": size });
+      return fs.createReadStream(file).pipe(res);
+    }
     if (m) {
       const a = +m[1];
       const b = Math.min(m[2] ? +m[2] : size - 1, size - 1);
@@ -46,6 +53,7 @@ before(async () => {
       res.writeHead(206, { "Content-Range": `bytes ${a}-${b}/${size}`, "Content-Length": b - a + 1 });
       fs.createReadStream(file, { start: a, end: b }).pipe(res);
     } else {
+      wholeAnswers++;
       res.writeHead(200, { "Content-Length": size });
       fs.createReadStream(file).pipe(res);
     }
@@ -194,18 +202,56 @@ test("a small cache: strips are read again, and still right", async () => {
   }
 });
 
-test("files it must refuse, each with a code a page can put in its own words", async () => {
+test("tiles and predictors: the files that have them do", async () => {
+  const tiled = await R.open(SOURCES.bytes(expected.good.tiled.file));
+  const t = await tiled.page("chr1", "gt");
+  assert.ok(t.tiled && t.tileWidth === 32 && t.tileLength === 16 && t.width === 97, "tiles 32 wide over rows of 97");
+  const p = await R.open(SOURCES.bytes(expected.good.predictors.file));
+  assert.equal((await p.page("chr1", "x-score")).predictor, 2);
+  assert.equal((await p.page("chr1", "x-frac")).predictor, 3);
+  assert.equal((await tiled.page("chr1", "x-frac")).predictor, 3);
+  assert.equal((await p.page("chr1", "gt")).predictor, 1);
+});
+
+test("files it must refuse, each with a code a page can put in its own words, and quickly", async () => {
   for (const [name, want] of Object.entries(expected.bad)) {
-    const source = SOURCES.bytes(want.file);
-    if (want.at === "open") {
-      await assert.rejects(R.open(source), (e) => e.code === want.code, name);
-      continue;
+    for (const kind of ["bytes", "url"]) {
+      const source = SOURCES[kind](want.file);
+      const t0 = Date.now();
+      const whole0 = wholeAnswers;
+      const ok = (e) => e.code === want.code && (!want.compression || e.compression === want.compression);
+      if (want.at === "open") await assert.rejects(R.open(source), ok, `${name} (${kind})`);
+      else {
+        const g = await R.open(source);
+        await assert.rejects(g.read(want.contig, want.plane, 0, 100), ok, `${name} (${kind})`);
+        if (want.compression) assert.equal((await g.read(want.contig, "ref", 0, 100)).length, 100, `${name}: its other pages still read`);
+      }
+      assert.ok(Date.now() - t0 < 5000, `${name} (${kind}): refused after ${Date.now() - t0} ms`);
+      assert.equal(wholeAnswers, whole0, `${name} (${kind}): the whole file was sent`);
     }
-    const g = await R.open(source);
-    await assert.rejects(g.read(want.contig, want.plane, 0, 100), (e) => e.code === want.code && e.compression === want.compression, name);
-    assert.equal((await g.read(want.contig, "ref", 0, 100)).length, 100, `${name}: its other pages still read`);
   }
   await assert.rejects(R.open(R.fromUrl(base + "no-such-file.gpxil.tif")), { code: "http" });
+  // the 200 MB strip: refused once more than its 10 bytes come out, not after all of it
+  const g = await R.open(SOURCES.bytes(expected.bad.bomb.file));
+  await assert.rejects(g.read("c", "ref", 0, 10), /inflates to more than the 10 bytes it holds/);
+  const z = zlib.deflateSync(Buffer.from("ACGT".repeat(1000)));
+  assert.equal(new TextDecoder().decode(await R.inflate(z, 4000)), "ACGT".repeat(1000));
+  await assert.rejects(R.inflate(z, 3999), { code: "limit" });
+  await assert.rejects(R.inflate(z.subarray(0, z.length - 6)), { code: "format" }); // (cut short)
+});
+
+test("odd files that read: a tag of 2^30 values, names that differ only in case", async () => {
+  const many = await R.open(SOURCES.url(expected.odd["many-values"]));
+  assert.equal(
+    Array.from(await many.read("c", "ref", 0, 20))
+      .map(R.base)
+      .join(""),
+    "ACGT".repeat(5),
+  );
+  const g = await R.open(SOURCES.bytes(expected.odd.case));
+  const first = async (name) => R.base((await g.read(name, "ref", 0, 1))[0]);
+  assert.deepEqual([await first("a"), await first("A"), await first("b"), await first("B")], ["A", "C", "G", "G"]);
+  assert.equal(g.contig("chrA").name, "a"); // (ignoring case, the first contig of the name)
 });
 
 test("it loads as a classic script, as an ES module and with require()", async () => {
