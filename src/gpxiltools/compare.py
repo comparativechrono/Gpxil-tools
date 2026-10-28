@@ -152,6 +152,9 @@ class _Seq:
     def has(self, plane: str) -> bool:
         return self.c.has(plane)
 
+    def covers(self, plane: str, s: int, e: int) -> bool:
+        return self.c.covers(plane, s - self.start, e - self.start)
+
     def read(self, plane: str, s: int, e: int):
         return self.c.read(plane, s - self.start, e - self.start)
 
@@ -348,20 +351,21 @@ def _check_same_reference(views) -> None:
                 raise ValueError(f"{v.name} has another {k} in one file than in another: not the same reference")
 
 
-def _ref_source(contigs):
-    """A contig with the reference's bases (a ref plane, or a reference attached), or None."""
-    return next((c for c in contigs if c.has("ref")), None)
+def _ref_source(contigs) -> list:
+    """The contigs that the reference's bases can be read from (a ref plane, or a reference attached): each file's,
+    in order, for :func:`_ref_reader` to read from the first that has them where it reads."""
+    return list(contigs)
 
 
-def _ref_reader(ref, s: int, e: int):
-    """The reference's bases over [s, e) (4-bit codes), read when first asked for; None without a reference."""
+def _ref_reader(refs, s: int, e: int):
+    """The reference's bases over [s, e) (4-bit codes), read when first asked for, from the first of ``refs`` that
+    has them there (windows without a ref plane may hold some of a stretch); None if none has them."""
     got: list = []
 
     def read():
-        if ref is None:
-            return None
         if not got:
-            got.append(np.bitwise_and(ref.read("ref", s, e), 0x0F))
+            ref = next((c for c in refs or () if c.covers("ref", s, e)), None)
+            got.append(None if ref is None else np.bitwise_and(ref.read("ref", s, e), 0x0F))
         return got[0]
 
     return read
@@ -1171,7 +1175,8 @@ def picture(
         cmyk[0xF0 + k] = np.round(np.array(colours[1]) * 255)
         if not (trio and k in _TRIO_SOMETIMES) or k in present:
             legend.append((label, 0xF0 + k))
-    base = ref.read("ref", start, end) if ref is not None else np.full(end - start, C.BASE_N, dtype=np.uint8)
+    src = next((c for c in ref if c.covers("ref", start, end)), None)
+    base = src.read("ref", start, end) if src is not None else np.full(end - start, C.BASE_N, dtype=np.uint8)
     idx = np.where(cls == 0, base, 0xF0 + cls).astype(np.uint8)
     bpr = bases_per_row or cs[0].width
     return Rendering(_wrap(idx, bpr, C.NO_BASE), rgb, cmyk, legend, bpr, 1, start, end, f"{cs[0].name}:{start + 1:,}-{end:,}")

@@ -219,7 +219,7 @@ def region_tally(contig, start: int = 0, end: int | None = None, *, chunk: int =
     end = contig.length if end is None else end
     if not (0 <= start < end <= contig.length):
         raise IndexError(f"{contig.name}:{start + 1}-{end} is outside {contig.name} (length {contig.length:,})")
-    t = Tally(regions=1, bases=end - start, has_ref=contig.has("ref"), has_gt=contig.has("gt"))
+    t = Tally(regions=1, bases=end - start, has_ref=contig.covers("ref", start, end), has_gt=contig.has("gt"))
     if not t.has_gt:
         if t.has_ref:
             for s in range(start, end, chunk):
@@ -354,8 +354,7 @@ def _wanted(gfile, regions) -> list[tuple]:
 def _through(gfile, c, s: int, e: int) -> tuple:
     """A region read through the file's join of the contigs of its sequence that holds it (a Stretch of windows that
     overlap or touch), so that an event cut by the end of one window is counted whole: (view, start, end)."""
-    v = gfile.stretch_of(c)
-    return v, c.start + s - v.start, c.start + e - v.start
+    return gfile.view(c, s, e)
 
 
 def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple]:

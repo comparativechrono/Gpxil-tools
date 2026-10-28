@@ -73,7 +73,10 @@ def _region_names(r) -> list[str]:
     may be named 'HLA-A*01:14')."""
     if not isinstance(r, str):
         return [r[0]]
-    return list(dict.fromkeys([r.strip(), parse_region(r)[0]]))
+    try:
+        return list(dict.fromkeys([r.strip(), parse_region(r)[0]]))
+    except ValueError:  # (not a region: a contig's name, 'HLA:0-5', or else an error once the names are known)
+        return [r.strip()]
 
 
 def _region_of(r, known_as: set[str]) -> tuple[str, int | None, int | None]:
@@ -81,7 +84,12 @@ def _region_of(r, known_as: set[str]) -> tuple[str, int | None, int | None]:
     (as gpxil-read.js reads it), else the region it reads as."""
     if not isinstance(r, str):
         return tuple(r)
-    return (r.strip(), None, None) if r.strip() in known_as else parse_region(r)
+    if r.strip() in known_as:
+        return (r.strip(), None, None)
+    try:
+        return parse_region(r)
+    except ValueError:  # (not a region, nor this contig's name: another contig's, else an error once all are read)
+        return (r.strip(), None, None)
 
 
 def reference_records(path, *, invalid: str = "error", wanted: Callable[[str], bool] | None = None):
@@ -452,6 +460,9 @@ def _encode_once(
                 )
             calls = None  # (free the masks before the next contig)
         if regions is not None:
+            for k, r in enumerate(regions):
+                if k not in found and isinstance(r, str):
+                    parse_region(r)  # (neither a contig's name nor a region: says what is wrong with it)
             missing = [_region_names(regions[k])[-1] for k in range(len(regions)) if k not in found]
             if missing:
                 raise ValueError(

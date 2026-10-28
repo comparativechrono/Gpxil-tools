@@ -18,16 +18,13 @@ def _names(text: str) -> list[str]:
 
 
 def _region(text: str | None):
-    """A region given as text, checked that it reads as one, and kept as text: what it is depends on the file (a
-    contig may be named 'HLA-A*01:14'), so each command reads it with the file's ``region_of`` (:func:`_in`)."""
+    """A region given as text, kept as text: what it is depends on the file (a contig may be named 'HLA-A*01:14', or
+    even 'HLA:0-5'), so each command reads it with the file's ``region_of`` (:func:`_in`), which says what is wrong
+    with a text that is neither a contig's name nor a region."""
     if text is None:
         return None
-    from .container import parse_region
-
-    try:
-        parse_region(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"{exc}; use CONTIG or CONTIG:START-END (1-based, inclusive)") from None
+    if not str(text).strip(" \t\r\n"):
+        raise argparse.ArgumentTypeError("an empty region: use CONTIG or CONTIG:START-END (1-based, inclusive)")
     return text
 
 
@@ -242,7 +239,8 @@ def cmd_render(a) -> int:
     from .render import render
 
     with _open(a) as g:
-        c, start, end = g.locate(*g.region_of(a.region))
+        # (read through the windows that overlap or touch the one that holds it, as every command reads a region)
+        c, start, end = g.view(*g.locate(*g.region_of(a.region), join=True))
         r = render(c, mode=a.mode, palette=a.palette, start=start, end=end, bases_per_row=a.width, mark_insertions=a.mark_insertions)
         if a.layout == "hilbert":
             import numpy as np
@@ -296,9 +294,11 @@ def cmd_fasta(a) -> int:
                 raise SystemExit(f"gpxil: error: {a.file} has no sample, so only --which ref can be exported")
             regions = [g.region_of(a.region)] if a.region else [(n, None, None) for n in g.contigs]
             for name, s, e in regions:
-                c, s, e = g.locate(name, s, e, join=True)
+                # (read through the windows that overlap or touch the one that holds it: an event that one cuts is
+                # whole, and a window without the sample's planes, or the reference, reads them from another)
+                c, s, e = g.view(*g.locate(name, s, e, join=True))
                 if a.which != "ref" and not c.has("gt"):
-                    print(f"note: {c.name} has no genotype plane (no calls); skipped", file=sys.stderr)
+                    print(f"note: {c.region(s, e)} has no genotype plane (no calls); skipped", file=sys.stderr)
                     continue
                 if a.which == "ref":
                     pieces = iter_reference(c, s, e)

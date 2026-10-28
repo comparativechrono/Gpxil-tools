@@ -200,8 +200,11 @@ class _Planes:
     """The planes of one chunk ``[lo, hi)`` of a contig."""
 
     def __init__(self, contig: Contig, lo: int, hi: int):
+        self.contig = contig
         self.lo, self.hi = lo, hi
-        self.ref = contig.read("ref", lo, hi)
+        # (the reference, read with the chunk where it can be; else for each record, as a stretch of windows of which
+        # some are stored without it holds it only in part: Stretch.covers)
+        self._ref = contig.read("ref", lo, hi) if contig.covers("ref", lo, hi) else None
         gt = contig.read("gt", lo, hi)
         self.h = [C.normalize_states(C.hap1(gt)), C.normalize_states(C.hap2(gt))]
         self.flags = contig.read("flags", lo, hi) if contig.has("flags") else np.zeros(hi - lo, dtype=np.uint8)
@@ -209,6 +212,12 @@ class _Planes:
         self.dp = contig.read("dp", lo, hi) if contig.has("dp") else None
         self.ps = contig.read("ps", lo, hi) if contig.has("ps") else None
         self.ins_any = (self.flags & (C.FLAG_INS1 | C.FLAG_INS2)) != 0
+
+    def ref(self, a: int, b: int) -> np.ndarray:
+        """The reference over the contig's offsets ``[a, b)``, in the chunk."""
+        if self._ref is not None:
+            return self._ref[a - self.lo : b - self.lo]
+        return self.contig.read("ref", a, b)
 
 
 def _chunked_windows(
@@ -272,7 +281,7 @@ def _record(
             pad = "N"
         elif b0 < p.hi:
             b0 += 1  # (a deletion at a sequence's first base, which VCF calls convert to never: the base after)
-    ref_ascii = C.REF_TO_ASCII[np.bitwise_and(p.ref[a0 - lo : b0 - lo], 0x0F)]
+    ref_ascii = C.REF_TO_ASCII[np.bitwise_and(p.ref(a0, b0), 0x0F)]
     refseq = pad + ref_ascii.tobytes().decode()
     alleles: list[str | None] = []
     for k in (0, 1):
@@ -454,13 +463,12 @@ def iter_vcf_records(
 def _view_pieces(pieces: list[tuple], views: list) -> list[tuple]:
     """Pieces ``(contig, start, end)`` of one sequence, read through the file's joins of its contigs with the
     sample's planes (``views``, :meth:`~gpxiltools.container.GpxilFile.stretches`): ``(view, start, end)`` at the
-    view's offsets, in order along the sequence, those of one view joined where they overlap or touch. A piece of a
-    contig without the sample's planes gives none."""
+    view's offsets, in order along the sequence, those of one view joined where they overlap or touch. A piece is of
+    the sequence, whatever planes the contig it was found in has: where only contigs without the sample's planes hold
+    it, it gives none."""
     got: dict[int, list] = {}
     starts = [v.start for v in views]  # (the views are apart, in order along the sequence)
     for c, s, e in pieces:
-        if not c.has("gt"):
-            continue
         a, b = c.start + s, c.start + e
         for k in range(max(0, bisect.bisect_right(starts, a) - 1), bisect.bisect_left(starts, b)):
             v = views[k]

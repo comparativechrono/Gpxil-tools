@@ -19,13 +19,14 @@ from test_web_and_browser import serve
 from gpxiltools import codes as C
 from gpxiltools.cli import main
 from gpxiltools.compare import compare_pair, compare_trio
-from gpxiltools.container import GpxilFile, GpxilFormatError, GpxilWriter, check_window, parse_region
+from gpxiltools.container import GpxilFile, GpxilFormatError, GpxilWriter, MissingPlaneError, check_window, parse_region
 from gpxiltools.encode import encode
 from gpxiltools.export import haplotype_sequence, iter_vcf_records, write_vcf
 from gpxiltools.fasta import encode_sequence, sequence_digests
 from gpxiltools.stats import stats
 from gpxiltools.subset import subset
 from gpxiltools.validate import validate
+from gpxiltools.vcf import SidecarEntry
 
 BASES = "ACGT"
 QUIET = {"log": lambda m: None}
@@ -754,9 +755,12 @@ def _body(path, **kw) -> list[str]:
 
 def _combine(out, parts):
     """One file of contigs copied from several (each (path, name))."""
-    with GpxilFile(parts[0][0]) as g0:
-        meta = g0.metadata
-    with GpxilWriter(out, width=16, sample=meta["sample"], reference=meta["reference"]) as w:
+    metas = []
+    for path, _ in parts:
+        with GpxilFile(path) as g:
+            metas.append(g.metadata)
+    sample = next((m["sample"] for m in metas if m.get("sample")), None)  # (a copy of the reference only has none)
+    with GpxilWriter(out, width=16, sample=sample, reference=metas[0]["reference"]) as w:
         for path, name in parts:
             with GpxilFile(path) as g:
                 w.copy_contig(g[name])
@@ -945,3 +949,125 @@ def test_joins_follow_the_reference_given(tmp_path):
         g.attach_reference(fa)
         (s,) = g.stretches(need="ref")
         assert s.read("ref", 0, 190).tobytes() == encode_sequence(ref[10:200].encode()).tobytes()
+
+
+# ------------------------------------------------------------------ a third review
+
+
+def test_a_region_found_in_a_contig_without_calls(tmp_path, capsys):
+    """The first contig that holds a region may have no calls, while a window with them holds it too: the region is
+    of the sequence, so VCF, fasta and stats read the window's calls."""
+    recs = [_rec(p, lambda r, p=p: r[p - 1], lambda r, p=p: _other_base(r, p), "0|1", GQ=40, DP=30, PS=7) for p in (120, 160, 180)]
+    ref, fa, whole = _small(tmp_path, recs, seed=3)
+    a, r, wr = (tmp_path / f"{x}.gpxil.tif" for x in ("a", "r", "wr"))
+    subset(whole, a, ["c1:101-200"], **QUIET)
+    subset(whole, r, ["c1:51-300"], planes=["ref"], **QUIET)
+    subset(whole, wr, ["c1"], planes=["ref"], **QUIET)
+    region = [("c1", 149, 190)]
+    want, want_all = _body(a, regions=region, nocall_blocks=False), _body(a, nocall_blocks=False)
+    assert [x.split("\t")[1] for x in want] == ["160", "180"]
+    for k, parts in enumerate(([(r, "c1:51-300"), (a, "c1:101-200")], [(wr, "c1"), (a, "c1:101-200")])):
+        f = tmp_path / f"f{k}.gpxil.tif"
+        _combine(f, parts)
+        assert _body(f, regions=region, nocall_blocks=False) == want
+        assert _body(f, contigs=["c1"], nocall_blocks=False) == _body(f, nocall_blocks=False) == want_all
+        with GpxilFile(f) as g, GpxilFile(a) as one:
+            assert stats(g, region)["total"]["substitutions"] == stats(one, region)["total"]["substitutions"]
+        assert main(["fasta", str(f), "--region", "c1:150-190", "--which", "1"]) == 0
+        got = capsys.readouterr().out
+        assert main(["fasta", str(a), "--region", "c1:150-190", "--which", "1"]) == 0
+        assert got == capsys.readouterr().out
+
+
+def test_complex_entries_at_the_edges_of_windows(tmp_path):
+    """A window's COMPLEX entry at its first base is the parent's own (gpxil's conversion gives every COMPLEX base
+    one), or, in a run of COMPLEX bases that another writer made, a copy of the entry that starts the run (spec 3.1).
+    Joined, the windows hold what one window of all of them does."""
+    # two alleles alike on bases side by side, in windows that touch between them: both kept
+    rng = random.Random(19)
+    ref = list("".join(rng.choice(BASES) for _ in range(100)))
+    ref[19] = ref[20] = "A"
+    fa = tmp_path / "ref.fa"
+    fa.write_text(fasta_text({"c1": "".join(ref)}))
+    vcf = tmp_path / "s.vcf"
+    head = "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n"
+    vcf.write_text(head + "".join(f"c1\t{p}\t.\tA\t<INS>\t50\tPASS\t.\tGT\t1|0\n" for p in (20, 21)))
+    whole = tmp_path / "whole.gpxil.tif"
+    encode(fa, whole, vcf=vcf, width=16, **QUIET)
+    for i, regs in enumerate((["c1:6-20", "c1:21-30"], ["c1:6-21", "c1:21-30"])):
+        two, one = tmp_path / f"two{i}.gpxil.tif", tmp_path / f"one{i}.gpxil.tif"
+        subset(whole, two, regs, **QUIET)
+        subset(whole, one, ["c1:6-30"], **QUIET)
+        with GpxilFile(two) as t, GpxilFile(one) as o:
+            (s,) = t.stretches()
+            assert s.sidecar() == o["c1:6-30"].sidecar() and len(s.sidecar()) == 2
+            assert stats(t)["total"]["complex"] == stats(o)["total"]["complex"] == {"heterozygous": 2, "homozygous": 0}
+        assert _body(two, nocall_blocks=False) == _body(one, nocall_blocks=False)
+    # a run of COMPLEX bases that another writer made, with entries at its start and inside it: a window that starts
+    # in it holds a copy, which windows joined leave out, whether they touch or overlap
+    seq = encode_sequence(b"ACGT" * 10)
+    gt = np.zeros(40, np.uint8)
+    gt[10:15] = (C.HAP_COMPLEX << 4) | C.HAP_REF
+    side = [SidecarEntry(10, 1, "COMPLEX", "REF=G;ALT=<INV>;END=15"), SidecarEntry(12, 1, "COMPLEX", "REF=A;ALT=<DUP>;END=14")]
+    parent = tmp_path / "parent.gpxil.tif"
+    with GpxilWriter(parent, width=8, sample={"id": "S"}) as w:
+        w.add_contig("c", {"ref": seq, "gt": gt, "flags": np.zeros(40, np.uint8)}, sidecar=side, **sequence_digests(seq))
+    union = tmp_path / "union.gpxil.tif"
+    subset(parent, union, ["c:1-20"], **QUIET)
+    with GpxilFile(union) as u:
+        want = u["c:1-20"].sidecar()
+    assert [(e.offset, e.data) for e in want] == [(10, side[0].data), (12, side[1].data)]
+    for i, regs in enumerate((["c:1-13", "c:14-20"], ["c:1-15", "c:14-20"])):
+        two = tmp_path / f"run{i}.gpxil.tif"
+        subset(parent, two, regs, **QUIET)
+        with GpxilFile(two) as t:
+            assert [(e.offset, e.data) for e in t["c:14-20"].sidecar()] == [(0, side[1].data)]  # (the copy)
+            (s,) = t.stretches()
+            assert s.sidecar() == want
+
+
+def test_a_window_without_the_reference_beside_one_with_it(tmp_path):
+    """The reference is read from the windows that have it, where they hold the bases."""
+    recs = [_rec(p, lambda r, p=p: r[p - 1], lambda r, p=p: _other_base(r, p), "0|1") for p in (120, 130, 250)]
+    ref, fa, whole = _small(tmp_path, recs, seed=9)
+    a, b, both, union = (tmp_path / f"{x}.gpxil.tif" for x in ("a", "b", "both", "union"))
+    subset(whole, a, ["c1:101-200"], **QUIET)
+    subset(whole, b, ["c1:151-300"], planes=["gt", "flags"], **QUIET)
+    subset(whole, union, ["c1:101-300"], **QUIET)
+    _combine(both, [(a, "c1:101-200"), (b, "c1:151-300")])
+    inside = [("c1", 110, 140)]
+    assert _body(both, regions=inside) == _body(a, regions=inside) == _body(union, regions=inside)
+    with GpxilFile(both) as g, GpxilFile(a) as one:
+        (s,) = g.stretches()
+        assert not s.has("ref") and s.covers("ref", 0, 100) and not s.covers("ref", 90, 101)
+        assert stats(g, inside)["total"] == stats(one, inside)["total"]
+        assert stats(g, inside)["total"]["reference"] is not None
+        assert stats(g)["total"]["reference"] is None  # (not all of it has a reference)
+        with pytest.raises(MissingPlaneError, match="give the reference"):
+            write_vcf(g, io.StringIO(), regions=[("c1", 110, 260)])
+    with GpxilFile(both, reference=fa) as g:
+        out = io.StringIO()
+        write_vcf(g, out, regions=[("c1", 110, 260)])
+        assert out.getvalue() == _vcf(union, regions=[("c1", 110, 260)])
+
+
+def test_names_like_regions_that_are_not(tmp_path, capsys):
+    """A contig may be named like a region that isn't one ('HLA:0-5'): commands take it, as region_of does; a text
+    that is neither a contig's name nor a region is an error that says why."""
+    rng = random.Random(4)
+    fa = tmp_path / "odd.fa"
+    fa.write_text(
+        fasta_text({"HLA:0-5": "".join(rng.choice(BASES) for _ in range(100)), "c1": "".join(rng.choice(BASES) for _ in range(100))})
+    )
+    g = tmp_path / "odd.gpxil.tif"
+    encode(fa, g, width=16, **QUIET)
+    assert main(["fasta", str(g), "--region", "HLA:0-5"]) == 0
+    assert capsys.readouterr().out.startswith(">HLA:0-5\n")
+    again = tmp_path / "again.gpxil.tif"
+    encode(fa, again, regions=["HLA:0-5"], width=16, **QUIET)
+    with GpxilFile(again) as h:
+        assert h.contigs == ["HLA:0-5"] and h.locate(" HLA:0-5 ")[0].name == "HLA:0-5"
+    with GpxilFile(g) as h:
+        assert h.locate(" c1 ")[0].name == "c1" and h.region_of(" HLA:0-5 ") == ("HLA:0-5", None, None)
+    assert main(["fasta", str(g), "--region", "c1:0-5"]) == 1
+    assert "positions count from 1" in capsys.readouterr().err

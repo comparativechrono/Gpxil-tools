@@ -60,21 +60,28 @@ Version 0.3 of the specification: windows.
   HG002's chromosome 17, in 41 stretches, the 860 records are those of one
   window per stretch); `gpxil compare` compares each base once, and `gpxil
   stats` counts each base once in all. A region is read through the
-  stretch that holds it, in every command, so a region in one window ends
-  as the region of one window of all the stretch would, and a region that
-  windows hold only together is found in them (`locate(..., join=True)`).
-  Windows may have different planes: each base keeps the planes of the
-  windows that hold it, and where none with the sample's planes does,
-  nothing is known of it. A sequence named alone is all its windows in
+  stretch that holds it, in every command (`GpxilFile.view()`), so a
+  region in one window ends as the region of one window of all the stretch
+  would, and a region that windows hold only together is found in them
+  (`locate(..., join=True)`). Windows may have different planes: each base
+  keeps the planes of the windows that hold it, and where none with the
+  sample's planes does, nothing is known of it; so a region found first in
+  a window of the reference only still has the calls of a window beside
+  it. The reference is read from the windows that have it, where they hold
+  the bases (`Stretch.covers()`). A window's copy of a COMPLEX entry at its
+  first base (specification section 3.1) is told from the parent's own
+  entry, and left out. A sequence named alone is all its windows in
   `stats`, `vcf` and `book`. A deletion at a window's first base is
   written on the base before the window, as N, so that the window's VCF
   encodes back to it (specification section 11.4).
 - Regions: `CHROM:POS` is one base; numbers are the digits 0 to 9, with
   commas or spaces, and don't begin with 0, so a name with colons in it
   (`HLA-A*01:01:01:01`) stays a name; a region from position 0 is an error.
-  A file's contig named like a region (`HLA-A*01:14`) is that contig, and
-  lists of names (`--contigs`, `subset`) split at commas but those that
-  group a region's digits. gpxil-read.js reads regions the same way.
+  A file's contig named like a region (`HLA-A*01:14`, or even `HLA:0-5`),
+  or given with spaces around it, is that contig, and lists of names
+  (`--contigs`, `subset`) split at commas but those that group a region's
+  digits. Positions go up to 2^53 − 1. gpxil-read.js reads regions the
+  same way.
 - A window without its reference plane reads its bases from its parent in
   the reference given (a FASTA, a gpxil file of the chromosome, or of a
   window that holds it), checked against its own digests or its parent's.

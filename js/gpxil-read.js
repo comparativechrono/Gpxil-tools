@@ -746,7 +746,10 @@
       if (start === null) start = undefined; // (null as in JSON: not given)
       if (end === null) end = undefined;
       if (start === undefined && end === undefined && !(name && typeof name === "object")) {
-        if (!this.contig(name)) {
+        const text = String(name).replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+        if (!this.contig(name) && this.contig(text)) {
+          name = text; // (a contig's name, with spaces around it)
+        } else if (!this.contig(name)) {
           const r = parseRegion(name);
           if (!r) throw fail("region", `${name} isn't a region: give CONTIG or CONTIG:START-END, 1-based`);
           if (r.start !== undefined) return this.locate(r.name, r.start, r.end);

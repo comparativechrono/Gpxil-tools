@@ -449,6 +449,8 @@ def locate_text_cases(path: str) -> list[dict]:
         "chr1:0-5",
         "chr9:1-10",
         "chr1:01-5",
+        " chrM ",  # (a name with spaces around it: the name)
+        " chr2:601-610 ",
     ]
     out = []
     with GpxilFile(path) as g:
