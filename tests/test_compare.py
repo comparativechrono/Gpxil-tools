@@ -227,6 +227,8 @@ TRIO = {
         snv(800, "0/1"),
         snv(900, "1/1"),
         snv(1100, "0/1"),
+        snv(1200, "0/1"),  # (two bases next to each other that neither parent has: one site)
+        snv(1201, "0/1"),
         (1009, "A", "AA", "0/1"),  # (the mother's insertion, written after the run of As)
         snv(4200, "0/1"),  # (outside the child's regions called with confidence)
     ],
@@ -245,17 +247,17 @@ def test_trio_counts(trio):
         r = compare_trio(c, f, m)
         everything = compare_trio(c, f, m, all_calls=True)["total"]
     t = r["total"]
-    assert (t["all_called"], t["child_variant_bases"]) == (L - 500, 7)
+    assert (t["all_called"], t["child_variant_bases"]) == (L - 500, 9)
     assert (t["from_father"], t["from_mother"], t["from_both"], t["origin_unknown"]) == (1, 1, 1, 1)
     me = t["mendelian_errors"]
-    assert (me["sites"], me["bases"], me["new_mutation_sites"]) == (2, 2, 1)
-    assert [(x["position"], x["new"]) for x in me["examples"]] == [(901, False), (1101, True)]
+    assert (me["sites"], me["bases"], me["new_mutation_sites"], me["new_mutation_bases"]) == (3, 4, 2, 3)
+    assert [(x["position"], x["end"], x["new"]) for x in me["examples"]] == [(901, 901, False), (1101, 1101, True), (1201, 1202, True)]
     assert me["examples"][0]["child"].count("/") == 1 and me["examples"][0]["mother"] == f"{REF[900]}/{REF[900]}"
     assert t["written_differently"] == {"stretches": 1, "bases": 1}
     assert t["haplotypes"] == {"father": None, "mother": None}
-    assert everything["mendelian_errors"]["new_mutation_sites"] == 2  # (with the child's call outside its regions)
+    assert everything["mendelian_errors"]["new_mutation_sites"] == 3  # (with the child's call outside its regions)
     text = format_compare(r)
-    assert "2 sites (2 bases), 1 of them candidate new mutations" in text and "not phased" in text
+    assert "3 sites (4 bases), 2 of them candidate new mutations" in text and "not phased" in text
 
 
 def test_trio_picture(trio):

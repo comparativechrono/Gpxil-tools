@@ -977,10 +977,13 @@ def _trio_piece(chs, items, ref4_of, lo: int, hi: int, gap: int, t: TrioTally, s
     q = idx[err & inw]
     if q.size and (len(t.examples) < EXAMPLES or collect is not None):
         news = set(idx[new & inw].tolist())
-        for j in q[np.concatenate(([True], np.diff(q) != 1))].tolist():  # (the first base of each run of errors)
+        cut = np.diff(q) != 1
+        runs = zip(q[np.concatenate(([True], cut))].tolist(), q[np.concatenate((cut, [True]))].tolist())
+        for j, k in runs:  # (each run of errors, a site: its first base and its last)
             r = int(ref4[j]) if ref4 is not None else None
             ex = {
                 "position": s + j + 1,
+                "end": s + k + 1,
                 "child": _genotype_text(Cc, j, r, items),
                 "father": _genotype_text(F, j, r, items),
                 "mother": _genotype_text(M, j, r, items),
