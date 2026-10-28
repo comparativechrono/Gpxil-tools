@@ -11,8 +11,10 @@ what browsers have, and runs in Node 18 or later.
 
 Files are untrusted input (specification section 13), so it refuses what would make it loop or take all the memory:
 directories that loop back, more than 2^20 pages, a tag of more than 64 MiB, a strip or tile of more than 256 MiB
-decoded (a whole human chromosome 1 in one strip of 8-bit values still fits), a sidecar of more than 256 MiB; and it
-never inflates a strip past the size its rows need, nor reads one that holds less.
+decoded (a whole human chromosome 1 in one strip of 8-bit values still fits), a strip stored in more bytes than it
+could need, a sidecar of more than 256 MiB; it never inflates a strip past the size its rows need, nor reads one that
+holds less. Directories one after another are walked from the bytes already read. A TIFF that isn't gpxil is told by
+its metadata (`not-gpxil`) before its pages are looked at.
 
 The [Gpxil browser](https://github.com/comparativechrono/Gpxil-browser) and
 [GpxilStudio](https://github.com/comparativechrono/gpxilstudio) each keep a copy. It is not published on npm.

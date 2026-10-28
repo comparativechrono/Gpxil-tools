@@ -15,18 +15,21 @@ Version 0.2 of the specification, and a reader in JavaScript.
   nor does an insertion follow a base another call deletes; split
   multi-allelic records, unphased, go one to each haplotype in either order
   (unless their alleles change different bases of one REF), and a record
-  written twice stays heterozygous. Counted as
+  written twice stays heterozygous, whichever way its genotype is written
+  (the same allele goes to the haplotype that has it). Counted as
   `overlapping_calls_reassigned` (each contig's `encoding`, the summary, and
   a note from `gpxil encode`). On chromosome 17 of GIAB's v4.2.1 benchmarks
   of HG002, HG003 and HG004 it moves 26 of 320,884 records (on their 22
   autosomes, 687 of 12,079,785); `gpxil compare` then agrees with a check
   from the VCF records on every stretch where HG002's two benchmarks
   differ, and the trio's artefactual Mendelian error is gone.
-- Two smaller fixes to the VCF conversion. Allele numbers are digits: `²`,
-  a digit to Python, stopped the encoder with an error, and ` 1` or `+1`
-  now count as `bad_allele_index`, as `-1` did. A one-base ALT allele other
-  than A, C, G or T at a reference N is UNKNOWN, as a longer one was, not
-  REF.
+- Smaller fixes to the VCF conversion. Allele numbers are digits: `²`, a
+  digit to Python, stopped the encoder with an error, and ` 1` or `+1` now
+  count as `bad_allele_index`, as `-1` did. A one-base ALT allele other than
+  A, C, G or T at a reference N is UNKNOWN, as a longer one was, not REF. A
+  record with an empty REF is skipped (`skipped_out_of_range`): its
+  insertion had no anchor, and could land before the contig. Alleles of
+  `Call`s made in Python are read case-insensitively, as the VCF's are.
 - Files are written as gpxil 0.2. `gpxil subset` keeps the version of the
   file it copies, any 0.x, whose planes were made by that version's rules.
   The validator knows 0.1 and 0.2, with a schema for each, and checks a
@@ -36,11 +39,13 @@ Version 0.2 of the specification, and a reader in JavaScript.
   request, decoded strips cached), with the sidecar; any version 0.x, in
   strips or tiles, Deflate or none, with or without a predictor, classic
   TIFF or BigTIFF, either byte order, planes of 8, 16 or 32 bits. Files are
-  untrusted: it refuses directories that loop, strips that inflate past
-  their size or hold less than their rows, and tags, strips or sidecars
-  larger than it takes, each with an error code a page can put in its own
-  words. Tested in CI against the files gpxiltools writes, and files made
-  to hurt it. The Gpxil browser and GpxilStudio each keep a copy
+  untrusted: it refuses directories that loop, strips stored in more bytes
+  than they could need, that inflate past their size or hold less than
+  their rows, and tags, strips or sidecars larger than it takes, each with
+  an error code a page can put in its own words; directories one after
+  another are walked from the bytes already read. Tested in CI against the
+  files gpxiltools writes, and files made to hurt it, after two independent
+  reviews. The Gpxil browser and GpxilStudio each keep a copy
   (`js/copy_to.py`); it is not on npm.
 
 ## 0.5.0 (28 October 2026)

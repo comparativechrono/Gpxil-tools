@@ -112,8 +112,9 @@ def retiff(src: str, out: str, byteorder: str = "<", tile: tuple[int, int] | Non
 
 def hand_tiff(pages: list[dict], loop_to: int | None = None) -> bytes:
     """A little-endian classic TIFF built by hand, so that it can be wrong: pages of dict(W, H, rps, strips (bytes
-    each), desc, comp=1, counts=None (strip byte counts other than the strips' sizes), patch=None ({tag: (type,
-    count, value or offset)} for entries to write as given)); the last directory pointing back to page loop_to."""
+    each), desc, comp=1, bits=8, fmt=None (SampleFormat), pred=None (Predictor), counts=None (strip byte counts other
+    than the strips' sizes), patch=None ({tag: (type, count, value or offset)} for entries to write as given)); the
+    last directory pointing back to page loop_to."""
     buf = bytearray(b"II*\x00\x00\x00\x00\x00")
 
     def array(typ: int, vals: list[int]) -> tuple[int, bytes]:
@@ -136,7 +137,7 @@ def hand_tiff(pages: list[dict], loop_to: int | None = None) -> bytes:
         entries = {
             256: (4, *array(4, [pg["W"]])),
             257: (4, *array(4, [pg["H"]])),
-            258: (3, *array(3, [8])),
+            258: (3, *array(3, [pg.get("bits", 8)])),
             259: (3, *array(3, [pg.get("comp", 1)])),
             262: (3, *array(3, [1])),
             270: (2, len(desc), struct.pack("<I", desc_at)),
@@ -145,6 +146,10 @@ def hand_tiff(pages: list[dict], loop_to: int | None = None) -> bytes:
             278: (4, *array(4, [pg["rps"]])),
             279: (4, *array(4, pg.get("counts") or [len(st) for st in pg["strips"]])),
         }
+        if pg.get("fmt"):
+            entries[339] = (3, *array(3, [pg["fmt"]]))
+        if pg.get("pred"):
+            entries[317] = (3, *array(3, [pg["pred"]]))
         for tag, (typ, n, value) in (pg.get("patch") or {}).items():
             entries[tag] = (typ, n, struct.pack("<I", value))
         ifds.append(len(buf))
@@ -212,17 +217,59 @@ def hand_files(out_dir: str) -> dict:
         contig="c",
         plane="gt",
     )
-    # a 10-base page whose one strip inflates to 200 MB
-    tiny = [{"name": "c", "length": 10, "pages": {"ref": 0}}]
+    # a page of one strip of 256 KiB, stored in 200 KiB (as such a strip could be), that inflates to 200 MB
+    wide = [{"name": "c", "length": 1 << 18, "pages": {"ref": 0}}]
     bomb = zlib.compress(b"\x00" * (200 << 20), 9)
     put(
         "bomb",
-        hand_tiff([{"W": 10, "H": 1, "rps": 1, "strips": [bomb], "comp": 8, "desc": hand_meta(tiny, 10)}]),
+        hand_tiff([{"W": 1 << 18, "H": 1, "rps": 1, "strips": [bomb], "comp": 8, "desc": hand_meta(wide, 1 << 18)}]),
         code="format",
         at="read",
         contig="c",
         plane="ref",
     )
+    # a strip said to be stored in 4 GiB: refused before anything is fetched
+    put(
+        "huge-count",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "counts": [0xFFFFFFF0], "desc": hand_meta(one, 10)}]),
+        code="format",
+        at="read",
+        contig="c",
+        plane="ref",
+    )
+    # 100,000 empty directories one after another, the gt plane said to be on the last: walked from the bytes read
+    far = [{"name": "c", "length": 20, "pages": {"ref": 0, "gt": 100_000}}]
+    data = bytearray(hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": hand_meta(far, 10)}]))
+    ifd = struct.unpack_from("<I", data, 4)[0]
+    start = len(data)
+    struct.pack_into("<I", data, ifd + 2 + 12 * struct.unpack_from("<H", data, ifd)[0], start)
+    for i in range(100_000):
+        data += struct.pack("<HI", 0, start + 6 * (i + 1) if i < 99_999 else 0)
+    put("chain", bytes(data), code="format", at="read", contig="c", plane="gt")
+    # page numbers that aren't (null, ""), and contig entries that aren't
+    nulls = [{"name": "c", "length": 20, "pages": {"ref": 0, "gt": None, "flags": ""}}]
+    put(
+        "page-null",
+        hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": hand_meta(nulls, 10)}]),
+        code="format",
+        at="read",
+        contig="c",
+        plane="gt",
+    )
+    bad["page-empty"] = dict(bad["page-null"], plane="flags")
+    for name, contigs in (
+        ("contig-null", [None]),
+        ("aliases-text", [{"name": "c", "length": 20, "pages": {"ref": 0}, "aliases": "chrC"}]),
+        ("pages-text", [{"name": "c", "length": 20, "pages": "ref"}]),
+    ):
+        desc = json.dumps(
+            {"gpxil": "0.2", "layout": {"type": "raster", "width": 10}, "contigs": contigs, "contig": "c", "plane": "ref", "length": 20}
+        )
+        put(name, hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": desc}]), code="format", at="open")
+    # TIFFs that aren't gpxil, with pages this reader couldn't read either: told by their metadata, before their layout
+    for name, kw in (("rgb", dict(data=np.zeros((8, 8, 3), np.uint8), photometric="rgb")), ("bilevel", dict(data=np.zeros((8, 8), bool)))):
+        tifffile.imwrite(os.path.join(out_dir, name + ".tif"), metadata=None, **kw)
+        bad[name] = {"file": name + ".tif", "code": "not-gpxil", "at": "open"}
     # strips shorter than their rows: 20 pixels in one strip of 10 bytes, stored and compressed
     put(
         "short",
@@ -276,7 +323,8 @@ def hand_files(out_dir: str) -> dict:
 
 def odd_files(out_dir: str) -> dict:
     """Files that are odd but must be read: an ImageWidth said to hold 2^30 values (only the first is read); two
-    contigs whose names differ only in case, and an alias that is another contig's name."""
+    contigs whose names differ only in case, and an alias that is another contig's name; a float plane with
+    predictor 2; a zlib stream with padding after it."""
     acgt = bytes([1, 2, 4, 8]) * 5
     files = {}
     one = [{"name": "c", "length": 20, "pages": {"ref": 0}}]
@@ -300,6 +348,28 @@ def odd_files(out_dir: str) -> dict:
     with open(os.path.join(out_dir, "case.tif"), "wb") as fh:
         fh.write(hand_tiff(pages))
     files["case"] = "case.tif"
+    # a float32 extension plane with predictor 2 (its 32-bit words differenced, as libtiff writes it; tifffile reads it)
+    x = (np.arange(64, dtype=np.float32) / 7).reshape(4, 16)
+    words = x.view(np.uint32).astype(np.int64)
+    words[:, 1:] = (words[:, 1:] - words[:, :-1]) % 2**32
+    contigs = [{"name": "c", "length": 64, "pages": {"x-f": 0}}]
+    desc = json.dumps(
+        {"gpxil": "0.2", "layout": {"type": "raster", "width": 16}, "contigs": contigs, "contig": "c", "plane": "x-f", "length": 64}
+    )
+    strip = zlib.compress(words.astype("<u4").tobytes())
+    with open(os.path.join(out_dir, "float-pred2.tif"), "wb") as fh:
+        fh.write(hand_tiff([{"W": 16, "H": 4, "rps": 4, "strips": [strip], "comp": 8, "bits": 32, "fmt": 3, "pred": 2, "desc": desc}]))
+    with open(os.path.join(out_dir, "float-pred2.bin"), "wb") as fh:
+        fh.write(x.astype("<f4").tobytes())
+    with tifffile.TiffFile(os.path.join(out_dir, "float-pred2.tif")) as t:
+        assert np.array_equal(t.pages[0].asarray(), x)  # (as tifffile reads it)
+    files["float-pred2"] = "float-pred2.tif"
+    # a strip whose zlib stream is followed, inside its byte count, by padding (zlib ignores it)
+    with open(os.path.join(out_dir, "padded.tif"), "wb") as fh:
+        fh.write(
+            hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [zlib.compress(acgt) + bytes(7)], "comp": 8, "desc": hand_meta(one, 10)}])
+        )
+    files["padded"] = "padded.tif"
     return files
 
 

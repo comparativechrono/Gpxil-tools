@@ -110,8 +110,9 @@
   }
 
   /** zlib-wrapped Deflate (TIFF compression 8, and the sidecar). With a limit, an error (code "limit") as soon as
-      more than that many bytes come out, so that a small file can't inflate to fill the memory */
-  async function inflate(bytes, limit) {
+      more than that many bytes come out, so that a small file can't inflate to fill the memory. Bytes after the end
+      of the stream (padding) are ignored, as zlib ignores them; so is anything after `enough` bytes have come out */
+  async function inflate(bytes, limit, enough) {
     const max = limit === undefined ? Infinity : limit;
     const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate")).getReader();
     const parts = [];
@@ -126,7 +127,9 @@
       }
     } catch (e) {
       reader.cancel().catch(() => {});
-      throw e && e.code === "limit" ? e : fail("format", `compressed data that don't inflate (${(e && e.message) || e})`);
+      if (e && e.code === "limit") throw e;
+      const junk = e && (e.code === "ERR_TRAILING_JUNK_AFTER_STREAM_END" || /junk/i.test(String(e.message)));
+      if (!(junk || (enough !== undefined && n >= enough))) throw fail("format", `compressed data that don't inflate (${(e && e.message) || e})`);
     }
     if (parts.length === 1) return parts[0];
     const out = new Uint8Array(n);
@@ -243,8 +246,9 @@
       const h = await this.header();
       const size = this.source.size;
       if (!count(at) || at < (h.big ? 16 : 8) || (size && at >= size)) throw fail("format", `a directory at ${at}, outside the file`);
-      let bytes = await this.source.read(at, size ? Math.min(size, at + PROBE) : at + PROBE, "directory");
-      let r = new View(bytes, at, h.little);
+      // (the bytes read for the last directory often hold this one: directories one after another are walked from them)
+      let r = this._last && this._last.has(at, h.big ? 8 : 2) ? this._last : null;
+      if (!r) r = new View(await this.source.read(at, size ? Math.min(size, at + PROBE) : at + PROBE, "directory"), at, h.little);
       if (!r.has(at, h.big ? 8 : 2)) throw fail("format", `the file ends before the directory at ${at}`);
       const n = h.big ? r.u64(at) : r.u16(at);
       if (n > MAX_TAGS) throw fail("format", `a directory of ${n} tags: not a gpxil page`);
@@ -252,10 +256,10 @@
       const first = at + (h.big ? 8 : 2);
       const end = first + n * entry + (h.big ? 8 : 4);
       if (!r.has(first, end - first)) {
-        bytes = await this.source.read(at, end, "directory");
-        r = new View(bytes, at, h.little);
+        r = new View(await this.source.read(at, Math.max(end, size ? Math.min(size, at + PROBE) : at + PROBE), "directory"), at, h.little);
         if (!r.has(first, end - first)) throw fail("format", `the file ends inside the directory at ${at}`);
       }
+      this._last = r;
       const tags = new Map();
       for (let i = 0; i < n; i++) {
         const e = first + i * entry;
@@ -309,8 +313,9 @@
       }
       return this.byOffset.get(at);
     }
-    async _page(at) {
-      const { r, tags } = await this._dir(at);
+    /** what reads the tags of a directory: values(tag, n) (up to n values, all without n; null if the page hasn't
+        the tag), one(tag, fallback) (the first value) and raw(tag) (the value's bytes, for ASCII and UNDEFINED) */
+    _tags(r, tags) {
       const h = this.h;
       /** a View holding the first n values of a tag, read from the file if the directory's bytes don't */
       const view = async (t, n) => {
@@ -321,7 +326,6 @@
         if (!v.has(t.at, bytes)) throw fail("format", "the file ends inside a tag");
         return v;
       };
-      /** up to n values of a tag (all of them without n), or null if the page hasn't the tag */
       const values = async (tag, n) => {
         const t = tags.get(tag);
         if (!t) return null;
@@ -336,13 +340,31 @@
         const v = await values(tag, 1);
         return v && v.length ? v[0] : fallback;
       };
-      /** a tag's value as bytes (ASCII, UNDEFINED), or null */
       const raw = async (tag) => {
         const t = tags.get(tag);
         if (!t) return null;
         const v = await view(t, t.count);
         return new Uint8Array(v.v.buffer, v.v.byteOffset + (t.at - v.base), t.bytes).slice();
       };
+      /** the ImageDescription (a page's JSON metadata) as text, or null */
+      const description = async () => {
+        const v = await raw(TAG.ImageDescription);
+        if (!v) return null;
+        let n = v.length;
+        while (n && v[n - 1] === 0) n--;
+        return new TextDecoder().decode(v.subarray(0, n));
+      };
+      return { values, one, raw, description };
+    }
+    /** the ImageDescription of page k, read without checking the page's layout (so that a TIFF that isn't gpxil is
+        told as one by its metadata) */
+    async description(k) {
+      const { r, tags } = await this._dir(await this.ifd(k));
+      return this._tags(r, tags).description();
+    }
+    async _page(at) {
+      const { r, tags } = await this._dir(at);
+      const { values, one, raw, description } = this._tags(r, tags);
       const tiled = tags.has(TAG.TileWidth) || tags.has(TAG.TileOffsets);
       const page = {
         offset: at,
@@ -355,13 +377,7 @@
         predictor: await one(TAG.Predictor, 1),
         tiled,
         /** the page's ImageDescription (its JSON metadata), or null */
-        description: async () => {
-          const v = await raw(TAG.ImageDescription);
-          if (!v) return null;
-          let n = v.length;
-          while (n && v[n - 1] === 0) n--;
-          return new TextDecoder().decode(v.subarray(0, n));
-        },
+        description,
         /** the raw bytes of a tag's value (the sidecar's, say), or null */
         tagBytes: raw,
       };
@@ -379,7 +395,7 @@
         e.compression = name;
         throw e;
       }
-      if (!(page.predictor === 1 || (page.predictor === 2 && page.format !== 3) || (page.predictor === 3 && page.format === 3)))
+      if (!(page.predictor === 1 || page.predictor === 2 || (page.predictor === 3 && page.format === 3)))
         throw fail("predictor", `a page of format ${page.format} with predictor ${page.predictor}, which this reader doesn't undo`);
       const bps = bits / 8;
       let n;
@@ -405,7 +421,13 @@
       page.counts = (await values(tiled ? TAG.TileByteCounts : TAG.StripByteCounts, n)) || [];
       if (page.offsets.length < n || page.counts.length < n)
         throw fail("format", `a page of ${n} ${what} lists ${Math.min(page.offsets.length, page.counts.length)}`);
-      for (let s = 0; s < n; s++) if (!(count(page.offsets[s]) && count(page.counts[s]))) throw fail("format", `${what} at offsets that aren't`);
+      // stored, a strip or tile needs no more bytes than it holds decoded (Deflate: plus what a stored block adds)
+      const full = page.segmentBytes;
+      const most = page.compression === 1 ? full + 16 : full + (full >> 3) + (full >> 6) + 64;
+      for (let s = 0; s < n; s++) {
+        if (!(count(page.offsets[s]) && count(page.counts[s]))) throw fail("format", `${what} at offsets that aren't`);
+        if (page.counts[s] > most) throw fail("format", `${what.slice(0, -1)} ${s} is stored in ${page.counts[s]} bytes, and it holds ${full}`);
+      }
       return page;
     }
     _key(page, s) {
@@ -421,7 +443,7 @@
       if (page.compression === 1) data = stored.slice(0, Math.min(stored.length, full));
       else {
         try {
-          data = await inflate(stored, full);
+          data = await inflate(stored, full, need);
         } catch (e) {
           throw e.code === "limit" ? fail("format", `${what} ${s} inflates to more than the ${full} bytes it holds`) : e;
         }
@@ -580,8 +602,7 @@
   /** open a gpxil file: its metadata (the JSON of the first page) and its contigs */
   async function open(source) {
     const file = new TiffFile(source);
-    const p0 = await file.page(0);
-    const desc = await p0.description();
+    const desc = await file.description(0); // (page 0's layout is checked when it is read: a TIFF that isn't gpxil is told by this)
     let meta;
     try {
       meta = JSON.parse(desc);
@@ -601,14 +622,21 @@
       this.meta = meta;
       this.version = String(meta.gpxil);
       const width = Number((meta.layout || {}).width) || 0;
-      this.contigs = meta.contigs.map((c) => ({
-        name: String(c.name),
-        length: Number(c.length),
-        width: Number(c.width || width),
-        pages: c.pages || {},
-        aliases: (c.aliases || []).map(String),
-        entry: c,
-      }));
+      const object = (v) => v && typeof v === "object" && !Array.isArray(v);
+      this.contigs = meta.contigs.map((c, i) => {
+        if (!object(c) || !["string", "number"].includes(typeof c.name) || c.name === "" || !count(Number(c.length)))
+          throw fail("format", `the metadata's contig ${i + 1} has no name or length`);
+        if ((c.pages !== undefined && !object(c.pages)) || (c.aliases !== undefined && !Array.isArray(c.aliases)))
+          throw fail("format", `the metadata's contig ${c.name}: pages must be an object, aliases a list`);
+        return {
+          name: String(c.name),
+          length: Number(c.length),
+          width: Number(c.width || width),
+          pages: c.pages || {},
+          aliases: (c.aliases || []).map(String),
+          entry: c,
+        };
+      });
       // names first, then aliases; exactly as written, then ignoring case; where two match, the first contig
       this._exact = new Map();
       this._folded = new Map();
@@ -635,8 +663,9 @@
     page(contig, plane) {
       const c = this._contig(contig);
       if (!Object.prototype.hasOwnProperty.call(c.pages, plane)) return Promise.reject(fail("plane", `${c.name} has no ${plane} plane`));
-      const k = Number(c.pages[plane]);
-      if (!count(k)) return Promise.reject(fail("format", `${c.name}'s ${plane} plane is on page ${c.pages[plane]}, which isn't a page number`));
+      const k = c.pages[plane];
+      if (typeof k !== "number" || !count(k))
+        return Promise.reject(fail("format", `${c.name}'s ${plane} plane is on page ${JSON.stringify(k)}, which isn't a page number`));
       return this.file.page(k);
     }
     /** a plane's values over [start, end) of a contig (0-based, the end excluded; clipped to the contig) */

@@ -121,6 +121,14 @@ def test_a_deletion_and_an_insertion_at_one_anchor_either_order():
 def test_a_record_written_twice_stays_heterozygous():
     gt, _, stats = encode([call(3, "G", "A", "0/1"), call(3, "G", "A", "0/1")])
     assert gt[2] == "REF|A" and stats.overlapping_calls_reassigned == 0
+    # in either order: the same allele goes to the haplotype that has it, not the other
+    gt, _, stats = encode([call(3, "G", "A", "0/1"), call(3, "G", "A", "1/0")])
+    assert gt[2] == "REF|A" and stats.overlapping_calls_reassigned == 1
+    gt, _, stats = encode([call(3, "G", "A", "1|0"), call(3, "G", "C,A", "1/2")])  # (phased first, then C/A)
+    assert gt[2] == "A|C" and stats.overlapping_calls_reassigned == 1
+    # homozygous before: the same allele fits either haplotype
+    gt, _, stats = encode([call(3, "G", "A", "1/1"), call(3, "G", "A", "0/1")])
+    assert gt[2] == "A|A" and stats.overlapping_calls_reassigned == 0
     gt, _, stats = encode([call(2, "CGT", "C", "0/1"), call(2, "CGT", "C", "0/1")])
     assert gt[2:4] == ["REF|DEL", "REF|DEL"] and stats.overlapping_calls_reassigned == 0
     # (the same allele written with more of the reference around it is the same allele)
@@ -150,6 +158,17 @@ def test_allele_numbers_are_digits():
     # "²" is a digit to Python, but no allele number: counted, and nothing written (it used to raise an error)
     gt, _, stats = encode([call(2, "CGTA", "C", "0/1"), call(4, "T", "*,A", "0/²"), call(6, "C", "T", "0/+1"), call(8, "T", "A", "0/ 1")])
     assert stats.bad_allele_index == 3 and gt[5] == "REF|REF" and gt[7] == "REF|REF"
+
+
+def test_a_record_without_ref_is_skipped():
+    # (an insertion with no anchor would go before the record, or before the contig: an invalid sidecar)
+    gt, side, stats = encode([call(1, "", "G", "0/1"), call(5, "", "T", "0/1")])
+    assert stats.skipped_out_of_range == 2 and not side and set(gt) == {"REF|REF"}
+
+
+def test_alleles_given_in_lowercase_read_as_uppercase():
+    gt, side, _ = encode([call(3, "g", "a", "0|1"), call(5, "a", "act", "1|0"), call(9, "a", "<del>", "0|1")])
+    assert gt[2] == "REF|A" and [(e.offset, e.hap, e.data) for e in side] == [(4, 1, "CT"), (8, 2, "REF=A;ALT=<del>")]
 
 
 def test_an_unknown_base_at_an_n_is_unknown():
