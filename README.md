@@ -48,6 +48,14 @@ gpxil stats HG002.gpxil.tif chr17:7,661,779-7,687,546 chr21
 gpxil subset HG002.gpxil.tif chr17 -o HG002_chr17.gpxil.tif
 gpxil subset HG002.gpxil.tif chr17 chr21 --no-ref -o HG002_17_21.noref.gpxil.tif
 
+# two genomes compared base by base (B taken as the truth: precision, recall, F1),
+# indels written at other places in a repeat found the same; or a child with both
+# parents: Mendelian errors, candidate new mutations, where each variant came from,
+# and crossovers where the parents are phased; -o draws a region of it (--draw)
+gpxil compare HG002.calls.gpxil.tif HG002.benchmark.gpxil.tif --region chr17
+gpxil compare HG002.gpxil.tif --father HG003.gpxil.tif --mother HG004.gpxil.tif --region chr17 \
+    -o TP53-trio.png --draw chr17:7,661,779-7,687,546 --width 256 --scale 2
+
 # pictures (coordinates are 1-based, inclusive)
 gpxil render HG002.gpxil.tif chr21:30,000,001-30,250,000 -o region.png --width 500
 gpxil render HG002.gpxil.tif chr21:36,496,385-36,497,408 -o haps.png --width 64 --mode haplotypes --scale 8
@@ -120,6 +128,20 @@ with GpxilFile("HG002.gpxil.tif") as g:
     print(counts["total"]["substitutions"])                # {'heterozygous': 3, 'homozygous': 11, ...}
     print(format_stats(counts))
 subset("HG002.gpxil.tif", "HG002_chr17.gpxil.tif", ["chr17"], planes=["ref", "gt", "flags"])
+```
+
+Genomes compared:
+
+```python
+from gpxiltools.compare import compare_pair, compare_trio, format_compare, picture
+
+with GpxilFile("calls.gpxil.tif") as a, GpxilFile("HG002.gpxil.tif") as b:
+    r = compare_pair(a, b, [("chr17", 0, None)])
+    print(r["total"]["events"]["substitutions"]["recall"])
+with GpxilFile("HG002.gpxil.tif") as c, GpxilFile("HG003.gpxil.tif") as f, GpxilFile("HG004.gpxil.tif") as m:
+    r = compare_trio(c, f, m)
+    print(format_compare(r))
+    picture([c, f, m], "chr17", 7_661_778, 7_687_546, bases_per_row=256).save_png("trio.png")
 ```
 
 Planes are ordinary arrays, so image tools apply directly. A GC-content map
@@ -206,6 +228,10 @@ agree with bcftools on every non-overlapping record; where records overlap
   applied to haplotype sequences.
 - Book PDFs use device CMYK ink values and the standard Helvetica font
   (not embedded); proof them with the printer's ICC profile.
+- Unphased heterozygous calls that overlap are applied as written, both to
+  haplotype 2 (spec sections 6.4 and 6.5), so two overlapping deletions that
+  the VCF has on different haplotypes become one, and `gpxil compare` sees
+  one.
 
 A gpxil file of a person, and every faithful rendering or book of it, is that
 person's genome: handle it like the VCF it came from.
