@@ -18,8 +18,6 @@ from collections.abc import Callable, Iterable
 from .container import (
     COMPRESSIONS,
     DEFAULT_COMPRESSION,
-    FORMAT_VERSION,
-    KNOWN_VERSIONS,
     STANDARD_PLANES,
     BigTiffNeeded,
     GpxilFile,
@@ -144,8 +142,8 @@ def _write(g: GpxilFile, out, jobs, compression: str, level: int | None, bigtiff
         sample=meta.get("sample"),
         metadata={k: v for k, v in meta.items() if k not in _OWN_KEYS and k not in ("summary", "subset")},
         require_codec=False,  # (copy_contig checks the codec where strips must be encoded again)
-        # (a copy follows the version its source does: its planes were made by that version's rules)
-        version=str(meta.get("gpxil")) if str(meta.get("gpxil")) in KNOWN_VERSIONS else FORMAT_VERSION,
+        # (a copy keeps the version of its source, any 0.x: its planes were made by that version's rules)
+        version=str(meta["gpxil"]),
     )
     writer.plane_info = {p: {k: v for k, v in (d or {}).items() if k != "dtype"} for p, d in (meta.get("planes") or {}).items()}
     try:

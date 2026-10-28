@@ -9,6 +9,7 @@ back to VCF gives an equivalent, normalised call set.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
@@ -234,6 +235,27 @@ def parse_gt(gt: str) -> tuple[list[str], bool]:
     return g.replace("|", "/").split("/"), False
 
 
+def allele_number(a: str) -> int | None:
+    """The number a GT allele is (0 the REF allele, 1 the first ALT allele, ...), or None for a missing allele (``.``)
+    and for anything not written in the digits 0-9 (spec 6.2: nothing is written for it)."""
+    return int(a) if a.isascii() and a.isdigit() else None
+
+
+def trim_alleles(ref: str, alt: str) -> tuple[int, str, str]:
+    """Steps 1 and 2 of spec 6.2: the common suffix trimmed (but never all of the shorter allele, so that an indel
+    keeps its anchor), then the common prefix. Returns ``(k, r, a)``: the length ``k`` of the prefix and the cores
+    left of REF and ALT, which start at offset ``k`` of the record."""
+    m, n = len(ref), len(alt)
+    qmax = min(m, n) - (1 if m != n else 0)
+    q = 0
+    while q < qmax and ref[m - 1 - q] == alt[n - 1 - q]:
+        q += 1
+    p = 0
+    while p < m - q and p < n - q and ref[p] == alt[p]:
+        p += 1
+    return p, ref[p : m - q], alt[p : n - q]
+
+
 @dataclass
 class AlleleEvents:
     """Per-base effect of one ALT allele relative to its record's REF span."""
@@ -256,15 +278,7 @@ def allele_events(ref: str, alt: str) -> AlleleEvents:
     makes encoders agree, and left placement matches how callers write
     companion records inside repeats.
     """
-    m, n = len(ref), len(alt)
-    qmax = min(m, n) - (1 if m != n else 0)
-    q = 0
-    while q < qmax and ref[m - 1 - q] == alt[n - 1 - q]:
-        q += 1
-    p = 0
-    while p < m - q and p < n - q and ref[p] == alt[p]:
-        p += 1
-    rc, ac = ref[p : m - q], alt[p : n - q]
+    p, rc, ac = trim_alleles(ref, alt)
     ev = AlleleEvents()
     k = min(len(rc), len(ac))
     for i in range(k):
@@ -340,6 +354,32 @@ def _strong(states: np.ndarray) -> np.ndarray:
     return (states != C.HAP_REF) & (states != C.HAP_UNKNOWN) & (states != C.HAP_ABSENT)
 
 
+# One bit per base (bit i % 8 of byte i // 8): the bases ALT alleles occupy on a haplotype (spec 6.5)
+def _bits(n: int) -> bytearray:
+    return bytearray((n + 7) >> 3)
+
+
+def _bits_set(bits: bytearray, a: int, b: int) -> None:
+    """Set the bits of [a, b)."""
+    i, j = a >> 3, (b - 1) >> 3
+    lo, hi = (0xFF << (a & 7)) & 0xFF, 0xFF >> (7 - ((b - 1) & 7))
+    if i == j:
+        bits[i] |= lo & hi
+    else:
+        bits[i] |= lo
+        bits[i + 1 : j] = b"\xff" * (j - i - 1)
+        bits[j] |= hi
+
+
+def _bits_any(bits: bytearray, a: int, b: int) -> bool:
+    """Whether any bit of [a, b) is set."""
+    i, j = a >> 3, (b - 1) >> 3
+    lo, hi = (0xFF << (a & 7)) & 0xFF, 0xFF >> (7 - ((b - 1) & 7))
+    if i == j:
+        return bool(bits[i] & lo & hi)
+    return bool(bits[i] & lo) or bool(bits[j] & hi) or bits.count(0, i + 1, j) != j - i - 1
+
+
 class PlaneBuilder:
     """Accumulates one sample's calls on one contig into gt/flags/... planes."""
 
@@ -376,6 +416,9 @@ class PlaneBuilder:
         self.ps_ids: dict[str, int] = {}
         self.ins: dict[tuple[int, int], str] = {}  # (anchor offset, hap) -> inserted bases
         self.complex: dict[tuple[int, int], str] = {}  # (offset, hap) -> COMPLEX sidecar data
+        # what ALT alleles occupy on each haplotype, and which alleles they are (spec 6.5)
+        self.occupied = [_bits(n), _bits(n)]
+        self.placed: list[set[int]] = [set(), set()]
         self.stats = EncodeStats()
 
     # -- helpers ---------------------------------------------------------
@@ -531,6 +574,10 @@ class PlaneBuilder:
                 s = self._apply_allele(h, a, call, p0, len(call.ref), span_end)
                 if s is not None:
                     strong |= s
+                c = None if a == "0" or a == "." else self._occupies(a, call, p0)
+                if c is not None:
+                    _bits_set(self.occupied[h], c[0], c[1])
+                    self.placed[h].add(c[2])
             if len(alleles) == 1:  # haploid call
                 if span == 1:
                     self._write_scalar(1, p0, C.HAP_ABSENT)
@@ -578,9 +625,12 @@ class PlaneBuilder:
         one haplotype already carries an asserted deletion over this record,
         '*' (the overlapping deletion) belongs to that haplotype (spec 6.5).
         """
+        if "*" not in call.alts:
+            return alleles
         star = []
         for i, a in enumerate(alleles):
-            if a.isdigit() and 0 < int(a) <= len(call.alts) and call.alts[int(a) - 1] == "*":
+            idx = self._alt_index(a, call)
+            if idx is not None and call.alts[idx - 1] == "*":
                 star.append(i)
         if len(star) != 1:
             return alleles
@@ -596,99 +646,65 @@ class PlaneBuilder:
 
     def _alt_index(self, a: str, call: Call) -> int | None:
         """The ALT allele an allele number names (1-based), or None for REF, a missing allele or a number that isn't one."""
-        if not a.isdigit():
-            return None
-        idx = int(a)
-        return idx if 0 < idx <= len(call.alts) else None
+        idx = allele_number(a)
+        return idx if idx is not None and 0 < idx <= len(call.alts) else None
 
-    def _would_write(self, a: str, call: Call, p0: int, span_end: int):
-        """What allele ``a`` of ``call`` asserts, as :meth:`_apply_allele` would write it, but without writing it.
+    @staticmethod
+    def _symbolic_end(alt: str, alt_index: int, call: Call) -> int | None:
+        """END of a symbolic allele: INFO/END, or for a deletion without it POS + |SVLEN| (spec 6.3)."""
+        end = call.end
+        if end is None and alt.startswith("<DEL") and call.svlen and alt_index < len(call.svlen) and call.svlen[alt_index]:
+            end = call.pos + abs(call.svlen[alt_index])
+        return end
 
-        Returns ``(states, written, insertions, complex_data)`` over the span, ``written`` marking the bases the
-        allele asserts REF or a strong state at; or None for an allele that asserts no sequence of its own (the
-        REF allele, a missing allele, ``*``, a placeholder, an allele number with no ALT allele).
-        """
+    def _occupies(self, a: str, call: Call, p0: int) -> tuple[int, int, int] | None:
+        """The offsets ``[lo, hi)`` that allele ``a`` of ``call`` occupies, and a number standing for the allele (spec
+        6.5): a sequence allele occupies its cores (spec 6.2), and the anchor before them if one is empty (a plain
+        insertion or deletion); ``<DEL>``, POS to END; another symbolic allele, POS. None for an allele that occupies
+        nothing: the REF allele, a missing allele, ``*``, a placeholder, a number with no ALT allele, ALT equal to REF."""
         idx = self._alt_index(a, call)
         if idx is None:
             return None
         alt = call.alts[idx - 1]
         if alt == "*" or alt in _REFBLOCK_ALTS:
             return None
-        span = span_end - p0
-        states = np.zeros(span, dtype=np.uint8)
-        written = np.zeros(span, dtype=bool)
         if is_symbolic(alt):
-            end = call.end
-            if end is None and alt.startswith("<DEL") and call.svlen and idx - 1 < len(call.svlen) and call.svlen[idx - 1]:
-                end = call.pos + abs(call.svlen[idx - 1])
-            if alt.startswith("<DEL") and end is not None and end > call.pos:
-                stop = min(end, self.length) - p0  # (POS is the padding base, REF; bases POS+1..END deleted)
-                states[1:stop] = C.HAP_DEL
-                written[:stop] = True
-                return states, written, [], None
-            states[0] = C.HAP_COMPLEX
-            written[0] = True
-            return states, written, [], f"REF={call.ref};ALT={alt}" + (f";END={end}" if end is not None else "")
-        ev = allele_events(call.ref, alt)
-        for off, s in ev.subs:
-            states[off] = s
-        for off, length in ev.dels:
-            states[off : off + length] = C.HAP_DEL
-        same = np.isin(states, C.HAP_SUB_CODES) & (states == np.bitwise_and(self.ref[p0:span_end], 0x0F))
-        states[same] = C.HAP_REF
-        written[:] = states != C.HAP_UNKNOWN  # (an N in ALT asserts no base in particular)
-        return states, written, [(p0 + anchor, self._inserted(seq)[0]) for anchor, seq in ev.ins], None
+            end = self._symbolic_end(alt, idx - 1, call)
+            lo, hi = p0, (min(end, self.length) if alt.startswith("<DEL") and end is not None and end > call.pos else p0 + 1)
+            what = f"{p0}\t{alt}\t{end}"
+        else:
+            k, r, x = trim_alleles(call.ref, alt)
+            if not r and not x:
+                return None
+            lo = max(p0, p0 + k - (1 if (not r) != (not x) else 0))
+            hi = p0 + k + len(r)
+            what = f"{p0 + k}\t{r}\t{x}".upper().replace("U", "T")  # (as the planes and the sidecar read them)
+        return lo, max(hi, lo + 1), int.from_bytes(hashlib.blake2b(what.encode(), digest_size=8).digest(), "little")
 
-    def _fits(self, h: int, p0: int, what) -> bool:
-        """Whether an allele (as :meth:`_would_write` gives it) fits haplotype ``h``: it writes REF or a strong
-        state nowhere that haplotype is already asserted with a different strong state, and inserts nothing, and
-        puts no COMPLEX allele, where it already has a different one (spec 6.5)."""
-        if what is None:
-            return True
-        states, written, ins, data = what
-        seg = self.w[h][p0 : p0 + states.shape[0]]
-        cur = seg & _STATE_MASK
-        if (written & ((seg & _ASSERTED) != 0) & _strong(cur) & (cur != states)).any():
-            return False
-        for anchor, seq in ins:
-            got = self.ins.get((anchor, h + 1))
-            if got is not None and got != seq:
-                return False
-        if data is not None:
-            got = self.complex.get((p0, h + 1))
-            if got is not None and got != data and (self.w[h][p0] & _STATE_MASK) == C.HAP_COMPLEX:
-                return False
-        return True
+    def _fits(self, h: int, c: tuple[int, int, int] | None) -> bool:
+        """Whether an allele (as :meth:`_occupies` gives it) fits haplotype ``h``: it occupies nothing, or no ALT allele
+        of an earlier call occupies there an offset it occupies, or the same allele was put there before (spec 6.5)."""
+        return c is None or c[2] in self.placed[h] or not _bits_any(self.occupied[h], c[0], c[1])
 
     def _place_overlapping(self, alleles: list[str], call: Call, p0: int, span_end: int) -> list[str]:
         """Unphased genotype of two different alleles: each on a haplotype it fits, if the written order can't.
 
-        In an unphased genotype the allele order means nothing. Two heterozygous calls that overlap can't both be
-        on one haplotype, yet applied as written they would both go to haplotype 2 and run together (two
-        deletions becoming one). So when an allele doesn't fit the haplotype the written order gives it (it would
-        write over another call's variant there), and the alleles swapped both fit, they are swapped (spec 6.5).
+        In an unphased genotype the allele order means nothing. Heterozygous calls that overlap are alternatives at one
+        place, so two of them can't be on one haplotype, yet applied as written they would both go to haplotype 2 and
+        run together (two deletions becoming one). So when an allele doesn't fit the haplotype the written order gives
+        it (an earlier call's ALT allele occupies there an offset it occupies), and the alleles swapped both fit, they
+        are swapped (spec 6.5).
         """
         a, b = alleles
-        star = [i for i in (self._alt_index(a, call), self._alt_index(b, call)) if i and call.alts[i - 1] == "*"]
-        if a == b or star:
-            return alleles  # (homozygous; or a '*' allele, which _place_spanning_deletion has placed)
-        # quick: nothing asserted with a strong state over the span, no insertion and no COMPLEX allele there
-        busy = (p0, 1) in self.complex or (p0, 2) in self.complex
-        if not busy:
-            if span_end - p0 == 1:
-                for w in self.w:
-                    v = int(w[p0])
-                    busy = busy or bool(v & _INS) or (bool(v & _ASSERTED) and (v & _STATE_MASK) not in _WEAK)
-            else:
-                for w in self.w:
-                    seg = w[p0:span_end]
-                    busy = busy or bool((seg & _INS).any()) or bool((((seg & _ASSERTED) != 0) & _strong(seg & _STATE_MASK)).any())
-        if not busy:
+        if a == b or not (_bits_any(self.occupied[0], p0, span_end) or _bits_any(self.occupied[1], p0, span_end)):
+            return alleles  # (homozygous; or no ALT allele occupies anything of the record's span yet)
+        ia, ib = self._alt_index(a, call), self._alt_index(b, call)
+        if any(i and call.alts[i - 1] == "*" for i in (ia, ib)):
+            return alleles  # (a '*' allele, which _place_spanning_deletion has placed)
+        ca, cb = self._occupies(a, call, p0), self._occupies(b, call, p0)
+        if self._fits(0, ca) and self._fits(1, cb):
             return alleles
-        wa, wb = self._would_write(a, call, p0, span_end), self._would_write(b, call, p0, span_end)
-        if self._fits(0, p0, wa) and self._fits(1, p0, wb):
-            return alleles
-        if self._fits(0, p0, wb) and self._fits(1, p0, wa):
+        if self._fits(0, cb) and self._fits(1, ca):
             self.stats.overlapping_calls_reassigned += 1
             self.stats.note(f"{self.contig}:{call.pos} {call.gt} put the other way round: it overlaps another call")
             return [b, a]
@@ -704,9 +720,8 @@ class PlaneBuilder:
             else:
                 self._write_states(h, p0, np.full(span, C.HAP_UNKNOWN, dtype=np.uint8))
             return None
-        try:
-            idx = int(a)
-        except ValueError:
+        idx = allele_number(a)
+        if idx is None:
             st.bad_allele_index += 1
             st.note(f"{self.contig}:{call.pos} GT allele {a!r} is not a number")
             return None
@@ -716,7 +731,7 @@ class PlaneBuilder:
             else:
                 self._write_states(h, p0, np.zeros(span, dtype=np.uint8))
             return None
-        if idx < 0 or idx > len(call.alts):
+        if idx > len(call.alts):
             st.bad_allele_index += 1
             st.note(f"{self.contig}:{call.pos} GT allele {idx} but {len(call.alts)} ALT alleles")
             return None
@@ -736,7 +751,7 @@ class PlaneBuilder:
         out = np.zeros(span, dtype=bool)
         if span == 1 and not ev.dels and not ev.ins and len(ev.subs) == 1:
             state = ev.subs[0][1]
-            if state == self.ref[p0] & 0x0F:  # possible only when REF disagrees with the reference
+            if state in C.HAP_SUB_CODES and state == self.ref[p0] & 0x0F:  # (only when REF disagrees with the reference)
                 state = C.HAP_REF
             out[0] = self._write_scalar(h, p0, state)  # plain SNV, the common case
             return out
@@ -756,9 +771,7 @@ class PlaneBuilder:
 
     def _apply_symbolic(self, h: int, alt: str, alt_index: int, call: Call, p0: int, span_end: int) -> np.ndarray:
         out = np.zeros(span_end - p0, dtype=bool)
-        end = call.end
-        if end is None and alt.startswith("<DEL") and call.svlen and alt_index < len(call.svlen) and call.svlen[alt_index]:
-            end = call.pos + abs(call.svlen[alt_index])
+        end = self._symbolic_end(alt, alt_index, call)
         if alt.startswith("<DEL") and end is not None and end > call.pos:
             # SV deletion: POS is the padding base, kept; bases POS+1..END are deleted
             self._write_scalar(h, p0, C.HAP_REF)
