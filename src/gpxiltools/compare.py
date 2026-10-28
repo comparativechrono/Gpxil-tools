@@ -78,6 +78,7 @@ _INS = C.FLAG_INS1 | C.FLAG_INS2
 _H1 = C.normalize_states(np.arange(256, dtype=np.uint8) >> 4)
 _H2 = C.normalize_states(np.arange(256, dtype=np.uint8) & 0x0F)
 _GT_VAR = _IS_VAR[_H1] | _IS_VAR[_H2]
+_RESERVED_GT = np.flatnonzero((_H1 != np.arange(256) >> 4) | (_H2 != np.arange(256) & 0x0F))  #: gt bytes with a reserved state
 _KEY = np.int32  #: allele keys: state | id << 4
 _MAX_IDS = 1 << 27
 
@@ -108,7 +109,8 @@ class _Ids:
 
 @dataclass
 class _Chunk:
-    """One file over [s, e): states, flags, allele keys (state | id << 4), and what is called, a variant, phased."""
+    """One file over [s, e): states, flags, allele keys (state | id << 4), what is called, a variant and phased, and
+    the bases that aren't plain (``nz``, sorted): plain is the reference on both haplotypes, with nothing inserted."""
 
     s: int
     e: int
@@ -121,6 +123,8 @@ class _Chunk:
     var: np.ndarray
     phased: np.ndarray
     ps: np.ndarray | None
+    plain: np.ndarray
+    nz: np.ndarray
 
     def cut(self, s: int, e: int) -> _Chunk:
         a, b = s - self.s, e - self.s
@@ -128,7 +132,9 @@ class _Chunk:
         def part(x):
             return None if x is None else x[a:b]
 
-        return _Chunk(s, e, *(part(getattr(self, n)) for n in ("h1", "h2", "flags", "k1", "k2", "called", "var", "phased", "ps")))
+        i, j = np.searchsorted(self.nz, (a, b)).tolist()
+        planes = (part(getattr(self, n)) for n in ("h1", "h2", "flags", "k1", "k2", "called", "var", "phased", "ps", "plain"))
+        return _Chunk(s, e, *planes, self.nz[i:j] - a)
 
 
 class _Member:
@@ -140,7 +146,8 @@ class _Member:
         self.confident = confident  # (calls outside the regions called with confidence left out)
         self.has_gt = contig.has("gt")
         self.has_flags = contig.has("flags")
-        self.want_ps = want_ps and contig.has("ps")
+        self.want_phase = want_ps  # (the phased flags and phase sets: of the parents, in a trio)
+        self.has_ps = contig.has("ps")
         self.ins: dict[tuple[int, int], str] = {}
         self.cplx: dict[tuple[int, int], str] = {}
         for ent in contig.sidecar() if self.has_gt else ():
@@ -148,10 +155,15 @@ class _Member:
                 self.ins[(ent.offset, ent.hap)] = ent.data
             elif ent.kind == "COMPLEX":
                 self.cplx[(ent.offset, ent.hap)] = ent.data
-        self._extra = []  # per haplotype: the offsets with an entry, sorted, and their (inserted bases, COMPLEX data)
+        # per haplotype: the offsets with an entry, sorted, and the numbers of what can be there: the inserted bases and
+        # the COMPLEX data, the inserted bases alone, and the COMPLEX data alone (0 where there is none)
+        self._extra = []
         for hap in (1, 2):
             offs = sorted({o for o, h in self.ins if h == hap} | {o for o, h in self.cplx if h == hap})
-            self._extra.append((np.array(offs, dtype=np.int64), [(self.ins.get((o, hap)), self.cplx.get((o, hap))) for o in offs]))
+            got = [(self.ins.get((o, hap)), self.cplx.get((o, hap))) for o in offs]
+            both = [ids(i, x) if i is not None and x is not None else 0 for i, x in got]
+            alone = [[ids(i, None) if i is not None else 0 for i, _ in got], [ids(None, x) if x is not None else 0 for _, x in got]]
+            self._extra.append((np.array(offs, dtype=np.int64), *(np.array(v, dtype=_KEY) << 4 for v in (both, *alone))))
         self.ins_at = np.array(sorted({o for o, _ in self.ins}), dtype=np.int64)
         self.cplx_at = np.array(sorted({o for o, _ in self.cplx}), dtype=np.int64)
 
@@ -161,26 +173,30 @@ class _Member:
             unknown = np.full(n, C.HAP_UNKNOWN, dtype=np.uint8)
             key = unknown.astype(_KEY)
             no = np.zeros(n, dtype=bool)
-            return _Chunk(s, e, unknown, unknown, np.zeros(n, dtype=np.uint8), key, key, no, no, no, None)
+            return _Chunk(s, e, unknown, unknown, np.zeros(n, dtype=np.uint8), key, key, no, no, no, None, no, np.arange(n))
         gt = self.c.read("gt", s, e)
-        h1, h2 = np.take(_H1, gt), np.take(_H2, gt)
         flags = self.c.read("flags", s, e) if self.has_flags else np.zeros(n, dtype=np.uint8)
+        ins = (flags & _INS) != 0
+        plain = (gt == 0) & ~ins
+        nz = np.flatnonzero(~plain)
+        if np.bincount(gt[nz], minlength=256)[_RESERVED_GT].any():  # (reserved states read as UNKNOWN: spec, reader rule 4)
+            gt = (_H1[gt] << 4) | _H2[gt]
+        h1, h2 = gt >> 4, gt & 0x0F
         k1, k2 = h1.astype(_KEY), h2.astype(_KEY)
-        for (offs, extras), key, h, bit in zip(self._extra, (k1, k2), (h1, h2), (C.FLAG_INS1, C.FLAG_INS2)):
+        for (offs, both, ins_only, cplx_only), key, h, bit in zip(self._extra, (k1, k2), (h1, h2), (C.FLAG_INS1, C.FLAG_INS2)):
             a, b = np.searchsorted(offs, (s, e)).tolist()
-            for o, (ins, cplx) in zip(offs[a:b].tolist(), extras[a:b]):
-                i = o - s
-                ins = ins if flags[i] & bit else None
-                cplx = cplx if h[i] == C.HAP_COMPLEX else None
-                if ins is not None or cplx is not None:
-                    key[i] |= self.ids(ins, cplx) << 4
+            if b > a:  # (an insertion where its flag is set, a COMPLEX allele's data where the state is COMPLEX)
+                i = offs[a:b] - s
+                has_ins, has_cplx = (flags[i] & bit) != 0, h[i] == C.HAP_COMPLEX
+                key[i] |= np.where(has_ins, np.where(has_cplx, both[a:b], ins_only[a:b]), np.where(has_cplx, cplx_only[a:b], 0))
         called = (h1 != C.HAP_UNKNOWN) & (h2 != C.HAP_UNKNOWN)
         if self.confident:
             _drop_islands(called, (flags & C.FLAG_VARIANT_SITE) != 0)
-        var = np.take(_GT_VAR, gt) | ((flags & _INS) != 0)
-        phased = (flags & C.FLAG_PHASED) != 0
-        ps = self.c.read("ps", s, e) if self.want_ps and phased.any() else None
-        return _Chunk(s, e, h1, h2, flags, k1, k2, called, var, phased, ps)
+        var = np.zeros(n, dtype=bool)  # (a variant is never plain: looked for among the rest)
+        var[nz] = _GT_VAR[gt[nz]] | ins[nz]
+        phased = (flags & C.FLAG_PHASED) != 0 if self.want_phase else None
+        ps = self.c.read("ps", s, e) if self.want_phase and self.has_ps and np.count_nonzero(phased) else None
+        return _Chunk(s, e, h1, h2, flags, k1, k2, called, var, phased, ps, plain, nz)
 
     def events(self, ch: _Chunk, lo: int, hi: int):
         """The events that start in [lo, hi), as gpxil stats counts them: arrays of kinds (0 a substitution, 1 an
@@ -194,14 +210,19 @@ class _Member:
             starts.append(np.asarray(x, dtype=np.int64))
             ends.append(np.asarray(y, dtype=np.int64))
 
-        h1, h2 = ch.h1[a:b], ch.h2[a:b]
-        sub = np.flatnonzero((np.take(_IS_SUB, h1) | np.take(_IS_SUB, h2)) & (h1 != C.HAP_UNKNOWN) & (h2 != C.HAP_UNKNOWN)) + lo
+        i, j = np.searchsorted(ch.nz, (a, b)).tolist()
+        q = ch.nz[i:j]  # (substitutions, deletions and insertions are never at a plain base)
+        x1, x2 = ch.h1[q], ch.h2[q]
+        sub = q[(_IS_SUB[x1] | _IS_SUB[x2]) & (x1 != C.HAP_UNKNOWN) & (x2 != C.HAP_UNKNOWN)] + s
         add(0, sub, sub + 1)
         runs = set()  # (the same run on both haplotypes, once)
         for h in (ch.h1, ch.h2):
-            x, y = _runs_of(h == C.HAP_DEL)
-            keep = (x >= a) & (x < b)
-            runs.update(zip((x[keep] + s).tolist(), (y[keep] + s).tolist()))
+            d = ch.nz[h[ch.nz] == C.HAP_DEL]
+            if d.size:
+                cut = np.flatnonzero(np.diff(d) != 1) + 1
+                first, last = d[np.concatenate(([0], cut))], d[np.concatenate((cut - 1, [d.size - 1]))] + 1
+                keep = (first >= a) & (first < b)
+                runs.update(zip((first[keep] + s).tolist(), (last[keep] + s).tolist()))
         runs = sorted(runs)
         add(1, [x for x, _ in runs], [y for _, y in runs])
         for kind, at, table in ((1, self.ins_at, self.ins), (2, self.cplx_at, self.cplx)):
@@ -219,13 +240,10 @@ def _runs_of(mask: np.ndarray):
     """The starts and ends of the runs of True."""
     if not mask.size:
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
-    d = np.diff(mask.view(np.int8))
-    starts, ends = np.flatnonzero(d == 1) + 1, np.flatnonzero(d == -1) + 1
-    if mask[0]:
-        starts = np.concatenate(([0], starts))
-    if mask[-1]:
-        ends = np.concatenate((ends, [mask.size]))
-    return starts, ends
+    turns = np.flatnonzero(mask[1:] != mask[:-1]) + 1
+    starts = np.concatenate(([0], turns))  # (the runs, True and False in turn)
+    true = mask[starts]
+    return starts[true], np.concatenate((turns, [mask.size]))[true]
 
 
 def _drop_islands(called: np.ndarray, site: np.ndarray) -> None:
@@ -276,12 +294,12 @@ def _pieces(members, start: int, end: int, length: int, chunk: int, gap: int):
         while True:
             a, b = max(0, s - gap), min(length, target + look)
             chunks = [m.read(a, b) for m in members]
-            noisy = np.zeros(b - a, dtype=bool)
-            for ch in chunks:
-                noisy |= ch.var
-            xs = np.arange(target, b + 1)
             near = max(a, target - gap)  # (only the bases near the candidates)
-            ok = np.flatnonzero(_quiet(noisy[near - a :], near, b, xs, gap, length))
+            noisy = np.zeros(b - near, dtype=bool)
+            for ch in chunks:
+                noisy |= ch.var[near - a :]
+            xs = np.arange(target, b + 1)
+            ok = np.flatnonzero(_quiet(noisy, near, b, xs, gap, length))
             if ok.size:
                 x = int(xs[ok[0]])
                 break
@@ -359,6 +377,11 @@ def _need_samples(named) -> None:
 
 def _name(g) -> str:
     return str(g.path).rstrip("/").rsplit("/", 1)[-1]
+
+
+def _cnt(mask: np.ndarray) -> int:
+    """How many True (as an int: np.count_nonzero is quicker than sum, notably in the browser)."""
+    return int(np.count_nonzero(mask))
 
 
 def _runs(mask: np.ndarray) -> int:
@@ -590,11 +613,12 @@ def _widened(windows, chunks, ref4: np.ndarray, items, gap: int, within: np.ndar
     return merged
 
 
-def _two_copies(ch: _Chunk):
-    """One copy (the other haplotype ABSENT) taken as two copies of its allele: how genotypes are compared."""
-    k1, k2 = ch.k1, ch.k2
-    a1, a2 = ch.h1 == _ABSENT, ch.h2 == _ABSENT
-    if not (a1.any() or a2.any()):
+def _two_copies(ch: _Chunk, at):
+    """The allele keys at ``at`` (positions, or a slice), one copy (the other haplotype ABSENT) taken as two copies of
+    its allele: how genotypes are compared."""
+    k1, k2 = ch.k1[at], ch.k2[at]
+    a1, a2 = ch.h1[at] == _ABSENT, ch.h2[at] == _ABSENT
+    if not (np.count_nonzero(a1) or np.count_nonzero(a2)):
         return k1, k2
     return np.where(a1 & ~a2, k2, k1), np.where(a2 & ~a1, k1, k2)
 
@@ -602,20 +626,28 @@ def _two_copies(ch: _Chunk):
 def _pair_piece(ma: _Member, mb: _Member, A: _Chunk, B: _Chunk, items, ref4_of, lo, hi, gap, t: PairTally, classes=None, collect=None):
     """Compare a piece (cut where neither file has a variant nearby) and count what is in [lo, hi)."""
     s, n = A.s, A.e - A.s
-    a1, a2 = _two_copies(A)
-    b1, b2 = _two_copies(B)
     both = A.called & B.called
-    same = ((a1 == b1) & (a2 == b2)) | ((a1 == b2) & (a2 == b1))
+    # where both are plain, the two are the same: the rest are compared one by one
+    idx = np.flatnonzero(~(A.plain & B.plain))
+    a1, a2 = _two_copies(A, idx)
+    b1, b2 = _two_copies(B, idx)
+    same_s = ((a1 == b1) & (a2 == b2)) | ((a1 == b2) & (a2 == b1))
+    both_s = both[idx]
+    same = np.ones(n, dtype=bool)
+    same[idx] = same_s
     equiv = np.zeros(n, dtype=bool)
-    pos = np.flatnonzero(both & ~same)
+    pos = idx[both_s & ~same_s]
     if pos.size:
-        deleted = (A.h1 == C.HAP_DEL) | (A.h2 == C.HAP_DEL) | (B.h1 == C.HAP_DEL) | (B.h2 == C.HAP_DEL)
+
+        def deleted(i):
+            return A.h1[i] == C.HAP_DEL or A.h2[i] == C.HAP_DEL or B.h1[i] == C.HAP_DEL or B.h2[i] == C.HAP_DEL
+
         stretches: list[list[int]] = []
         for grp in np.split(pos, np.flatnonzero(np.diff(pos) > gap) + 1):
             w0, w1 = int(grp[0]), int(grp[-1]) + 1
-            while w0 > 0 and deleted[w0 - 1]:
+            while w0 > 0 and deleted(w0 - 1):
                 w0 -= 1
-            while w1 < n and deleted[w1]:
+            while w1 < n and deleted(w1):
                 w1 += 1
             if stretches and w0 - (stretches[-1][1] - 1) <= gap:  # (no more than gap from the last base of the one before)
                 stretches[-1][1] = max(stretches[-1][1], w1)
@@ -629,13 +661,14 @@ def _pair_piece(ma: _Member, mb: _Member, A: _Chunk, B: _Chunk, items, ref4_of, 
             if ref4 is None:
                 t.stretches_unchecked += counted
                 alike = False
-            elif _haplotype_pairs(a1[w0:w1], a2[w0:w1], ref4[w0:w1], items) & _haplotype_pairs(b1[w0:w1], b2[w0:w1], ref4[w0:w1], items):
-                equiv[w0:w1] = True
-                t.stretches_written_differently += counted
-                alike = True
             else:
-                t.stretches_different += counted
-                alike = False
+                w = slice(w0, w1)
+                alike = bool(_haplotype_pairs(*_two_copies(A, w), ref4[w], items) & _haplotype_pairs(*_two_copies(B, w), ref4[w], items))
+                if alike:
+                    equiv[w] = True
+                    t.stretches_written_differently += counted
+                else:
+                    t.stretches_different += counted
             if counted and collect is not None:
                 collect.append((ma.c.name, s + w0 + 1, s + w1, alike))
             if counted and not alike and len(t.examples) < EXAMPLES:
@@ -645,51 +678,57 @@ def _pair_piece(ma: _Member, mb: _Member, A: _Chunk, B: _Chunk, items, ref4_of, 
                     {"position": s + w0 + 1, "end": s + w1, "a": _genotype_text(A, j, r, items), "b": _genotype_text(B, j, r, items)}
                 )
     a, b = lo - s, hi - s
-    w = slice(a, b)
-    ca, cb, bo = A.called[w], B.called[w], both[w]
+    ca, cb = A.called[a:b], B.called[a:b]
+    n_a, n_b, n_both = _cnt(ca), _cnt(cb), _cnt(both[a:b])
     t.bases += b - a
-    t.both_called += int(bo.sum())
-    t.a_only_called += int((ca & ~cb).sum())
-    t.b_only_called += int((~ca & cb).sum())
-    t.neither_called += int((~ca & ~cb).sum())
-    va, vb, sm, eq = A.var[w], B.var[w], same[w], equiv[w]
-    anyv = bo & (va | vb)
-    differ = anyv & ~sm & ~eq
-    t.var_same += int((anyv & sm).sum())
-    t.var_written_differently += int((anyv & ~sm & eq).sum())
-    t.var_only_a += int((differ & va & ~vb).sum())
-    t.var_only_b += int((differ & vb & ~va).sum())
-    t.var_different += int((differ & va & vb).sum())
+    t.both_called += n_both
+    t.a_only_called += n_a - n_both
+    t.b_only_called += n_b - n_both
+    t.neither_called += (b - a) - n_a - n_b + n_both
+    # (a variant is never at a plain base, so the variant bases are among idx)
+    inw = (idx >= a) & (idx < b)
+    va, vb, eq = A.var[idx], B.var[idx], equiv[idx]
+    anyv = inw & both_s & (va | vb)
+    differ = anyv & ~same_s & ~eq
+    cnt = _cnt
+    t.var_same += cnt(anyv & same_s)
+    t.var_written_differently += cnt(anyv & ~same_s & eq)
+    t.var_only_a += cnt(differ & va & ~vb)
+    t.var_only_b += cnt(differ & vb & ~va)
+    t.var_different += cnt(differ & va & vb)
     if classes is not None:
+        cls_s = np.zeros(idx.size, dtype=np.uint8)
+        cls_s[anyv & same_s] = 1
+        cls_s[differ & va & ~vb] = 2
+        cls_s[differ & vb & ~va] = 3
+        cls_s[differ & va & vb] = 4
+        cls_s[anyv & ~same_s & eq] = 5
         cls = np.zeros(b - a, dtype=np.uint8)
-        cls[anyv & sm] = 1
-        cls[differ & va & ~vb] = 2
-        cls[differ & vb & ~va] = 3
-        cls[differ & va & vb] = 4
-        cls[anyv & ~sm & eq] = 5
-        cls[~bo] = 6
+        cls[idx[inw] - a] = cls_s[inw]
+        cls[~both[a:b]] = 6
         classes.append(cls)
     # each file's events, looked for in the other
-    ok = same | equiv
     for me, ch, other, side in ((ma, A, B, "a"), (mb, B, A, "b")):
         kinds, x, y = me.events(ch, lo, hi)
         x, y = x - s, y - s
         one = y - x == 1
-        not_compared, found, there = ~both[x], ok[x], other.var[x]  # (right for the events on one base)
+        not_compared, found, there = ~both[x], same[x] | equiv[x], other.var[x]  # (right for the events on one base)
         for i in np.flatnonzero(~one).tolist():  # (deletions: every base they span)
             sl = slice(x[i], y[i])
-            not_compared[i], found[i], there[i] = not both[sl].all(), ok[sl].all(), other.var[sl].any()
+            not_compared[i] = not both[sl].all()
+            found[i] = bool((same[sl] | equiv[sl]).all())
+            there[i] = other.var[sl].any()
         found &= ~not_compared
         other_gt = ~not_compared & ~found & there
         missing = ~not_compared & ~found & ~other_gt
         for k, name in enumerate(_KINDS):
             sel = kinds == k
             e = t.events[name][side]
-            e["total"] += int(sel.sum())
-            e["found"] += int((sel & found).sum())
-            e["missing"] += int((sel & missing).sum())
-            e["other_genotype"] += int((sel & other_gt).sum())
-            e["not_compared"] += int((sel & not_compared).sum())
+            e["total"] += cnt(sel)
+            e["found"] += cnt(sel & found)
+            e["missing"] += cnt(sel & missing)
+            e["other_genotype"] += cnt(sel & other_gt)
+            e["not_compared"] += cnt(sel & not_compared)
 
 
 def compare_pair(a, b, regions=None, *, chunk: int = CHUNK, gap: int = GAP, all_calls: bool = False, stretches: list | None = None) -> dict:
@@ -822,7 +861,7 @@ def _allele_text(x: int, r: int | None, items) -> str:
 
 def _genotype_text(ch: _Chunk, j: int, r, items) -> str:
     alleles = [x for x in (_allele_text(int(ch.k1[j]), r, items), _allele_text(int(ch.k2[j]), r, items)) if x]
-    return ("|" if ch.phased[j] else "/").join(alleles)
+    return ("|" if ch.flags[j] & C.FLAG_PHASED else "/").join(alleles)
 
 
 def _haplotypes(ch: _Chunk, w0: int, w1: int, ref4: np.ndarray, items) -> tuple[set, set | None]:
@@ -874,9 +913,12 @@ def _crossovers(sites: np.ndarray, contig: str, phased: bool, min_run: int = MIN
 def _trio_piece(chs, items, ref4_of, lo: int, hi: int, gap: int, t: TrioTally, sites: dict, classes=None, collect=None):
     """Compare a piece of the child's, the father's and the mother's files and count what is in [lo, hi)."""
     Cc, F, M = chs
-    s, n = Cc.s, Cc.e - Cc.s
-    c1, c2 = Cc.k1, Cc.k2
-    f1, f2, m1, m2 = F.k1, F.k2, M.k1, M.k2
+    s = Cc.s
+    a, b = lo - s, hi - s
+    allc = Cc.called & F.called & M.called
+    # a base called in all three and plain in all three is consistent, without a variant: the rest are looked at
+    idx = np.flatnonzero(allc & ~(Cc.plain & F.plain & M.plain))
+    c1, c2, f1, f2, m1, m2 = (k[idx] for k in (Cc.k1, Cc.k2, F.k1, F.k2, M.k1, M.k2))
     f2p, m2p, c2p = f2 != _ABSENT, m2 != _ABSENT, c2 != _ABSENT
 
     def fathers(x):
@@ -885,23 +927,23 @@ def _trio_piece(chs, items, ref4_of, lo: int, hi: int, gap: int, t: TrioTally, s
     def mothers(x):
         return (x == m1) | ((x == m2) & m2p)
 
-    allc = Cc.called & F.called & M.called
     one = ~c2p
     f1c, m1c, f2c, m2c = fathers(c1), mothers(c1), fathers(c2), mothers(c2)
     opt1, opt2 = f1c & m2c, f2c & m1c  # (the child's first allele from the father and the second from the mother, or the other way)
     consistent = np.where(one, f1c | m1c, opt1 | opt2)
-    err = allc & ~consistent
+    err = ~consistent
     # stretches around the errors, with every variant of the three near them: consistent as sequences?
-    written = np.zeros(n, dtype=bool)
+    written = np.zeros(idx.size, dtype=bool)
     ref4 = ref4_of() if err.any() else None
     if ref4 is not None:
-        pos = np.flatnonzero(Cc.var | F.var | M.var | err)
+        pos = np.union1d(np.flatnonzero(Cc.var | F.var | M.var), idx[err])
         breaks = np.flatnonzero(np.diff(pos) > gap) + 1
         firsts, lasts = pos[np.concatenate(([0], breaks))], pos[np.concatenate((breaks - 1, [pos.size - 1]))] + 1
-        ks = np.unique(np.searchsorted(firsts, np.flatnonzero(err), side="right") - 1).tolist()
+        ks = np.unique(np.searchsorted(firsts, idx[err], side="right") - 1).tolist()
         for w0, w1 in _widened([[int(firsts[k]), int(lasts[k])] for k in ks], chs, ref4, items, gap, allc):
             if _trio_consistent(chs, w0, w1, ref4, items):
-                written[w0:w1] = True
+                i, j = np.searchsorted(idx, (w0, w1)).tolist()
+                written[i:j] = True
                 t.written_differently_stretches += lo <= s + w0 < hi
     rewritten = err & written
     err &= ~written
@@ -914,36 +956,35 @@ def _trio_piece(chs, items, ref4_of, lo: int, hi: int, gap: int, t: TrioTally, s
     pat, mat = np.where(hom, c1, pat), np.where(hom, c1, mat)
     pat = np.where(one, np.where(f1c & ~m1c, c1, -1), pat)
     mat = np.where(one, np.where(m1c & ~f1c, c1, -1), mat)
-    cvar = allc & Cc.var
+    cvar = Cc.var[idx]  # (a variant of the child's is never at a plain base)
     ok = cvar & consistent
     vf, vm = (pat != -1) & (pat != 0), (mat != -1) & (mat != 0)
     from_both, from_f, from_m = ok & vf & vm, ok & vf & ~vm, ok & vm & ~vf
     unknown = ok & ~vf & ~vm
-    a, b = lo - s, hi - s
-    w = slice(a, b)
+    inw = (idx >= a) & (idx < b)
     t.bases += b - a
-    t.all_called += int(allc[w].sum())
-    t.child_variant += int(cvar[w].sum())
-    t.from_father += int(from_f[w].sum())
-    t.from_mother += int(from_m[w].sum())
-    t.from_both += int(from_both[w].sum())
-    t.origin_unknown += int(unknown[w].sum())
-    t.error_bases += int(err[w].sum())
-    t.error_sites += _runs(err[w])
-    t.new_bases += int(new[w].sum())
-    t.new_sites += _runs(new[w])
-    t.written_differently_bases += int(rewritten[w].sum())
-    if err[w].any() and (len(t.examples) < EXAMPLES or collect is not None):
-        e = err[w]
-        for i in np.flatnonzero(e & ~np.concatenate(([False], e[:-1]))).tolist():
-            j = a + i
+    t.all_called += _cnt(allc[a:b])
+    t.child_variant += _cnt(cvar & inw)
+    t.from_father += _cnt(from_f & inw)
+    t.from_mother += _cnt(from_m & inw)
+    t.from_both += _cnt(from_both & inw)
+    t.origin_unknown += _cnt(unknown & inw)
+    t.written_differently_bases += _cnt(rewritten & inw)
+    for mask, bases_, sites_ in ((err, "error_bases", "error_sites"), (new, "new_bases", "new_sites")):
+        q = idx[mask & inw]
+        setattr(t, bases_, getattr(t, bases_) + q.size)
+        setattr(t, sites_, getattr(t, sites_) + (q.size and 1 + _cnt(np.diff(q) != 1)))
+    q = idx[err & inw]
+    if q.size and (len(t.examples) < EXAMPLES or collect is not None):
+        news = set(idx[new & inw].tolist())
+        for j in q[np.concatenate(([True], np.diff(q) != 1))].tolist():  # (the first base of each run of errors)
             r = int(ref4[j]) if ref4 is not None else None
             ex = {
                 "position": s + j + 1,
                 "child": _genotype_text(Cc, j, r, items),
                 "father": _genotype_text(F, j, r, items),
                 "mother": _genotype_text(M, j, r, items),
-                "new": bool(new[j]),
+                "new": j in news,
             }
             if len(t.examples) < EXAMPLES:
                 t.examples.append(ex)
@@ -953,30 +994,28 @@ def _trio_piece(chs, items, ref4_of, lo: int, hi: int, gap: int, t: TrioTally, s
                 break
     # which of a phased parent's haplotypes the child received, where the parent is heterozygous and it shows
     inherited = {}
-    for parent, P, allele in (("father", F, pat), ("mother", M, mat)):
-        p1, p2, ph = P.k1[w], P.k2[w], P.phased[w]
-        if ph.any():
+    for parent, P, allele, p1, p2 in (("father", F, pat, f1, f2), ("mother", M, mat, m1, m2)):
+        if _cnt(P.phased[a:b]):
             t.parents[parent]["phased"] = True
-        allele = allele[w]
+        ph = P.phased[idx]
         h = np.where(allele == p1, 1, np.where(allele == p2, 2, 0))
-        site = allc[w] & consistent[w] & (allele != -1) & (p1 != p2) & (p2 != _ABSENT) & ph & (h > 0)
+        site = inw & consistent & (allele != -1) & (p1 != p2) & (p2 != _ABSENT) & ph & (h > 0)
         inherited[parent] = np.where(site, h, 0)
         if site.any():
-            idx = np.flatnonzero(site)
-            ps = P.ps[w][idx].astype(np.int64) if P.ps is not None else np.zeros(idx.size, dtype=np.int64)
-            sites[parent].append(np.stack([idx + lo, ps, h[idx]], axis=1))
+            ps = P.ps[idx[site]].astype(np.int64) if P.ps is not None else np.zeros(_cnt(site), dtype=np.int64)
+            sites[parent].append(np.stack([idx[site] + s, ps, h[site]], axis=1))
     if classes is not None:
+        cls_s = np.zeros(idx.size, dtype=np.uint8)
+        cls_s[from_f] = np.where(inherited["father"][from_f] == 2, 2, 1)
+        cls_s[from_m] = np.where(inherited["mother"][from_m] == 2, 4, 3)
+        cls_s[from_both] = 5
+        cls_s[unknown] = 6
+        cls_s[rewritten] = 7
+        cls_s[err] = 8
+        cls_s[new] = 9
         cls = np.zeros(b - a, dtype=np.uint8)
-        x = from_f[w]
-        cls[x] = np.where(inherited["father"][x] == 2, 2, 1)
-        x = from_m[w]
-        cls[x] = np.where(inherited["mother"][x] == 2, 4, 3)
-        cls[from_both[w]] = 5
-        cls[unknown[w]] = 6
-        cls[rewritten[w]] = 7
-        cls[err[w]] = 8
-        cls[new[w]] = 9
-        cls[~allc[w]] = 10
+        cls[idx[inw] - a] = cls_s[inw]
+        cls[~allc[a:b]] = 10
         classes.append(cls)
 
 
