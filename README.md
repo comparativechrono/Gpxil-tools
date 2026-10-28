@@ -9,8 +9,9 @@ multi-page TIFF.
 gpxiltools converts a reference FASTA, and optionally one person's VCF, into a
 `.gpxil.tif` file; reads any genomic interval of any plane as a NumPy array;
 exports reference, haplotype or IUPAC sequences and VCF; checks files against
-the specification; and renders pictures for the screen (PNG), for print (CMYK
-TIFF) and as a whole "genome book" PDF with one printed dot per base.
+the specification; makes working copies of some chromosomes; counts what a
+file holds; and renders pictures for the screen (PNG), for print (CMYK TIFF)
+and as a whole "genome book" PDF with one printed dot per base.
 
 ## Install
 
@@ -35,6 +36,17 @@ gpxil encode GRCh38.fa.gz -v HG002.vcf.gz --callable HG002_benchmark.bed \
 
 gpxil info HG002.gpxil.tif
 gpxil validate HG002.gpxil.tif
+
+# what it holds, counted: calls, substitutions (and Ti/Tv), insertions,
+# deletions, phasing, quality; for the whole file or regions (--json for programs)
+gpxil stats HG002.gpxil.tif
+gpxil stats HG002.gpxil.tif chr17:7,661,779-7,687,546 chr21
+
+# a working copy: chromosome 17 out of the whole genome, its strips copied
+# without decoding; --no-ref leaves out the reference plane (100 times smaller),
+# --planes keeps only some planes, --compression encodes the strips again
+gpxil subset HG002.gpxil.tif chr17 -o HG002_chr17.gpxil.tif
+gpxil subset HG002.gpxil.tif chr17 chr21 --no-ref -o HG002_17_21.noref.gpxil.tif
 
 # pictures (coordinates are 1-based, inclusive)
 gpxil render HG002.gpxil.tif chr21:30,000,001-30,250,000 -o region.png --width 500
@@ -61,6 +73,7 @@ gpxil fasta HG002.noref.gpxil.tif --reference GRCh38.gpxil.tif --region chr21:5,
 G=https://comparativechrono.github.io/Gpxil-browser/data/grch38/gpxil
 gpxil info $G/chr17.gpxil.tif
 gpxil fasta $G/chr17.gpxil.tif --region chr17:7,668,402-7,668,461
+gpxil stats $G/chr17.gpxil.tif chr17:7,661,779-7,687,546
 gpxil encode $G/chr21.gpxil.tif -v HG002_chr21.vcf.gz -o HG002_chr21.gpxil.tif   # a gpxil file as the reference
 
 gpxil palettes
@@ -94,6 +107,19 @@ with GpxilFile("HG002.gpxil.tif") as g:
     picture = render(chr21, start=30_000_000, end=30_250_000, bases_per_row=500)
     picture.save_png("region.png")
     whole = chr21.image("ref")                         # the stored 2-D raster, 8,192 bases per row
+```
+
+Counts, and working copies:
+
+```python
+from gpxiltools.stats import format_stats, stats
+from gpxiltools.subset import subset
+
+with GpxilFile("HG002.gpxil.tif") as g:
+    counts = stats(g, [("chr17", 7_661_778, 7_687_546)])   # 0-based, end exclusive; None for every contig
+    print(counts["total"]["substitutions"])                # {'heterozygous': 3, 'homozygous': 11, ...}
+    print(format_stats(counts))
+subset("HG002.gpxil.tif", "HG002_chr17.gpxil.tif", ["chr17"], planes=["ref", "gt", "flags"])
 ```
 
 Planes are ordinary arrays, so image tools apply directly. A GC-content map

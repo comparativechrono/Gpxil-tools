@@ -1,5 +1,33 @@
 # Changes
 
+## 0.4.0 (28 October 2026)
+
+Two commands for working with big files. Files are unchanged.
+
+- **`gpxil subset`** copies some contigs, and if you like only some planes,
+  of a gpxil file into a new one: a working copy, such as chromosome 17 out
+  of a whole genome, without encoding anything again. The strips are copied
+  as they are stored, without being decoded, so it is fast, needs about one
+  strip of memory, and works on files on the web (adjacent strips are read
+  in one request). `--no-ref` leaves out the reference plane (the contigs
+  keep their digests); `--planes` keeps some planes; `--reference` puts the
+  reference plane back into a file written without it; `--compression` and
+  `--level` encode the strips again. The copy keeps each contig's metadata,
+  and records what it was copied from (`subset` in the metadata). It
+  refuses to leave out the `ps` plane of a contig with several phase sets,
+  which would then read as one, and a region of a contig, which gpxil 0.1
+  cannot store. In Python: `gpxiltools.subset.subset`, and
+  `GpxilWriter.copy_contig`.
+- **`gpxil stats`** counts what a file holds, for every contig or for
+  regions: the reference's bases (GC, N, soft-masked), bases called, not
+  called and partly called, heterozygous and homozygous substitutions with
+  transitions and transversions, insertions and deletions (events and
+  bases), COMPLEX alleles, the share of heterozygous substitutions phased
+  and the phase sets (N50 and the largest), and genotype quality and depth
+  (quartiles). It reads a piece at a time, so a whole genome needs little
+  memory; regions add up to the whole. `--json` gives the counts to
+  programs. In Python: `gpxiltools.stats.stats` and `region_tally`.
+
 ## 0.3.1 (28 October 2026)
 
 - **N is near-black** in the `classic` and `okabe-ito` palettes, and is no

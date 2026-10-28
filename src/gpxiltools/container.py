@@ -56,6 +56,18 @@ COMPRESSIONS = {
 DEFAULT_COMPRESSION = "deflate"
 DEFAULT_WIDTH = 8192
 DEFAULT_STRIP_BYTES = 1 << 18
+#: TIFF Compression tag values of each compression (32946 is the obsolete code for Deflate)
+COMPRESSION_TAGS = {"deflate": (8, 32946), "zstd": (50000,), "lzw": (5,), "lzma": (34925,), "packbits": (32773,), "none": (1,)}
+#: contig metadata keys that describe the gt plane, or the ps plane, and go when those planes do
+GT_ENTRY_KEYS = ("ploidy", "vcf_contig", "encoding", "callable_bases", "phase_sets", "phase_set_ids")
+PS_ENTRY_KEYS = ("phase_sets", "phase_set_ids")
+COPY_READ_BYTES = 1 << 23  #: copied strips are read up to this many bytes at a time (one request for a file on the web)
+
+
+def compression_of(page) -> str | None:
+    """The name (as in COMPRESSIONS) of a page's compression, or None for one gpxil files do not use."""
+    code = int(page.compression)
+    return next((name for name, tags in COMPRESSION_TAGS.items() if code in tags), None)
 
 
 TIFF_MAGIC = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
@@ -119,6 +131,13 @@ def is_tiff(path) -> bool:
 CLASSIC_TIFF_LIMIT = (1 << 32) - (1 << 26)  #: stay 64 MiB clear of the 4 GiB classic-TIFF offset limit
 
 
+def _no_codec_message(compression: str) -> str:
+    return (
+        f"{compression} compression needs the imagecodecs package, which this Python does not have "
+        "(pip install imagecodecs), or use deflate, the default"
+    )
+
+
 class GpxilFormatError(ValueError):
     pass
 
@@ -178,6 +197,40 @@ def to_image(values: np.ndarray, width: int) -> np.ndarray:
     return out.reshape(rows, width)
 
 
+def _stored_strip_bytes(page):
+    """A page's strips as they are stored, reading runs of adjacent strips at once (one request on the web)."""
+    fh = page.parent.filehandle
+    offsets, counts = page.dataoffsets, page.databytecounts
+    i, n = 0, len(offsets)
+    while i < n:
+        j, total = i + 1, counts[i]
+        while j < n and offsets[j] == offsets[j - 1] + counts[j - 1] and total + counts[j] <= COPY_READ_BYTES:
+            total += counts[j]
+            j += 1
+        fh.seek(offsets[i])
+        data = fh.read(total)
+        if len(data) != total:
+            raise GpxilFormatError(f"the file ends inside strip {i} of a page: is it complete?")
+        pos = 0
+        for k in range(i, j):
+            yield data[pos : pos + counts[k]]
+            pos += counts[k]
+        i = j
+
+
+def _several_phase_sets(contig) -> bool:
+    """True if a contig's ps plane holds more than one phase set (from its metadata, or by reading the plane)."""
+    known = contig.entry.get("phase_sets")
+    if isinstance(known, int):
+        return known > 1
+    seen: set[int] = set()
+    for s in range(0, contig.length, 1 << 24):
+        seen.update(int(v) for v in np.unique(contig.read("ps", s, min(contig.length, s + (1 << 24)))) if v)
+        if len(seen) > 1:
+            return True
+    return False
+
+
 def encode_sidecar(entries: list[SidecarEntry]) -> bytes:
     text = SIDECAR_HEADER + "".join(e.to_tsv() + "\n" for e in entries)
     return zlib.compress(text.encode("utf-8"), 9)
@@ -231,14 +284,13 @@ class GpxilWriter:
         reference: dict | None = None,
         sample: dict | None = None,
         metadata: dict | None = None,
+        require_codec: bool = True,
     ):
         if compression not in COMPRESSIONS:
             raise ValueError(f"unknown compression {compression!r}; choose from {', '.join(COMPRESSIONS)}")
-        if not codec_available(compression):
-            raise GpxilFormatError(
-                f"{compression} compression needs the imagecodecs package, which this Python does not have "
-                "(pip install imagecodecs), or use deflate, the default"
-            )
+        # (require_codec=False: a copy whose strips are all copied as stored needs no codec)
+        if require_codec and not codec_available(compression):
+            raise GpxilFormatError(_no_codec_message(compression))
         if width < 1:
             raise ValueError("width must be positive")
         self.path = os.fspath(path)
@@ -267,6 +319,10 @@ class GpxilWriter:
             "flags": tiff_colormap(flags_view_colours()),
         }
         self._plane_dtypes: dict[str, str] = {}
+        #: extra keys for the 'planes' metadata of a plane (description, units, ...), as copied from another file
+        self.plane_info: dict[str, dict] = {}
+        #: how many pages the last copy_contig copied as stored and encoded again
+        self.last_copy: dict[str, int] = {"stored": 0, "encoded": 0}
         self._closed = False
 
     def __enter__(self) -> GpxilWriter:
@@ -343,28 +399,8 @@ class GpxilWriter:
             if prev != dt.name:
                 raise GpxilFormatError(f"plane {plane!r} has dtype {dt.name} here but {prev} in an earlier contig")
             img = to_image(arr, w)
-            rps = max(1, min(rows, self.strip_bytes // max(1, w * dt.itemsize)))
-            desc = {"gpxil": FORMAT_VERSION, "contig": name, "plane": plane, "length": length}
-            kwargs = dict(
-                compression=self._codec,
-                rowsperstrip=rps,
-                description=json.dumps(desc, ensure_ascii=True),
-                metadata=None,
-                software=f"gpxiltools {__version__}",
-                datetime=_dt.datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
-            )
-            if self._codec is not None and self._level is not None:
-                kwargs["compressionargs"] = {"level": self._level}
-            if plane in self._colormaps:
-                kwargs.update(photometric="palette", colormap=self._colormaps[plane])
-            else:
-                kwargs.update(photometric="minisblack")
-            extratags = [(285, "s", 0, f"{name} {plane}", True)]  # PageName
-            if plane == "gt" and sidecar:
-                blob = encode_sidecar(sidecar)
-                extratags.append((SIDECAR_TAG, 7, len(blob), blob, True))
-            kwargs["extratags"] = extratags
-            self._tw.write(img, **kwargs)
+            blob = encode_sidecar(sidecar) if plane == "gt" and sidecar else None
+            self._tw.write(img, **self._page_kwargs(name, plane, length, self._rows_per_strip(rows, w, dt), blob))
             pages[plane] = self._page
             self._page += 1
         if sidecar:
@@ -375,10 +411,153 @@ class GpxilWriter:
         self._names.add(name)
         return info
 
+    def _rows_per_strip(self, rows: int, width: int, dt: np.dtype) -> int:
+        return max(1, min(rows, self.strip_bytes // max(1, width * dt.itemsize)))
+
+    def _page_kwargs(self, name: str, plane: str, length: int, rps: int, sidecar_blob: bytes | None) -> dict:
+        """tifffile.TiffWriter.write arguments for one page: tags, page metadata and colour map (section 8)."""
+        desc = {"gpxil": FORMAT_VERSION, "contig": name, "plane": plane, "length": length}
+        kwargs = dict(
+            compression=self._codec,
+            rowsperstrip=rps,
+            description=json.dumps(desc, ensure_ascii=True),
+            metadata=None,
+            software=f"gpxiltools {__version__}",
+            datetime=_dt.datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
+        )
+        if self._codec is not None and self._level is not None:
+            kwargs["compressionargs"] = {"level": self._level}
+        if plane in self._colormaps:
+            kwargs.update(photometric="palette", colormap=self._colormaps[plane])
+        else:
+            kwargs.update(photometric="minisblack")
+        extratags = [(285, "s", 0, f"{name} {plane}", True)]  # PageName
+        if sidecar_blob:
+            extratags.append((SIDECAR_TAG, 7, len(sidecar_blob), sidecar_blob, True))
+        kwargs["extratags"] = extratags
+        return kwargs
+
+    def _check_dtype(self, plane: str, dt: np.dtype) -> None:
+        prev = self._plane_dtypes.setdefault(plane, dt.name)
+        if prev != dt.name:
+            raise GpxilFormatError(f"plane {plane!r} has dtype {dt.name} here but {prev} in an earlier contig")
+
+    def _stored_strips(self, page, dt: np.dtype, level_given: bool) -> bool:
+        """True if the page's strips can be copied as they are stored: the same compression, strips, no predictor."""
+        if level_given or page.is_tiled or page.rowsperstrip <= 0 or self.compression == "none":
+            return False
+        if compression_of(page) != self.compression or int(page.predictor) not in (0, 1) or int(page.fillorder) != 1:
+            return False
+        if page.dtype != dt or (dt.itemsize > 1 and page.parent.byteorder != self._tw.tiff.byteorder):
+            return False
+        return len(page.dataoffsets) == math.ceil(page.shape[0] / page.rowsperstrip)
+
+    def copy_contig(self, src: Contig, planes: Iterable[str] | None = None, *, recompress: bool = False) -> ContigInfo:
+        """Copy a contig of an open gpxil file, with all or some of its planes, strip by strip.
+
+        Strips are copied as they are stored when the compression is the
+        same (and ``recompress`` is false), without being decoded; otherwise
+        they are decoded and encoded again a strip at a time. Either way the
+        memory used is about one strip, whatever the contig's size, and the
+        source can be a file on the web. ``planes`` defaults to the
+        contig's own planes; ``ref`` can also come from a reference attached
+        to the source file. The contig keeps its metadata entry, without the
+        keys that describe planes left out.
+        """
+        if self._closed:
+            raise RuntimeError("writer is closed")
+        name, length, w, rows = src.name, src.length, src.width, src.rows
+        check_contig_name(name)
+        if name in self._names:
+            raise GpxilFormatError(f"duplicate contig name {name!r}")
+        want = sort_planes(src.planes if planes is None else dict.fromkeys(planes))
+        if not want:
+            raise GpxilFormatError(f"contig {name!r}: no planes to copy")
+        for p in want:
+            if not src.has(p):
+                src._page(p)  # raises MissingPlaneError, saying how to give a missing reference
+        if "gt" in want and "flags" not in want:
+            raise GpxilFormatError(f"contig {name!r}: a gt plane needs its flags plane (section 3)")
+        if "gt" not in want and any(p in want for p in ("gq", "dp", "ps")):
+            raise GpxilFormatError(f"contig {name!r}: gq, dp and ps planes need the gt plane (section 3)")
+        if "gt" in want and not (isinstance(self.sample, dict) and self.sample.get("id")):
+            raise GpxilFormatError("a gt plane describes a sample: give GpxilWriter(sample={'id': ...})")
+        if "ref" not in want and not (src.entry.get("md5") or src.entry.get("refget")):
+            raise GpxilFormatError(
+                f"contig {name!r}: without its ref plane a contig needs the md5 or refget digest of its reference (section 3)"
+            )
+        if "gt" in want and "ps" in src.pages and "ps" not in want and _several_phase_sets(src):
+            raise GpxilFormatError(
+                f"contig {name!r} has more than one phase set: without the ps plane its phased calls would read as one"
+                " phase set (section 5.5), so keep ps"
+            )
+        side = src.sidecar() if "gt" in want else []
+        plan: dict[str, tuple[np.dtype, object | None]] = {}
+        size = 0
+        for p in want:
+            stored = p in src.pages
+            page = src._page(p) if stored else None
+            dt = plane_dtype(p, np.zeros(0, dtype=page.dtype) if page is not None else None) if p.startswith("x-") else plane_dtype(p)
+            raw = page if (page is not None and self._stored_strips(page, dt, recompress)) else None
+            if raw is None and not codec_available(self.compression):
+                raise GpxilFormatError(_no_codec_message(self.compression))
+            plan[p] = (dt, raw)
+            size += sum(raw.databytecounts) if raw is not None else rows * w * dt.itemsize
+        if not self.bigtiff and self._tw.filehandle.tell() + size > CLASSIC_TIFF_LIMIT:
+            if self._auto_bigtiff:
+                raise BigTiffNeeded(f"{self.path} may pass 4 GiB")
+            raise GpxilFormatError(f"{self.path} may pass 4 GiB: write it with bigtiff=True")
+        pages: dict[str, int] = {}
+        self.last_copy = {
+            "stored": sum(raw is not None for _, raw in plan.values()),
+            "encoded": sum(raw is None for _, raw in plan.values()),
+        }
+        for p in want:
+            dt, raw = plan[p]
+            self._check_dtype(p, dt)
+            if raw is not None:
+                rps, strips = raw.rowsperstrip, _stored_strip_bytes(raw)
+            else:
+                rps = self._rows_per_strip(rows, w, dt)
+                strips = self._encoded_strips(src, p, dt, rps)
+            blob = encode_sidecar(side) if p == "gt" and side else None
+            kwargs = self._page_kwargs(name, p, length, rps, blob)
+            kwargs.pop("compressionargs", None)  # (the strips arrive encoded)
+            self._tw.write(strips, shape=(rows, w), dtype=dt, **kwargs)
+            pages[p] = self._page
+            self._page += 1
+        extra = {k: v for k, v in src.entry.items() if k not in ("name", "length", "width", "pages", "sidecar_entries")}
+        for k in GT_ENTRY_KEYS if "gt" not in pages else PS_ENTRY_KEYS if "ps" not in pages and "ps" in src.pages else ():
+            extra.pop(k, None)
+        if side:
+            extra["sidecar_entries"] = len(side)
+        info = ContigInfo(name=name, length=length, width=w, pages=pages, extra=extra)
+        self.contigs.append(info)
+        self._names.add(name)
+        return info
+
+    def _encoded_strips(self, src: Contig, plane: str, dt: np.dtype, rps: int):
+        """The plane's strips, read from the source a strip's worth of rows at a time and encoded."""
+        from tifffile import TIFF
+
+        w, rows, n = src.width, src.rows, src.length
+        order = self._tw.tiff.byteorder
+        code = COMPRESSION_TAGS[self.compression][0]
+        args = {} if self._level is None else {"level": self._level}
+        for r0 in range(0, rows, rps):
+            r1 = min(rows, r0 + rps)
+            a, b = r0 * w, min(n, r1 * w)
+            buf = np.zeros((r1 - r0) * w, dtype=dt.newbyteorder(order))
+            buf[: b - a] = src.read(plane, a, b)
+            if code == 1:
+                yield buf.tobytes()
+            else:
+                yield bytes(TIFF.COMPRESSORS[code](buf.reshape(r1 - r0, w), **args))
+
     def metadata(self) -> dict:
         planes = {}
         for p, dt in self._plane_dtypes.items():
-            spec = {"dtype": dt}
+            spec = {**self.plane_info.get(p, {}), "dtype": dt}
             if p in STANDARD_PLANES and STANDARD_PLANES[p]["missing"] is not None:
                 spec["missing"] = STANDARD_PLANES[p]["missing"]
             planes[p] = spec
