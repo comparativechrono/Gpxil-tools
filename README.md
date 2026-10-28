@@ -168,6 +168,11 @@ WebAssembly), as it does in [GpxilStudio](https://github.com/comparativechrono/G
 not have and which only Zstandard, LZW and PackBits need. Deflate, the
 default compression, needs nothing but Python.
 
+For pages that read gpxil files without Python, [`js/gpxil-read.js`](js/README.md)
+is a reader in JavaScript, tested against the files gpxiltools writes: the
+[Gpxil browser](https://github.com/comparativechrono/Gpxil-browser) and
+GpxilStudio each keep a copy (it is not on npm).
+
 Writing a file directly, including your own planes:
 
 ```python
@@ -219,7 +224,7 @@ the conversion with small hand-made cases. On HG002 chr21 the haplotypes
 agree with bcftools on every non-overlapping record; where records overlap
 (`*` alleles), gpxiltools applies both records and bcftools skips one.
 
-## Limits of version 0.1
+## Limits
 
 - One sample per file, ploidy at most 2.
 - VCF export is equivalent in haplotype content, not a copy of the input
@@ -228,10 +233,11 @@ agree with bcftools on every non-overlapping record; where records overlap
   applied to haplotype sequences.
 - Book PDFs use device CMYK ink values and the standard Helvetica font
   (not embedded); proof them with the printer's ICC profile.
-- Unphased heterozygous calls that overlap are applied as written, both to
-  haplotype 2 (spec sections 6.4 and 6.5), so two overlapping deletions that
-  the VCF has on different haplotypes become one, and `gpxil compare` sees
-  one.
+- Files written by gpxiltools 0.5 and earlier follow version 0.1 of the
+  specification, which applied unphased heterozygous calls that overlap as
+  written, both to haplotype 2: two overlapping deletions that the VCF has on
+  different haplotypes became one, which `gpxil compare` sees as one. Encode
+  such a VCF again for version 0.2's rule (spec section 6.5).
 
 A gpxil file of a person, and every faithful rendering or book of it, is that
 person's genome: handle it like the VCF it came from.

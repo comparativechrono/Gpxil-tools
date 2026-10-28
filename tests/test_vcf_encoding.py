@@ -103,12 +103,24 @@ def test_ref_allele_never_overwrites_a_variant():
 def test_conflicting_variants_are_counted_last_wins():
     planes, _, stats = encode(
         [
-            Call(pos=3, ref="G", alts=["C"], filter=".", gt="0/1"),
-            Call(pos=3, ref="G", alts=["T"], filter=".", gt="0/1"),  # split multi-allelic
+            Call(pos=3, ref="G", alts=["C"], filter=".", gt="0|1"),
+            Call(pos=3, ref="G", alts=["T"], filter=".", gt="0|1"),  # split multi-allelic, phased: as written
         ]
     )
     assert C.describe_gt_byte(int(planes["gt"][2])) == "REF|T"
     assert stats.conflicts == 1
+
+
+def test_unphased_split_multiallelic_records_go_one_to_each_haplotype():
+    # (spec 0.2, section 6.5: the second record's T doesn't fit haplotype 2, which has the first's C)
+    planes, _, stats = encode(
+        [
+            Call(pos=3, ref="G", alts=["C"], filter=".", gt="0/1"),
+            Call(pos=3, ref="G", alts=["T"], filter=".", gt="0/1"),
+        ]
+    )
+    assert C.describe_gt_byte(int(planes["gt"][2])) == "T|C"
+    assert stats.conflicts == 0 and stats.overlapping_calls_reassigned == 1
 
 
 def test_gvcf_block_gq_dp_and_callable_mask():

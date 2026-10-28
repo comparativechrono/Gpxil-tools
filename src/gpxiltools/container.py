@@ -29,9 +29,10 @@ from .palettes import DEFAULT_PALETTE, flags_view_colours, gt_view_colours, ref_
 from .remote import RangeFile, is_url
 from .vcf import SidecarEntry
 
-FORMAT_VERSION = "0.1"
+FORMAT_VERSION = "0.2"  #: the version of the specification this writes (and its rules for VCF calls, section 6)
+KNOWN_VERSIONS = ("0.1", "0.2")  #: versions this reads and checks as they are (any 0.x is read, spec 14)
 SIDECAR_TAG = 65400  #: private TIFF tag (reusable range) holding the zlib-compressed sidecar TSV
-SIDECAR_HEADER = "#gpxil-sidecar\t0.1\noffset\thap\tkind\tdata\n"
+SIDECAR_HEADER = "#gpxil-sidecar\t0.1\noffset\thap\tkind\tdata\n"  # (the sidecar's own version: unchanged in gpxil 0.2)
 
 STANDARD_PLANES: dict[str, dict] = {
     "ref": {"dtype": "uint8", "photometric": "palette", "missing": None},
@@ -285,6 +286,7 @@ class GpxilWriter:
         sample: dict | None = None,
         metadata: dict | None = None,
         require_codec: bool = True,
+        version: str = FORMAT_VERSION,
     ):
         if compression not in COMPRESSIONS:
             raise ValueError(f"unknown compression {compression!r}; choose from {', '.join(COMPRESSIONS)}")
@@ -304,6 +306,8 @@ class GpxilWriter:
         self.reference = reference or {}
         self.sample = sample
         self.extra_metadata = metadata or {}
+        # the specification's version the file follows: this one's, or (gpxil subset) its source's, whose planes it copies
+        self.version = str(version)
         # bigtiff=None: classic TIFF, raising BigTiffNeeded before the file
         # could pass 4 GiB (gpxiltools.encode then starts again as BigTIFF)
         self._auto_bigtiff = bigtiff is None
@@ -416,7 +420,7 @@ class GpxilWriter:
 
     def _page_kwargs(self, name: str, plane: str, length: int, rps: int, sidecar_blob: bytes | None) -> dict:
         """tifffile.TiffWriter.write arguments for one page: tags, page metadata and colour map (section 8)."""
-        desc = {"gpxil": FORMAT_VERSION, "contig": name, "plane": plane, "length": length}
+        desc = {"gpxil": self.version, "contig": name, "plane": plane, "length": length}
         kwargs = dict(
             compression=self._codec,
             rowsperstrip=rps,
@@ -562,7 +566,7 @@ class GpxilWriter:
                 spec["missing"] = STANDARD_PLANES[p]["missing"]
             planes[p] = spec
         meta = {
-            "gpxil": FORMAT_VERSION,
+            "gpxil": self.version,
             "generator": f"gpxiltools {__version__}",
             "created": _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat(),
             "layout": {"type": "raster", "width": self.width},

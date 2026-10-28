@@ -235,7 +235,15 @@ def _encode_once(
             "sex": sex,
         }
     ref_meta = _reference_meta(fasta, reference_name)
-    totals: dict = {"contigs": 0, "bases": 0, "records": 0, "conflicts": 0, "ref_mismatches": 0, "skipped": 0}
+    totals: dict = {
+        "contigs": 0,
+        "bases": 0,
+        "records": 0,
+        "conflicts": 0,
+        "ref_mismatches": 0,
+        "skipped": 0,
+        "overlapping_calls_reassigned": 0,
+    }
     used_vcf: set[str] = set()
     t0 = time.time()
     writer = GpxilWriter(
@@ -310,6 +318,7 @@ def _encode_once(
                         entry["phase_set_ids"] = synthetic  # ps value -> original VCF PS
                 totals["records"] += stats.records
                 totals["conflicts"] += stats.conflicts
+                totals["overlapping_calls_reassigned"] += stats.overlapping_calls_reassigned
                 totals["ref_mismatches"] += stats.ref_mismatches
                 totals["skipped"] += stats.skipped_out_of_range + stats.polyploid_skipped
                 if stats.examples:

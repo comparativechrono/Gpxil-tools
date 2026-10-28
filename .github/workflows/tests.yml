@@ -24,3 +24,22 @@ jobs:
         run: pytest -q
       - name: Validate the specification's worked example
         run: gpxil validate tests/data/worked-example.gpxil.tif
+
+  javascript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: The JavaScript reader, against files gpxiltools writes
+        run: |
+          node --check js/gpxil-read.js
+          node --test js/test/read.test.mjs

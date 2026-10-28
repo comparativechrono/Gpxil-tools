@@ -1,5 +1,48 @@
 # Changes
 
+## 0.6.0 (28 October 2026)
+
+Version 0.2 of the specification, and a reader in JavaScript.
+
+- **gpxil 0.2: unphased calls that overlap go one to each haplotype**
+  (specification section 6.5). Calls that overlap are alternatives at one
+  place. An ALT allele *occupies* the bases it changes, and the base before
+  a plain insertion or deletion; in an unphased genotype of two different
+  alleles, an allele that doesn't fit the haplotype the written order gives
+  it (an earlier call's ALT allele occupies one of its bases there) goes to
+  the other haplotype, if both alleles fit the other way round. So two
+  overlapping heterozygous deletions no longer run together on haplotype 2,
+  nor does an insertion follow a base another call deletes; split
+  multi-allelic records, unphased, go one to each haplotype in either order
+  (unless their alleles change different bases of one REF), and a record
+  written twice stays heterozygous. Counted as
+  `overlapping_calls_reassigned` (each contig's `encoding`, the summary, and
+  a note from `gpxil encode`). On chromosome 17 of GIAB's v4.2.1 benchmarks
+  of HG002, HG003 and HG004 it moves 26 of 320,884 records (on their 22
+  autosomes, 687 of 12,079,785); `gpxil compare` then agrees with a check
+  from the VCF records on every stretch where HG002's two benchmarks
+  differ, and the trio's artefactual Mendelian error is gone.
+- Two smaller fixes to the VCF conversion. Allele numbers are digits: `²`,
+  a digit to Python, stopped the encoder with an error, and ` 1` or `+1`
+  now count as `bad_allele_index`, as `-1` did. A one-base ALT allele other
+  than A, C, G or T at a reference N is UNKNOWN, as a longer one was, not
+  REF.
+- Files are written as gpxil 0.2. `gpxil subset` keeps the version of the
+  file it copies, any 0.x, whose planes were made by that version's rules.
+  The validator knows 0.1 and 0.2, with a schema for each, and checks a
+  later 0.x as 0.2; `GpxilWriter(version=...)` writes another.
+- **`js/gpxil-read.js`**: a reader of gpxil files for web pages and Node,
+  from Blobs, bytes or the web (range requests, adjacent strips in one
+  request, decoded strips cached), with the sidecar; any version 0.x, in
+  strips or tiles, Deflate or none, with or without a predictor, classic
+  TIFF or BigTIFF, either byte order, planes of 8, 16 or 32 bits. Files are
+  untrusted: it refuses directories that loop, strips that inflate past
+  their size or hold less than their rows, and tags, strips or sidecars
+  larger than it takes, each with an error code a page can put in its own
+  words. Tested in CI against the files gpxiltools writes, and files made
+  to hurt it. The Gpxil browser and GpxilStudio each keep a copy
+  (`js/copy_to.py`); it is not on npm.
+
 ## 0.5.0 (28 October 2026)
 
 Genomes compared. Files are unchanged.

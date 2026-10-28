@@ -17,6 +17,7 @@ from . import codes as C
 from .container import (
     EXTENSION_DTYPES,
     FORMAT_VERSION,
+    KNOWN_VERSIONS,
     SIDECAR_TAG,
     STANDARD_PLANES,
     GpxilFile,
@@ -83,7 +84,8 @@ def _check_schema(meta: dict, rep: Report) -> None:
         return
     from importlib.resources import files
 
-    schema = json.loads(files("gpxiltools").joinpath("schema/gpxil-0.1.schema.json").read_text())
+    name = "gpxil-0.1.schema.json" if str(meta.get("gpxil")) == "0.1" else "gpxil-0.2.schema.json"
+    schema = json.loads(files("gpxiltools").joinpath("schema", name).read_text())
     for err in jsonschema.Draft202012Validator(schema).iter_errors(meta):
         where = "/".join(str(p) for p in err.absolute_path) or "(top level)"
         rep.error(f"metadata {where}: {err.message}")
@@ -103,8 +105,8 @@ def validate(path, *, check_digests: bool = True, chunk: int = CHUNK) -> Report:
     with g:
         meta = g.metadata
         _check_schema(meta, rep)
-        if str(meta.get("gpxil")) != FORMAT_VERSION:
-            rep.warn(f"file declares gpxil {meta.get('gpxil')}, validator implements {FORMAT_VERSION}")
+        if str(meta.get("gpxil")) not in KNOWN_VERSIONS:
+            rep.warn(f"file declares gpxil {meta.get('gpxil')}, newer than this validator: checked as gpxil {FORMAT_VERSION}")
         layout = meta.get("layout") or {}
         if layout.get("type") != "raster":
             rep.error(f"layout.type must be 'raster', got {layout.get('type')!r}")
