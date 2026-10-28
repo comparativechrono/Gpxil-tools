@@ -1,5 +1,41 @@
 # Changes
 
+## 0.5.0 (28 October 2026)
+
+Genomes compared. Files are unchanged.
+
+- **`gpxil compare A B`** compares two genomes base by base, as gpxil's planes
+  are aligned to the reference: no VCF records are matched. At each base
+  called in both, genotypes are compared as unordered pairs of alleles, so
+  phasing isn't compared and one copy equals two of the same allele. Where
+  they differ, bases no more than `--gap` (50) apart, widened over any
+  repeat their insertions and deletions could move along, form a stretch,
+  compared as sequences, with its heterozygous pieces either way round: an
+  indel written at another place in a repeat, or a substitution written
+  with a deletion, is *the same, written differently*. Each file's events
+  (substitutions, indels, COMPLEX alleles, counted as `gpxil stats` counts
+  them) are found in the other, missing, there with another genotype, or not
+  compared where the other didn't call; with B as the truth that gives
+  precision, recall and F1. It lists the first differences.
+- **`gpxil compare CHILD --father F --mother M`** checks a child against both
+  parents: Mendelian errors (a stretch is first checked as sequences, so
+  variants written differently aren't errors), candidate new mutations,
+  where each of the child's variants came from (the father, the mother,
+  both, or can't be told), and, where a parent's calls are phased, which of
+  that parent's haplotypes the child received and the crossovers between
+  them.
+- Calls outside the regions called with confidence (a file written with a
+  BED file keeps them, each an island among bases not called) are left out
+  of both, unless `--all-calls`.
+- `-o` draws the first region, one pixel a base, its classes over the
+  reference faded. `--json` gives every count to programs.
+- In Python: `gpxiltools.compare.compare_pair`, `compare_trio`, `picture`
+  and `format_compare`. Chromosome 17 takes about 4 s for two genomes and
+  6 s for a trio, reading a megabase at a time.
+- Checked against VCF records, independently of gpxiltools, on GIAB's HG002
+  (v4.2.1 against v5.0q) and the HG002-HG003-HG004 trio, and on 806 indels
+  moved along repeats ([Gpxil-scratchpad, experiment 03](https://github.com/comparativechrono/gpxil-scratchpad/tree/main/experiments/03-compare)).
+
 ## 0.4.0 (28 October 2026)
 
 Two commands for working with big files. Files are unchanged.

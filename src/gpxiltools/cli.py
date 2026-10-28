@@ -167,6 +167,42 @@ def cmd_stats(a) -> int:
     return 0
 
 
+def cmd_compare(a) -> int:
+    from .compare import compare_pair, compare_trio, format_compare, picture
+    from .container import GpxilFile
+
+    trio = bool(a.father or a.mother)
+    if trio and not (a.father and a.mother):
+        raise SystemExit("gpxil: error: a trio needs both --father and --mother")
+    if trio and len(a.files) != 1:
+        raise SystemExit("gpxil: error: with --father and --mother, give one file: the child's")
+    if not trio and len(a.files) != 2:
+        raise SystemExit("gpxil: error: give two files to compare, or a child's with --father and --mother")
+    files = []
+    try:
+        for path in [a.files[0], a.father, a.mother] if trio else a.files:
+            files.append(GpxilFile(path, reference=a.reference))
+        kw = {"gap": a.gap, "all_calls": a.all_calls}
+        res = compare_trio(*files, a.region, **kw) if trio else compare_pair(*files, a.region, **kw)
+        if a.output:
+            first = res["regions"][0]
+            pic = picture(files, first["contig"], first["start"] - 1, first["end"], bases_per_row=a.width, palette=a.palette, **kw)
+            pic = pic.scaled(a.scale)
+            if a.output.lower().endswith((".tif", ".tiff")):
+                pic.save_tiff(a.output, colorspace="cmyk" if a.cmyk else "rgb")
+            elif a.cmyk:
+                raise SystemExit("--cmyk needs a .tif output (PNG has no CMYK)")
+            else:
+                pic.save_png(a.output)
+            h, w = pic.shape
+            print(f"wrote {a.output}: {w} x {h} px, {pic.title}", file=sys.stderr)
+    finally:
+        for g in files:
+            g.close()
+    print(json.dumps(res, indent=2) if a.json else format_compare(res))
+    return 0
+
+
 def cmd_render(a) -> int:
     from .layout import hilbert_image
     from .render import render
@@ -335,6 +371,34 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--json", action="store_true", help="the counts as JSON")
     st.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
     st.set_defaults(fn=cmd_stats)
+
+    cp = sub.add_parser("compare", help="compare two genomes base by base, or a child's with both parents' (a trio)")
+    cp.add_argument(
+        "files",
+        nargs="+",
+        metavar="FILE",
+        help="two gpxil files, A and B (B taken as the truth); or the child's, with --father and --mother",
+    )
+    cp.add_argument("--father", metavar="FILE", help="the father's gpxil file, for a trio")
+    cp.add_argument("--mother", metavar="FILE", help="the mother's gpxil file, for a trio")
+    cp.add_argument(
+        "--region",
+        type=_region,
+        action="append",
+        help="CONTIG or CONTIG:START-END (1-based, inclusive); repeatable; default: every contig all have",
+    )
+    cp.add_argument("-o", "--output", help="a picture of the first region, one pixel a base: .png, or .tif")
+    cp.add_argument("--width", type=int, help="bases per row of the picture (default: the files' layout width)")
+    cp.add_argument("--scale", type=int, default=1, help="pixels per base in the picture, each way")
+    cp.add_argument("--palette", choices=list(PALETTES), default="classic", help="colours of the reference, faded, in the picture")
+    cp.add_argument("--cmyk", action="store_true", help="the picture as a CMYK TIFF for print")
+    cp.add_argument(
+        "--gap", type=int, default=50, help="differences this close together are one stretch, compared as sequences (default 50)"
+    )
+    cp.add_argument("--all-calls", action="store_true", help="also compare the calls outside the regions called with confidence")
+    cp.add_argument("--json", action="store_true", help="the counts as JSON")
+    cp.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
+    cp.set_defaults(fn=cmd_compare)
 
     r = sub.add_parser("render", help="draw a contig or interval as PNG (screen) or TIFF (RGB or CMYK)")
     r.add_argument("file")
