@@ -336,15 +336,16 @@ def _one_copy_at(contig, offset: int) -> bool:
     return bool(C.hap2(contig.read("gt", offset, offset + 1))[0] == C.HAP_ABSENT)
 
 
-def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple[str, int, int, Tally]]:
-    """Tallies of ``regions``: ``(contig, start, end)``, 0-based, end None for the rest (default: every contig)."""
+def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple]:
+    """Tallies of ``regions``: ``(contig, start, end)``, 0-based, start and end None for the whole contig, end None
+    for the rest of it (default: every contig). On a window (spec 3.1) they are positions in its parent. Returns
+    ``(contig, start, end, Tally)`` with the :class:`~gpxiltools.container.Contig` and its own offsets."""
     if not regions:
-        regions = [(n, 0, None) for n in gfile.contigs]
+        regions = [(n, None, None) for n in gfile.contigs]
     out = []
     for name, s, e in regions:
-        c = gfile[name]
-        e = c.length if e is None else e
-        out.append((c.name, s, e, region_tally(c, s, e, chunk=chunk)))
+        c, s, e = gfile.locate(name, s, e)
+        out.append((c, s, e, region_tally(c, s, e, chunk=chunk)))
     return out
 
 
@@ -359,9 +360,17 @@ def stats(gfile, regions=None, *, chunk: int = CHUNK) -> dict:
         "file": str(gfile.path).rstrip("/").rsplit("/", 1)[-1],
         "sample": gfile.sample_id,
         "reference": (meta.get("reference") or {}).get("name"),
-        "regions": [{"contig": n, "start": s + 1, "end": e, **t.as_dict()} for n, s, e, t in parts],
+        "regions": [_where(c, s, e) | t.as_dict() for c, s, e, t in parts],
         "total": {"regions": len(parts), **total.as_dict()},
     }
+
+
+def _where(c, s: int, e: int) -> dict:
+    """A region in its sequence's coordinates (a window's: its parent's), and the window it is in."""
+    out = {"contig": c.parent, "start": c.start + s + 1, "end": c.start + e}
+    if c.window is not None:
+        out["window"] = c.name
+    return out
 
 
 # ----------------------------------------------------------------- as a table

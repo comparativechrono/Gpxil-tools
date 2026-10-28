@@ -169,20 +169,22 @@ class SplitResult:
     format_keys: set[str]  # FORMAT keys used by any record
 
 
-def split_by_contig(path, sample_index: int, workdir: str, buffer_bytes: int = 32 << 20) -> SplitResult:
+def split_by_contig(path, sample_index: int, workdir: str, buffer_bytes: int = 32 << 20, keep=None) -> SplitResult:
     """Stream a VCF once, writing each contig's calls for one sample to a temp file.
 
     This lets the encoder handle one chromosome at a time whatever the record
     order of the VCF. Lines are buffered in memory and appended to the
     per-contig files in batches, so only one file is open at a time however
     many contigs there are. The FORMAT keys of every record are collected on
-    the way, so the choice of optional planes sees the whole file.
+    the way, so the choice of optional planes sees the whole file. With
+    ``keep``, only the contigs it accepts (by name) are written.
     """
     buffers: dict[str, list[str]] = {}
     counts: Counter[str] = Counter()
     paths: dict[str, str] = {}
     formats_seen: set[str] = set()
     format_keys: set[str] = set()
+    rejected: set[str] = set()
     buffered = 0
     col = 9 + sample_index
 
@@ -200,12 +202,18 @@ def split_by_contig(path, sample_index: int, workdir: str, buffer_bytes: int = 3
         if len(parts) <= col:
             raise VcfError(f"record at {parts[0]}:{parts[1] if len(parts) > 1 else '?'} has no column for sample {sample_index}")
         chrom = parts[0]
-        if chrom not in paths:
-            paths[chrom] = os.path.join(workdir, f"contig{len(paths):05d}.vcf")
-            buffers[chrom] = []
         if len(parts) > 8 and parts[8] not in formats_seen:
             formats_seen.add(parts[8])
             format_keys.update(parts[8].split(":"))
+        if keep is not None and chrom not in paths:
+            if chrom in rejected:
+                continue
+            if not keep(chrom):
+                rejected.add(chrom)
+                continue
+        if chrom not in paths:
+            paths[chrom] = os.path.join(workdir, f"contig{len(paths):05d}.vcf")
+            buffers[chrom] = []
         out = "\t".join(parts[:9] + [parts[col]]) + "\n"  # fixed columns plus the chosen sample
         buffers[chrom].append(out)
         buffered += len(out)
@@ -381,8 +389,33 @@ def _bits_any(bits: bytearray, a: int, b: int) -> bool:
     return bool(bits[i] & lo) or bool(bits[j] & hi) or bits.count(0, i + 1, j) != j - i - 1
 
 
+def record_span(call: Call, n: int) -> tuple[int, int, bool] | None:
+    """The bases a record covers on a contig of ``n`` bases (spec 6.2, 6.3): ``(start, end, clipped)``, 0-based with
+    the end excluded, ``clipped`` if END took it past the contig's end (where it is cut). None for a record that is
+    skipped: no REF allele, or outside the contig."""
+    p0 = call.pos - 1
+    if not call.ref or p0 < 0 or p0 >= n or p0 + len(call.ref) > n:
+        return None
+    alts = call.alts
+    only_refblock = not alts or all(a in _REFBLOCK_ALTS for a in alts)
+    symbolic = any(is_symbolic(a) for a in alts)
+    span_end = p0 + max(len(call.ref), 1)
+    if call.end is not None and (only_refblock or symbolic):
+        span_end = max(span_end, call.end)
+    elif symbolic and call.svlen:
+        for i, a in enumerate(alts):
+            if a.startswith("<DEL") and i < len(call.svlen) and call.svlen[i]:
+                span_end = max(span_end, call.pos + abs(call.svlen[i]))
+    return p0, min(span_end, n), span_end > n
+
+
 class PlaneBuilder:
-    """Accumulates one sample's calls on one contig into gt/flags/... planes."""
+    """Accumulates one sample's calls on one contig into gt/flags/... planes.
+
+    ``ref`` is the contig's reference, or a stretch of it that starts at ``origin``, for a window (spec 3.1): then
+    ``contig_length`` is the whole contig's, positions in calls are the contig's, and the planes are the stretch's.
+    The calls given must lie inside the stretch (see :func:`window_calls`).
+    """
 
     def __init__(
         self,
@@ -394,11 +427,15 @@ class PlaneBuilder:
         want_dp: bool = False,
         want_ps: bool = False,
         contig: str = "",
+        origin: int = 0,
+        contig_length: int | None = None,
     ):
         n = ref.shape[0]
         self.ref = ref
         self.contig = contig
         self.length = n
+        self.origin = origin
+        self.contig_length = origin + n if contig_length is None else contig_length
         self.w = [np.zeros(n, dtype=np.uint8), np.zeros(n, dtype=np.uint8)]
         # initial states (spec 6.1): callable regions first, then haploid regions
         if callable_mask is not None:
@@ -459,7 +496,7 @@ class PlaneBuilder:
             conflict &= where
         if conflict.any():
             self.stats.conflicts += int(conflict.sum())
-            self.stats.note(f"{self.contig}:{start + int(np.flatnonzero(conflict)[0]) + 1} conflicting states on hap{h + 1}")
+            self.stats.note(f"{self.contig}:{self.origin + start + int(np.flatnonzero(conflict)[0]) + 1} conflicting states on hap{h + 1}")
         if h == 1:
             mism = (cur == C.HAP_ABSENT) & ~asserted & (states != C.HAP_ABSENT)
             if where is not None:
@@ -482,13 +519,13 @@ class PlaneBuilder:
             if asserted:
                 if state == C.HAP_ABSENT and cur not in _WEAK:
                     self.stats.conflicts += 1
-                    self.stats.note(f"{self.contig}:{pos + 1} haploid call meets a variant on hap2")
+                    self.stats.note(f"{self.contig}:{self.origin + pos + 1} haploid call meets a variant on hap2")
                 return False
             w[pos] = state | _ASSERTED | keep
             return False
         if asserted and cur not in _WEAK and cur != state:
             self.stats.conflicts += 1
-            self.stats.note(f"{self.contig}:{pos + 1} conflicting states on hap{h + 1}")
+            self.stats.note(f"{self.contig}:{self.origin + pos + 1} conflicting states on hap{h + 1}")
         w[pos] = state | _ASSERTED | keep
         return True
 
@@ -505,7 +542,7 @@ class PlaneBuilder:
         key = (anchor, h + 1)
         if key in self.ins and self.ins[key] != seq:
             self.stats.conflicts += 1
-            self.stats.note(f"{self.contig}:{anchor + 1} two insertions on hap{h + 1}")
+            self.stats.note(f"{self.contig}:{self.origin + anchor + 1} two insertions on hap{h + 1}")
         self.ins[key] = seq
         self.w[h][anchor] |= _INS
 
@@ -531,26 +568,19 @@ class PlaneBuilder:
         text = call.ref + "".join(call.alts)
         if text != text.upper():  # (REF and sequence ALT alleles are read case-insensitively, spec 6.2: iter_calls does)
             call = dataclasses.replace(call, ref=call.ref.upper(), alts=[a if is_symbolic(a) else a.upper() for a in call.alts])
-        p0 = call.pos - 1
-        alts = call.alts
-        n = self.length
-        if not call.ref or p0 < 0 or p0 >= n or p0 + len(call.ref) > n:
+        n = self.contig_length
+        span = record_span(call, n)
+        if span is None:
             st.skipped_out_of_range += 1
             st.note(f"{self.contig}:{call.pos} " + (f"outside the contig (length {n})" if call.ref else "has no REF allele"))
             return
-        only_refblock = not alts or all(a in _REFBLOCK_ALTS for a in alts)
-        symbolic = any(is_symbolic(a) for a in alts)
-        span_end = p0 + max(len(call.ref), 1)
-        if call.end is not None and (only_refblock or symbolic):
-            span_end = max(span_end, call.end)
-        elif symbolic and call.svlen:
-            for i, a in enumerate(alts):
-                if a.startswith("<DEL") and i < len(call.svlen) and call.svlen[i]:
-                    span_end = max(span_end, call.pos + abs(call.svlen[i]))
-        if span_end > n:
+        p0, span_end, clipped = span
+        if clipped:
             st.clipped_to_contig_end += 1
             st.note(f"{self.contig}:{call.pos} span clipped at the contig end")
-            span_end = n
+        p0, span_end = p0 - self.origin, span_end - self.origin  # (the stretch's offsets)
+        if p0 < 0 or span_end > self.length:
+            raise ValueError(f"{self.contig}:{call.pos}: the record isn't inside the stretch being encoded")
         if not self._ref_ok(p0, call.ref):
             st.ref_mismatches += 1
             st.note(f"{self.contig}:{call.pos} REF {call.ref} does not match the reference")
@@ -674,7 +704,10 @@ class PlaneBuilder:
             return None
         if is_symbolic(alt):
             end = self._symbolic_end(alt, idx - 1, call)
-            lo, hi = p0, (min(end, self.length) if alt.startswith("<DEL") and end is not None and end > call.pos else p0 + 1)
+            lo, hi = (
+                p0,
+                (min(end, self.contig_length) - self.origin if alt.startswith("<DEL") and end is not None and end > call.pos else p0 + 1),
+            )
             what = f"{p0}\t{alt}\t{end}"
         else:
             k, r, x = trim_alleles(call.ref, alt)
@@ -782,7 +815,7 @@ class PlaneBuilder:
         if alt.startswith("<DEL") and end is not None and end > call.pos:
             # SV deletion: POS is the padding base, kept; bases POS+1..END are deleted
             self._write_scalar(h, p0, C.HAP_REF)
-            del_start, del_end = p0 + 1, min(end, self.length)
+            del_start, del_end = p0 + 1, min(end, self.contig_length) - self.origin
             if del_end > del_start:
                 s = self._write_states(h, del_start, np.full(del_end - del_start, C.HAP_DEL, dtype=np.uint8))
                 out[1 : 1 + s.shape[0]] = s
@@ -907,8 +940,12 @@ def encode_calls(
     callable_mask: np.ndarray | None = None,
     haploid_mask: np.ndarray | None = None,
     planes: Iterable[str] = ("gt", "flags"),
+    origin: int = 0,
+    contig_length: int | None = None,
 ) -> tuple[dict[str, np.ndarray], list[SidecarEntry], EncodeStats, dict[str, int]]:
-    """Build variant planes for one contig from an iterable of :class:`Call`."""
+    """Build variant planes for one contig from an iterable of :class:`Call`; or for a stretch of it that starts
+    at ``origin`` (``ref`` and the masks being the stretch's, ``contig_length`` the contig's), from calls that lie
+    inside the stretch (see :func:`window_stretch`)."""
     wanted = set(planes)
     builder = PlaneBuilder(
         ref,
@@ -918,6 +955,8 @@ def encode_calls(
         want_dp="dp" in wanted,
         want_ps="ps" in wanted,
         contig=contig,
+        origin=origin,
+        contig_length=contig_length,
     )
     for call in calls:
         builder.add(call)
@@ -925,23 +964,68 @@ def encode_calls(
     return out, side, builder.stats, builder.ps_ids
 
 
+def window_stretch(spans: Iterable[tuple[int, int, bool] | None], start: int, end: int) -> tuple[int, int, np.ndarray]:
+    """The calls to convert for a window ``[start, end)`` of a contig (spec 3.1), from the spans of all its calls in
+    file order (:func:`record_span`, None for a record skipped).
+
+    A base depends only on the calls whose spans cover it and, through the placement of unphased calls (spec 6.5), on
+    the calls that overlap those, and so on. So the calls whose spans join up with the window, through spans that
+    share a base, converted alone over the stretch they cover, give the window the values that converting the whole
+    contig would. Returns that stretch ``(a, b)`` and which calls are in it (a boolean per call)."""
+    spans = list(spans)
+    got = [(i, s[0], s[1]) for i, s in enumerate(spans) if s is not None]
+    idx = np.array([g[0] for g in got], dtype=np.int64)
+    lo = np.array([g[1] for g in got] + [start], dtype=np.int64)
+    hi = np.array([g[2] for g in got] + [end], dtype=np.int64)
+    order = np.argsort(lo, kind="stable")
+    los, his = lo[order], hi[order]
+    reach = np.maximum.accumulate(his)  # (the furthest end of the spans so far, in order of start)
+    # a span begins a new run of spans that share bases where it starts at or after the end of every one before it
+    begins = np.concatenate(([True], los[1:] >= reach[:-1]))
+    run = np.cumsum(begins) - 1
+    mine = run[int(np.flatnonzero(order == len(got))[0])]  # (the run with the window in it)
+    a, b = int(los[run == mine].min()), int(his[run == mine].max())
+    keep = np.zeros(len(spans), dtype=bool)
+    keep[idx[(lo[:-1] < b) & (hi[:-1] > a)]] = True
+    return a, b, keep
+
+
+def window_entries(entries: list[SidecarEntry], start: int, end: int, first_gt: int | None = None) -> list[SidecarEntry]:
+    """A window's sidecar (spec 3.1): the entries at ``[start, end)``, at the window's offsets; and where the window's
+    first base is COMPLEX on a haplotype (``first_gt``, its gt byte) without an entry there (a run of COMPLEX bases
+    that began before the window), a copy of the entry nearest before it, which starts the run."""
+    out = [SidecarEntry(e.offset - start, e.hap, e.kind, e.data) for e in entries if start <= e.offset < end]
+    if start > 0 and first_gt is not None:
+        for hap, state in ((1, first_gt >> 4), (2, first_gt & 0x0F)):
+            if state != C.HAP_COMPLEX or any(e.offset == 0 and e.hap == hap and e.kind == "COMPLEX" for e in out):
+                continue
+            before = [e for e in entries if e.kind == "COMPLEX" and e.hap == hap and e.offset < start]
+            if before:
+                out.append(SidecarEntry(0, hap, "COMPLEX", max(before, key=lambda e: e.offset).data))
+    out.sort(key=lambda e: (e.offset, e.hap, e.kind))
+    return out
+
+
 class TempSplit:
     """Context manager around :func:`split_by_contig` with automatic cleanup."""
 
-    def __init__(self, path, sample_index: int):
+    def __init__(self, path, sample_index: int, keep=None):
         self.path = path
         self.sample_index = sample_index
+        self.keep = keep
         self._tmp = None
         self.index: dict[str, tuple[str, int]] = {}
         self.format_keys: set[str] = set()
 
     def __enter__(self) -> TempSplit:
         self._tmp = tempfile.TemporaryDirectory(prefix="gpxil-vcf-")
-        res = split_by_contig(self.path, self.sample_index, self._tmp.name)
+        res = split_by_contig(self.path, self.sample_index, self._tmp.name, keep=self.keep)
         self.index, self.format_keys = res.index, res.format_keys
         return self
 
-    def calls(self, chrom: str) -> Iterator[Call]:
+    def calls(self, chrom: str, keep=None) -> Iterator[Call]:
+        """The calls on ``chrom``, in file order; with ``keep`` (a boolean per call), only those it keeps, the others
+        not even read."""
         entry = self.index.get(chrom)
         if entry is None:
             return iter(())
@@ -949,7 +1033,8 @@ class TempSplit:
 
         def gen():
             with open(path, encoding="utf-8") as fh:
-                for _, call in iter_calls(fh, 0):
+                lines = fh if keep is None else (line for line, k in zip(fh, keep) if k)
+                for _, call in iter_calls(lines, 0):
                     yield call
 
         return gen()

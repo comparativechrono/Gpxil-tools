@@ -27,12 +27,61 @@ from . import __version__
 from . import codes as C
 from .palettes import DEFAULT_PALETTE, flags_view_colours, gt_view_colours, ref_colours, tiff_colormap
 from .remote import RangeFile, is_url
-from .vcf import SidecarEntry
+from .vcf import SidecarEntry, window_entries
 
-FORMAT_VERSION = "0.2"  #: the version of the specification this writes (and its rules for VCF calls, section 6)
-KNOWN_VERSIONS = ("0.1", "0.2")  #: versions this reads and checks as they are (any 0.x is read, spec 14)
+FORMAT_VERSION = "0.3"  #: the version of the specification this writes (and its rules for VCF calls, section 6)
+KNOWN_VERSIONS = ("0.1", "0.2", "0.3")  #: versions this reads and checks as they are (any 0.x is read, spec 14)
+WINDOW_VERSION = "0.3"  #: the first version with windows (spec 3.1): a file that holds one has this version or a later one
 SIDECAR_TAG = 65400  #: private TIFF tag (reusable range) holding the zlib-compressed sidecar TSV
-SIDECAR_HEADER = "#gpxil-sidecar\t0.1\noffset\thap\tkind\tdata\n"  # (the sidecar's own version: unchanged in gpxil 0.2)
+SIDECAR_HEADER = "#gpxil-sidecar\t0.1\noffset\thap\tkind\tdata\n"  # (the sidecar's own version: unchanged in gpxil 0.2 and 0.3)
+
+
+def version_key(v) -> tuple[int, ...]:
+    """'0.10' -> (0, 10): versions compared as numbers. Anything else sorts first."""
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return (-1,)
+
+
+def later_version(a, b) -> str:
+    """The later of two versions."""
+    return str(a) if version_key(a) >= version_key(b) else str(b)
+
+
+_REGION = re.compile(r"^(.+):([\d,]+)-([\d,]+)$")
+
+
+def parse_region(text: str) -> tuple[str, int | None, int | None]:
+    """'chr17:7,661,779-7,687,546' -> ('chr17', 7661778, 7687546): 1-based and inclusive in, 0-based with the end
+    excluded out. 'chr17' -> ('chr17', None, None). The name ends at the last colon, so a window's name (spec 3.1),
+    'chr17:7561779-7787546', can be followed by a region as well."""
+    text = str(text).strip()
+    m = _REGION.match(text)
+    if not m:
+        if not text:
+            raise ValueError("an empty region")
+        return text, None, None
+    name, s, e = m.group(1), int(m.group(2).replace(",", "")), int(m.group(3).replace(",", ""))
+    if s < 1 or e < s:
+        raise ValueError(f"bad interval in {text!r}: give START-END, 1-based, START no more than END")
+    return name, s - 1, e
+
+
+def region_text(name: str, start: int, end: int, *, commas: bool = False) -> str:
+    """('chr17', 7661778, 7687546) -> 'chr17:7661779-7687546' (1-based, inclusive), or with commas for people."""
+    return f"{name}:{start + 1:,}-{end:,}" if commas else f"{name}:{start + 1}-{end}"
+
+
+def path_name(path) -> str:
+    """The name of a file, from its path or URL."""
+    s = str(path).rstrip("/")
+    return s.rsplit("/", 1)[-1] if is_url(s) else os.path.basename(s)
+
+
+def _listed(contigs, k: int = 4) -> str:
+    return ", ".join(c.region() for c in contigs[:k]) + (", …" if len(contigs) > k else "")
+
 
 STANDARD_PLANES: dict[str, dict] = {
     "ref": {"dtype": "uint8", "photometric": "palette", "missing": None},
@@ -164,6 +213,39 @@ def check_contig_name(name: str) -> None:
         raise GpxilFormatError(f"contig name {name!r} must be non-empty printable ASCII without whitespace")
 
 
+def _whole_number(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def check_window(name: str, length: int, window, aliases: Iterable[str] = ()) -> dict:
+    """A window's ``window`` key (spec 3.1, 9.3), checked: its parent named, its start a whole number, the window
+    inside the parent, and none of its names the parent's. Returns it; raises GpxilFormatError."""
+    if not isinstance(window, dict):
+        raise GpxilFormatError(f"contig {name}: 'window' must be an object, with 'of' and 'start'")
+    of, start, plen = window.get("of"), window.get("start"), window.get("length")
+    if not isinstance(of, str) or not _CONTIG_NAME.match(of):
+        raise GpxilFormatError(f"window {name}: 'of' must name its parent, in printable ASCII without whitespace")
+    if not _whole_number(start) or start < 0:
+        raise GpxilFormatError(f"window {name}: 'start' must be a whole number, 0 or more (got {start!r})")
+    if plen is not None and (not _whole_number(plen) or plen < 1):
+        raise GpxilFormatError(f"window {name}: the parent's 'length' must be a whole number, 1 or more (got {plen!r})")
+    if plen is not None and start + length > plen:
+        raise GpxilFormatError(f"window {name} runs past the end of {of}: {start:,} + {length:,} bases > {plen:,}")
+    others = window.get("aliases", [])
+    if not isinstance(others, list) or not all(isinstance(a, str) for a in others):
+        raise GpxilFormatError(f"window {name}: the parent's 'aliases' must be a list of names")
+    for k in ("md5", "refget"):
+        if k in window and not isinstance(window[k], str):
+            raise GpxilFormatError(f"window {name}: the parent's {k!r} must be a string")
+    parent = {of, *others}
+    if name in parent:
+        raise GpxilFormatError(f"window {name}: its name is its parent's; a window needs a name of its own, such as {of}:FIRST-LAST")
+    clash = sorted(parent & set(aliases))
+    if clash:
+        raise GpxilFormatError(f"window {name}: its other names can't be its parent's ({', '.join(clash)})")
+    return window
+
+
 def plane_dtype(name: str, arr: np.ndarray | None = None) -> np.dtype:
     if name in STANDARD_PLANES:
         return np.dtype(STANDARD_PLANES[name]["dtype"])
@@ -219,14 +301,23 @@ def _stored_strip_bytes(page):
         i = j
 
 
-def _several_phase_sets(contig) -> bool:
-    """True if a contig's ps plane holds more than one phase set (from its metadata, or by reading the plane)."""
+def _identified(entry: dict) -> bool:
+    """Whether a contig entry identifies its reference sequence without a ref plane: its own digest, or (a window)
+    its parent's (spec 3, rule 1)."""
+    win = entry.get("window") if isinstance(entry.get("window"), dict) else {}
+    return bool(entry.get("md5") or entry.get("refget") or win.get("md5") or win.get("refget"))
+
+
+def _several_phase_sets(contig, start: int = 0, end: int | None = None) -> bool:
+    """True if a contig's ps plane holds more than one phase set (from its metadata, or by reading the plane), over
+    all of it or over ``[start, end)``."""
+    end = contig.length if end is None else end
     known = contig.entry.get("phase_sets")
-    if isinstance(known, int):
+    if isinstance(known, int) and (known <= 1 or (start, end) == (0, contig.length)):
         return known > 1
     seen: set[int] = set()
-    for s in range(0, contig.length, 1 << 24):
-        seen.update(int(v) for v in np.unique(contig.read("ps", s, min(contig.length, s + (1 << 24)))) if v)
+    for s in range(start, end, 1 << 24):
+        seen.update(int(v) for v in np.unique(contig.read("ps", s, min(end, s + (1 << 24)))) if v)
         if len(seen) > 1:
             return True
     return False
@@ -246,6 +337,12 @@ def decode_sidecar(blob: bytes) -> list[SidecarEntry]:
         off, hap, kind, data = line.split("\t", 3)
         out.append(SidecarEntry(int(off), int(hap), kind, data))
     return out
+
+
+def _window_sidecar(src, start: int, end: int) -> list[SidecarEntry]:
+    """The sidecar of a window cut out of ``src`` at ``[start, end)`` (spec 3.1)."""
+    first = int(src.read("gt", start, start + 1)[0]) if start > 0 and "gt" in src.pages else None
+    return window_entries(src.sidecar(), start, end, first)
 
 
 # --------------------------------------------------------------------- writer
@@ -377,6 +474,13 @@ class GpxilWriter:
             raise GpxilFormatError(f"contig {name!r}: planes {bad} differ from length {length}")
         if length < 1:
             raise GpxilFormatError(f"contig {name!r} is empty; contigs must have at least one base")
+        if "window" in extra:
+            self._check_window(name, length, extra["window"], extra.get("aliases", ()))
+            if "ref" not in planes and not _identified(extra):
+                raise GpxilFormatError(
+                    f"window {name!r}: without its ref plane a window needs the md5 or refget digest of its own"
+                    " sequence, or of its parent's (sections 3 and 3.1)"
+                )
         if sidecar and "gt" not in planes:
             raise GpxilFormatError("a sidecar is stored with the gt plane, which is missing")
         if "gt" in planes and "flags" not in planes:
@@ -414,6 +518,13 @@ class GpxilWriter:
         self.contigs.append(info)
         self._names.add(name)
         return info
+
+    def _check_window(self, name: str, length: int, window, aliases=()) -> None:
+        if version_key(self.version) < version_key(WINDOW_VERSION):
+            raise GpxilFormatError(
+                f"window {name}: windows came with gpxil {WINDOW_VERSION}, and this file is being written as gpxil {self.version}"
+            )
+        check_window(name, length, window, aliases)
 
     def _rows_per_strip(self, rows: int, width: int, dt: np.dtype) -> int:
         return max(1, min(rows, self.strip_bytes // max(1, width * dt.itemsize)))
@@ -474,19 +585,10 @@ class GpxilWriter:
         check_contig_name(name)
         if name in self._names:
             raise GpxilFormatError(f"duplicate contig name {name!r}")
-        want = sort_planes(src.planes if planes is None else dict.fromkeys(planes))
-        if not want:
-            raise GpxilFormatError(f"contig {name!r}: no planes to copy")
-        for p in want:
-            if not src.has(p):
-                src._page(p)  # raises MissingPlaneError, saying how to give a missing reference
-        if "gt" in want and "flags" not in want:
-            raise GpxilFormatError(f"contig {name!r}: a gt plane needs its flags plane (section 3)")
-        if "gt" not in want and any(p in want for p in ("gq", "dp", "ps")):
-            raise GpxilFormatError(f"contig {name!r}: gq, dp and ps planes need the gt plane (section 3)")
-        if "gt" in want and not (isinstance(self.sample, dict) and self.sample.get("id")):
-            raise GpxilFormatError("a gt plane describes a sample: give GpxilWriter(sample={'id': ...})")
-        if "ref" not in want and not (src.entry.get("md5") or src.entry.get("refget")):
+        if src.window is not None:
+            self._check_window(name, length, src.window, src.entry.get("aliases", ()))
+        want = self._planes_wanted(src, planes, name)
+        if "ref" not in want and not _identified(src.entry):
             raise GpxilFormatError(
                 f"contig {name!r}: without its ref plane a contig needs the md5 or refget digest of its reference (section 3)"
             )
@@ -540,23 +642,151 @@ class GpxilWriter:
         self._names.add(name)
         return info
 
-    def _encoded_strips(self, src: Contig, plane: str, dt: np.dtype, rps: int):
-        """The plane's strips, read from the source a strip's worth of rows at a time and encoded."""
+    def _planes_wanted(self, src: Contig, planes: Iterable[str] | None, name: str) -> list[str]:
+        """The planes to write of a contig copied or cut, checked against the rules of section 3."""
+        want = sort_planes(src.planes if planes is None else dict.fromkeys(planes))
+        if not want:
+            raise GpxilFormatError(f"contig {name!r}: no planes to copy")
+        for p in want:
+            if not src.has(p):
+                src._page(p)  # raises MissingPlaneError, saying how to give a missing reference
+        if "gt" in want and "flags" not in want:
+            raise GpxilFormatError(f"contig {name!r}: a gt plane needs its flags plane (section 3)")
+        if "gt" not in want and any(p in want for p in ("gq", "dp", "ps")):
+            raise GpxilFormatError(f"contig {name!r}: gq, dp and ps planes need the gt plane (section 3)")
+        if "gt" in want and not (isinstance(self.sample, dict) and self.sample.get("id")):
+            raise GpxilFormatError("a gt plane describes a sample: give GpxilWriter(sample={'id': ...})")
+        return want
+
+    def cut_contig(self, src: Contig, start: int, end: int, planes: Iterable[str] | None = None, *, name: str | None = None) -> ContigInfo:
+        """Write a window (spec 3.1): offsets ``[start, end)`` of a contig of an open gpxil file, whole or itself a window.
+
+        The planes are read and encoded a strip at a time, so the source can be a whole genome on the web. The
+        sidecar entries at ``[start, end)`` are kept, at the window's offsets. The window names its parent (the
+        source's parent, if the source is a window) and where in it it starts, and is named, unless ``name`` is
+        given, after the region it holds in its parent: ``chr17:7561779-7787546``. Its own digests are worked out
+        when its bases can be read (a ref plane, or a reference attached to the source); its parent's are copied.
+        Of the source's metadata, it keeps what holds for a stretch too: what the counts of a conversion and the
+        callable bases were, it can't tell.
+        """
+        if self._closed:
+            raise RuntimeError("writer is closed")
+        if not (0 <= start < end <= src.length):
+            raise IndexError(f"{src.name}: {start:,}-{end:,} is outside 0-{src.length:,}")
+        if src.window is None and (start, end) == (0, src.length):
+            raise GpxilFormatError(f"a window of all of {src.name} would be {src.name} itself: copy the contig instead")
+        n = end - start
+        name = name or region_text(src.parent, src.start + start, src.start + end)
+        check_contig_name(name)
+        if name in self._names:
+            raise GpxilFormatError(f"duplicate contig name {name!r}")
+        win: dict = {"of": src.parent, "start": src.start + start}
+        if src.parent_length is not None:
+            win["length"] = src.parent_length
+        win.update(src.parent_digests())
+        if src.parent_aliases:
+            win["aliases"] = list(src.parent_aliases)
+        self._check_window(name, n, win)
+        want = self._planes_wanted(src, planes, name)
+        if "gt" in want and "ps" in src.pages and "ps" not in want and _several_phase_sets(src, start, end):
+            raise GpxilFormatError(
+                f"{src.region(start, end)} has more than one phase set: without the ps plane its phased calls would read"
+                " as one phase set (section 5.5), so keep ps"
+            )
+        readable = src.has("ref")
+        if not readable and not _identified({"window": win}):
+            raise GpxilFormatError(
+                f"{src.name} has no reference plane and no digest of its sequence, so a window of it couldn't be"
+                " identified: give the reference (--reference)"
+            )
+        w = self.width
+        rows = rows_for(n, w)
+        dts = {p: (plane_dtype(p, np.zeros(0, dtype=src._page(p).dtype)) if p.startswith("x-") else plane_dtype(p)) for p in want}
+        if not codec_available(self.compression):
+            raise GpxilFormatError(_no_codec_message(self.compression))
+        from .fasta import SequenceDigester
+
+        size = sum(rows * w * dt.itemsize for dt in dts.values())
+        if not self.bigtiff and self._tw.filehandle.tell() + size > CLASSIC_TIFF_LIMIT:
+            if self._auto_bigtiff:
+                raise BigTiffNeeded(f"{self.path} may pass 4 GiB")
+            raise GpxilFormatError(f"{self.path} may pass 4 GiB: write it with bigtiff=True")
+        # what the window's entry says of its own bases, worked out as its planes are written
+        digester = SequenceDigester() if readable else None
+        seen = {"absent2": 0, "ps": set()}
+
+        def watch(plane):
+            if plane == "ref":
+                return digester.update
+            if plane == "gt":
+                return lambda v: seen.__setitem__("absent2", seen["absent2"] + int(np.count_nonzero((v & 0x0F) == C.HAP_ABSENT)))
+            if plane == "ps":
+                return lambda v: seen["ps"].update(np.unique(v[v != 0]).tolist())
+            return None
+
+        side = _window_sidecar(src, start, end) if "gt" in want else []
+        pages: dict[str, int] = {}
+        self.last_copy = {"stored": 0, "encoded": len(want)}
+        for p in want:
+            dt = dts[p]
+            self._check_dtype(p, dt)
+            rps = self._rows_per_strip(rows, w, dt)
+            strips = self._window_strips(src, p, dt, rps, start, end, w, watch(p))
+            blob = encode_sidecar(side) if p == "gt" and side else None
+            kwargs = self._page_kwargs(name, p, n, rps, blob)
+            kwargs.pop("compressionargs", None)  # (the strips arrive encoded)
+            self._tw.write(strips, shape=(rows, w), dtype=dt, **kwargs)
+            pages[p] = self._page
+            self._page += 1
+        if digester is not None and "ref" not in pages:  # (not written, but its bases can be read: for the digests)
+            for s in range(start, end, 1 << 24):
+                digester.update(src.read("ref", s, min(end, s + (1 << 24))))
+        extra: dict = {k: src.entry[k] for k in ("vcf_contig", "invalid_characters_converted_to_N") if k in src.entry}
+        if digester is not None:
+            extra.update(digester.result())
+        extra["window"] = win
+        if "gt" in pages:
+            extra["ploidy"] = 1 if seen["absent2"] == n else 2 if seen["absent2"] == 0 else "mixed"
+        if "ps" in pages:
+            extra["phase_sets"] = len(seen["ps"])
+            ids = src.entry.get("phase_set_ids")
+            if isinstance(ids, dict):
+                kept = {k: v for k, v in ids.items() if str(k).isdigit() and int(k) in seen["ps"]}
+                if kept:
+                    extra["phase_set_ids"] = kept
+        if side:
+            extra["sidecar_entries"] = len(side)
+        info = ContigInfo(name=name, length=n, width=w, pages=pages, extra=extra)
+        self.contigs.append(info)
+        self._names.add(name)
+        return info
+
+    def _window_strips(self, src: Contig, plane: str, dt: np.dtype, rps: int, start: int, end: int, w: int, watch=None):
+        """The strips of a plane over ``[start, end)`` of a contig, in rows of ``w``, read a strip's worth at a time
+        and encoded; ``watch`` sees each piece of values."""
         from tifffile import TIFF
 
-        w, rows, n = src.width, src.rows, src.length
+        n = end - start
+        rows = rows_for(n, w)
         order = self._tw.tiff.byteorder
         code = COMPRESSION_TAGS[self.compression][0]
         args = {} if self._level is None else {"level": self._level}
         for r0 in range(0, rows, rps):
             r1 = min(rows, r0 + rps)
             a, b = r0 * w, min(n, r1 * w)
+            vals = src.read(plane, start + a, start + b)
+            if watch is not None:
+                watch(vals)
             buf = np.zeros((r1 - r0) * w, dtype=dt.newbyteorder(order))
-            buf[: b - a] = src.read(plane, a, b)
+            buf[: b - a] = vals
             if code == 1:
                 yield buf.tobytes()
             else:
                 yield bytes(TIFF.COMPRESSORS[code](buf.reshape(r1 - r0, w), **args))
+
+    def _encoded_strips(self, src: Contig, plane: str, dt: np.dtype, rps: int):
+        """The plane's strips, read from the source a strip's worth of rows at a time and encoded."""
+        return self._window_strips(src, plane, dt, rps, 0, src.length, src.width)
 
     def metadata(self) -> dict:
         planes = {}
@@ -608,9 +838,53 @@ class Contig:
         self.width: int = int(entry.get("width") or gfile.metadata["layout"]["width"])
         self.rows: int = rows_for(self.length, self.width)
         self.pages: dict[str, int] = {k: int(v) for k, v in entry["pages"].items()}
+        #: for a window (spec 3.1), its ``window`` key: the parent, and where the window starts in it; else None
+        self.window: dict | None = (
+            check_window(self.name, self.length, entry["window"], entry.get("aliases", ())) if "window" in entry else None
+        )
 
     def __repr__(self) -> str:
-        return f"<Contig {self.name} length={self.length} planes={list(self.pages)}>"
+        where = f" window of {self.parent} at {self.start + 1:,}-{self.end:,}" if self.window else ""
+        return f"<Contig {self.name} length={self.length}{where} planes={list(self.pages)}>"
+
+    # where the contig lies in its sequence: for a window, its parent (spec 3.1); for a whole contig, itself
+    @property
+    def parent(self) -> str:
+        """The name of the sequence this contig holds bases of: a window's parent, or the contig itself."""
+        return self.window["of"] if self.window else self.name
+
+    @property
+    def start(self) -> int:
+        """The offset in :attr:`parent` of this contig's offset 0 (0 for a whole contig)."""
+        return int(self.window["start"]) if self.window else 0
+
+    @property
+    def end(self) -> int:
+        """The offset in :attr:`parent` just past this contig's last base."""
+        return self.start + self.length
+
+    @property
+    def parent_length(self) -> int | None:
+        """The length of :attr:`parent`, if known (a window may not say)."""
+        if self.window is None:
+            return self.length
+        n = self.window.get("length")
+        return int(n) if n is not None else None
+
+    @property
+    def parent_aliases(self) -> list[str]:
+        """The other names of :attr:`parent`."""
+        return list((self.window or self.entry).get("aliases", []))
+
+    def parent_digests(self) -> dict:
+        """The md5 and refget of :attr:`parent`, those known."""
+        src = self.window or self.entry
+        return {k: src[k] for k in ("md5", "refget") if isinstance(src.get(k), str)}
+
+    def region(self, start: int = 0, end: int | None = None, *, commas: bool = True) -> str:
+        """Offsets ``[start, end)`` of this contig as a region of :attr:`parent`, 1-based: 'chr17:7,661,779-7,687,546'."""
+        end = self.length if end is None else end
+        return region_text(self.parent, self.start + start, self.start + end, commas=commas)
 
     @property
     def planes(self) -> list[str]:
@@ -620,49 +894,95 @@ class Contig:
         """True if the plane is stored, or is ``ref`` and a reference (FASTA or gpxil) is attached."""
         return plane in self.pages or (plane == "ref" and self._g._reference_path is not None)
 
-    def _reference_contig(self) -> Contig:
-        """The matching contig of an attached gpxil reference, checked against this contig's digests."""
+    def _names_in_reference(self) -> list[str]:
+        """The names the sequence this contig holds bases of may have in a reference: its own and its other names,
+        each with and without 'chr'."""
+        out: list[str] = []
+        for n in (self.parent, *self.parent_aliases):
+            out += [n, "chr" + n, n.removeprefix("chr")]
+        return list(dict.fromkeys(out))
+
+    def _reference_contig(self) -> tuple[Contig, int]:
+        """The contig of an attached gpxil reference that holds this contig's bases, checked against its digests,
+        and the offset there of this contig's offset 0. For a window, the reference can hold its parent, or a window
+        of the parent that holds all of this one."""
         cached = self._g._ref_contigs.get(self.name)
         if cached is not None:
             return cached
         ref = self._g._reference_gpxil()
-        for n in (self.name, *self.entry.get("aliases", [])):
-            for cand in (n, "chr" + n, n.removeprefix("chr")):
-                if cand in ref:
-                    rc = ref[cand]
-                    if rc.length != self.length:
-                        raise GpxilFormatError(f"{rc.name} in {ref.path} has length {rc.length}, not {self.length}")
-                    if "ref" not in rc.pages:
-                        raise GpxilFormatError(f"{rc.name} in {ref.path} has no reference plane either")
-                    for k in ("md5", "refget"):
-                        if k in self.entry and k in rc.entry and self.entry[k] != rc.entry[k]:
-                            raise GpxilFormatError(f"{rc.name} in {ref.path} does not match the {k} of {self.name}")
-                    self._g._ref_contigs[self.name] = rc
-                    return rc
-        raise GpxilFormatError(f"{self.name} not found in {ref.path}")
+        for cand in self._names_in_reference():
+            try:
+                rc, s, e = ref.locate(cand, self.start, self.end) if self.window else (ref[cand], 0, None)
+            except (KeyError, IndexError):
+                continue
+            where = f"{rc.name} in {ref.path}"
+            if self.window is None and rc.length != self.length:
+                raise GpxilFormatError(f"{where} has length {rc.length}, not {self.length}")
+            if "ref" not in rc.pages:
+                raise GpxilFormatError(f"{where} has no reference plane either")
+            n, theirs = self.parent_length, rc.parent_length
+            if n is not None and theirs is not None and n != theirs:
+                raise GpxilFormatError(f"{rc.parent} in {ref.path} has length {theirs:,}, not the {n:,} of {self.parent}")
+            mine, theirs = self.parent_digests(), rc.parent_digests()
+            for k in ("md5", "refget"):
+                if k in mine and k in theirs and mine[k] != theirs[k]:
+                    raise GpxilFormatError(f"{where} does not match the {k} of {self.parent}")
+            if self.window and not (set(mine) & set(theirs)):
+                # (no digest of the parent to compare: the window's own bases are checked against its own digests)
+                self._check_own_digests(rc.read("ref", s, s + self.length), where)
+            self._g._ref_contigs[self.name] = (rc, s)
+            return rc, s
+        raise GpxilFormatError(f"{self.region() if self.window else self.name} not found in {ref.path}")
+
+    def _check_own_digests(self, codes: np.ndarray, where: str) -> None:
+        from .fasta import sequence_digests
+
+        own = {k: self.entry[k] for k in ("md5", "refget") if isinstance(self.entry.get(k), str)}
+        if not own:
+            return
+        dig = sequence_digests(codes)
+        for k, v in own.items():
+            if dig[k] != v:
+                raise GpxilFormatError(f"{where} does not match the {k} of {self.name}")
 
     def _external_ref(self) -> np.ndarray:
-        """The reference of a contig stored without a ref plane, from the attached FASTA."""
+        """The reference of a contig stored without a ref plane, from the attached FASTA (for a window, the stretch
+        of its parent it holds). The last sequence read is kept, so a file's windows of one chromosome read it once;
+        each contig is checked against its digests the first time."""
         if self._g._reference_is_gpxil:
-            return self._reference_contig().read("ref")
-        cached = self._g._ref_cache
-        if cached is not None and cached[0] == self.name:
-            return cached[1]
+            rc, s = self._reference_contig()
+            return rc.read("ref", s, s + self.length)
         from .fasta import iter_fasta, sequence_digests
 
-        names = set()
-        for n in (self.name, *self.entry.get("aliases", [])):
-            names |= {n, "chr" + n, n.removeprefix("chr")}
-        for rec in iter_fasta(self._g._reference_path, invalid="N", only=names):
-            if rec.length != self.length:
-                raise GpxilFormatError(f"{rec.name} in {self._g._reference_path} has length {rec.length}, not {self.length}")
-            dig = sequence_digests(rec.codes)
-            for k in ("md5", "refget"):
-                if k in self.entry and self.entry[k] != dig[k]:
-                    raise GpxilFormatError(f"{rec.name} in {self._g._reference_path} does not match the {k} of {self.name}")
-            self._g._ref_cache = (self.name, rec.codes)
-            return rec.codes
-        raise GpxilFormatError(f"{self.name} not found in {self._g._reference_path}")
+        names = self._names_in_reference()
+        path = self._g._reference_path
+        cached = self._g._ref_cache
+        if cached is not None and cached[0] in names:
+            rec_name, codes = cached
+        else:
+            records = iter_fasta(path, invalid="N", only=set(names))
+            try:
+                rec = next(records, None)
+            finally:
+                records.close()
+            if rec is None:
+                raise GpxilFormatError(f"{self.parent} not found in {path}")
+            rec_name, codes = rec.name, rec.codes
+            self._g._ref_cache = (rec_name, codes)
+        mine = codes if self.window is None else codes[self.start : self.end]
+        if self.name not in self._g._ref_checked:
+            n = self.parent_length
+            if (n is not None and len(codes) != n) or len(codes) < self.end:
+                raise GpxilFormatError(f"{rec_name} in {path} has length {len(codes):,}, not {n or self.length:,}")
+            if self.window is None or not any(isinstance(self.entry.get(k), str) for k in ("md5", "refget")):
+                dig = sequence_digests(codes)  # (a whole contig; or a window that gives only its parent's digests)
+                for k, v in self.parent_digests().items():
+                    if dig[k] != v:
+                        raise GpxilFormatError(f"{rec_name} in {path} does not match the {k} of {self.parent}")
+            else:
+                self._check_own_digests(mine, f"{rec_name} in {path}")
+            self._g._ref_checked.add(self.name)
+        return mine
 
     def _page(self, plane: str):
         if plane not in self.pages:
@@ -685,7 +1005,8 @@ class Contig:
             raise IndexError(f"{self.name}:{start}-{end} outside 0-{self.length}")
         if plane == "ref" and "ref" not in self.pages and self._g._reference_path is not None:
             if self._g._reference_is_gpxil:  # read just the region from the reference file
-                return self._reference_contig().read("ref", start, end)
+                rc, s = self._reference_contig()
+                return rc.read("ref", s + start, s + end)
             return self._external_ref()[start:end].copy()
         page = self._page(plane)
         if start == end:
@@ -748,8 +1069,9 @@ class GpxilFile:
         self._reference_path = None
         self._reference_is_gpxil = False
         self._ref_file: GpxilFile | None = None
-        self._ref_contigs: dict[str, Contig] = {}
-        self._ref_cache: tuple[str, np.ndarray] | None = None
+        self._ref_contigs: dict[str, tuple[Contig, int]] = {}
+        self._ref_cache: tuple[str, np.ndarray] | None = None  # (the FASTA record read last: its name and codes)
+        self._ref_checked: set[str] = set()  # (the contigs checked against the FASTA's digests)
         if reference is not None:
             self.attach_reference(reference)
         try:
@@ -812,6 +1134,7 @@ class GpxilFile:
         self._ref_file = None
         self._ref_contigs = {}
         self._ref_cache = None
+        self._ref_checked = set()
 
     def _reference_gpxil(self) -> GpxilFile:
         if self._ref_file is None:
@@ -838,6 +1161,61 @@ class GpxilFile:
         if name in self._aliases:
             return self._contigs[self._aliases[name]]
         raise KeyError(f"no contig {name!r} in {self.path}")
+
+    @property
+    def windows(self) -> list[Contig]:
+        """The file's windows (spec 3.1), in file order."""
+        return [c for c in self._contigs.values() if c.window is not None]
+
+    def windows_of(self, name: str) -> list[Contig]:
+        """The windows of the sequence ``name`` (their parent's name, or another name of it), in file order."""
+        return [c for c in self.windows if name == c.parent or name in c.parent_aliases]
+
+    def locate(self, name: str, start: int | None = None, end: int | None = None) -> tuple[Contig, int, int]:
+        """Where a region is: the contig that holds it, and the offsets ``[s, e)`` of the region there.
+
+        ``name`` names a contig, whole or a window, or a sequence that windows of the file hold (spec 3.1). ``start``
+        and ``end`` (0-based, the end excluded) are positions in the sequence, so on a window they are positions in
+        its parent, and a region of the parent is found in a window that holds all of it. Without them the region is
+        the whole contig: for a sequence that only windows hold, its window, if it has one only.
+        """
+        whole = end is None and not start
+        if name in self:
+            c = self[name]
+            if whole:
+                return c, 0, c.length
+            s = c.start if start is None else start
+            e = c.end if end is None else end
+            if not (c.start <= s < e <= c.end):
+                if c.window is None:
+                    raise IndexError(f"{region_text(name, s, e, commas=True)} is outside {c.name} (length {c.length:,})")
+                raise IndexError(
+                    f"{region_text(c.parent, s, e, commas=True)} is outside the window {c.name}, which holds {c.region()}"
+                    " (a window's positions are its parent's)"
+                )
+            return c, s - c.start, e - c.start
+        wins = self.windows_of(name)
+        if wins:
+            if whole:
+                if len(wins) == 1:
+                    return wins[0], 0, wins[0].length
+                raise KeyError(f"{path_name(self.path)} holds {len(wins)} windows of {name} ({_listed(wins)}): give one, or a region")
+            s = start or 0
+            # (a window of just that stretch, or else the first that holds it all)
+            exact = [w for w in wins if (w.start, w.end) == (s, end)]
+            for w in exact or wins:
+                if w.start <= s < w.end:
+                    e = w.end if end is None else end
+                    if e <= w.end:
+                        return w, s - w.start, e - w.start
+            e = s + 1 if end is None else end
+            raise IndexError(
+                f"{region_text(name, s, e, commas=True)} isn't all in a window of {path_name(self.path)}: it holds {_listed(wins)}"
+            )
+        if start is not None and end is not None and region_text(name, start, end) in self:
+            return self.locate(region_text(name, start, end))  # (a contig named like a region)
+        have = ", ".join(self.contigs[:8]) + (", …" if len(self) > 8 else "")
+        raise KeyError(f"no contig {name!r} in {self.path} (it has {have})")
 
 
 def open_gpxil(path, reference=None) -> GpxilFile:

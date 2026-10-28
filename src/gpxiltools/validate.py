@@ -20,13 +20,16 @@ from .container import (
     KNOWN_VERSIONS,
     SIDECAR_TAG,
     STANDARD_PLANES,
+    WINDOW_VERSION,
     GpxilFile,
     GpxilFormatError,
     _asarray,
     _decode,
+    _identified,
     decode_sidecar,
     rows_for,
     sort_planes,
+    version_key,
 )
 from .fasta import SequenceDigester
 
@@ -84,7 +87,8 @@ def _check_schema(meta: dict, rep: Report) -> None:
         return
     from importlib.resources import files
 
-    name = "gpxil-0.1.schema.json" if str(meta.get("gpxil")) == "0.1" else "gpxil-0.2.schema.json"
+    v = str(meta.get("gpxil"))
+    name = f"gpxil-{v}.schema.json" if v in ("0.1", "0.2") else "gpxil-0.3.schema.json"  # (0.3 for 0.3 and later)
     schema = json.loads(files("gpxiltools").joinpath("schema", name).read_text())
     for err in jsonschema.Draft202012Validator(schema).iter_errors(meta):
         where = "/".join(str(p) for p in err.absolute_path) or "(top level)"
@@ -116,6 +120,7 @@ def validate(path, *, check_digests: bool = True, chunk: int = CHUNK) -> Report:
         seen_pages: dict[int, tuple[str, str]] = {}
         for entry in entries:
             _check_contig(g, entry, rep, seen_pages, n_pages, check_digests, chunk)
+        _check_windows(g, rep, chunk)
         unclaimed = [i for i in range(n_pages) if i not in seen_pages]
         if unclaimed:
             rep.warn(f"pages not listed in metadata (ignored by readers): {unclaimed[:10]}")
@@ -234,8 +239,11 @@ def _check_contig(g: GpxilFile, entry: dict, rep: Report, seen_pages: dict, n_pa
     extra = [p for p in ("gq", "dp", "ps") if p in contig.pages]
     if extra and "gt" not in contig.pages:
         rep.error(f"{name}: {', '.join(extra)} without a gt plane (section 3)")
-    if "ref" not in contig.pages and not entry.get("md5") and not entry.get("refget"):
-        rep.error(f"{name}: no ref plane and no md5/refget digest identifying the reference")
+    if "ref" not in contig.pages and not _identified(entry):
+        rep.error(
+            f"{name}: no ref plane and no md5/refget digest identifying the reference"
+            + (" (its own or its parent's)" if contig.window else "")
+        )
 
     # sidecar
     side = []
@@ -354,3 +362,43 @@ def _check_contig(g: GpxilFile, entry: dict, rep: Report, seen_pages: dict, n_pa
     if stale_complex:
         rep.warn(f"{name}: {len(stale_complex)} COMPLEX sidecar entries are on bases that are not COMPLEX, e.g. {stale_complex[:3]}")
     rep.checked.append(name)
+
+
+def _check_windows(g: GpxilFile, rep: Report, chunk: int) -> None:
+    """Windows (section 3.1): the file's version, parents that are windows, and windows of a parent the file also
+    holds, which must hold what it holds over their stretch."""
+    wins = g.windows
+    if not wins:
+        return
+    version = str(g.metadata.get("gpxil"))
+    if version_key(version) < version_key(WINDOW_VERSION):
+        rep.error(f"the file holds windows, which came with gpxil {WINDOW_VERSION}, but says it is gpxil {version} (sections 3.1, 9.1)")
+    for w in wins:
+        if w.parent not in g:
+            continue
+        p = g[w.parent]
+        if p.window is not None:
+            rep.error(f"window {w.name}: its parent {w.parent} is a window too; a window names the sequence it is cut from (section 3.1)")
+            continue
+        if w.parent_length is not None and w.parent_length != p.length:
+            rep.error(f"window {w.name}: says {w.parent} has {w.parent_length:,} bases, but {p.name} in this file has {p.length:,}")
+            continue
+        if w.end > p.length:
+            rep.error(f"window {w.name} runs past the end of {p.name} ({p.length:,} bases)")
+            continue
+        for k, v in w.parent_digests().items():
+            if k in p.entry and p.entry[k] != v:
+                rep.error(f"window {w.name}: the {k} it gives for {w.parent} is not that of {p.name} in this file")
+        for plane in sorted(set(w.pages) & set(p.pages)):
+            for s in range(0, w.length, chunk):
+                e = min(w.length, s + chunk)
+                if not np.array_equal(w.read(plane, s, e), p.read(plane, w.start + s, w.start + e)):
+                    rep.error(f"window {w.name}: its {plane} plane differs from that of {p.name} over the same bases (section 3.1)")
+                    break
+        if "gt" in w.pages and "gt" in p.pages:
+            theirs = {(e.offset - w.start, e.hap, e.kind, e.data) for e in p.sidecar() if w.start <= e.offset < w.end}
+            # (a COMPLEX entry at offset 0 that the parent has before the window starts its run there: section 3.1)
+            mine = {(e.offset, e.hap, e.kind, e.data) for e in w.sidecar() if not (e.offset == 0 and e.kind == "COMPLEX")}
+            theirs = {x for x in theirs if not (x[0] == 0 and x[2] == "COMPLEX")}
+            if mine != theirs:
+                rep.error(f"window {w.name}: its sidecar differs from that of {p.name} over the same bases (section 3.1)")

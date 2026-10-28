@@ -103,7 +103,7 @@ test("every plane of every file reads as gpxiltools reads it, from bytes, a Blob
   }
 });
 
-test("windows: across rows and strips, clipped at either end, by alias", async () => {
+test("intervals: across rows and strips, clipped at either end, by alias", async () => {
   const r = rng(11);
   for (const [name, want] of Object.entries(expected.good)) {
     const g = await R.open(SOURCES.url(want.file));
@@ -138,6 +138,66 @@ test("windows: across rows and strips, clipped at either end, by alias", async (
   assert.equal(g.contig("chr7"), null);
   await assert.rejects(g.read("chr9", "gt", 0, 10), { code: "contig" });
   await assert.rejects(g.read("chrM", "gt", 0, 10), { code: "plane" });
+});
+
+test("windows (section 3.1): where they lie in their sequence, and regions found in them as gpxiltools finds them", async () => {
+  const where = (x) => [x.contig.name, x.start, x.end];
+  for (const name of ["windows", "windows-noref"]) {
+    const want = expected.good[name];
+    const g = await R.open(SOURCES.url(want.file));
+    for (const c of want.contigs) {
+      const got = g.contig(c.name);
+      assert.deepEqual([got.parent, got.start, got.end], [c.parent, c.start, c.start + c.length], `${name} ${c.name}`);
+      if (!c.window) assert.equal(got.window, null);
+      else {
+        const w = c.window;
+        assert.deepEqual(got.window, { of: w.of, start: w.start, length: w.length, md5: w.md5, refget: w.refget, aliases: w.aliases });
+        assert.equal(got.parentLength, w.length);
+        assert.deepEqual(got.parentAliases, w.aliases);
+      }
+    }
+    assert.equal(g.version, "0.3");
+  }
+  const g = await R.open(SOURCES.bytes(expected.good.windows.file));
+  assert.deepEqual(
+    g.windows.map((c) => c.name),
+    ["chr1:1-500", "chr1:30001-34000", "chr1:33001-40000", "chr2:501-2000"],
+  );
+  assert.deepEqual(
+    g.windowsOf("1").map((c) => c.name),
+    ["chr1:1-500", "chr1:30001-34000", "chr1:33001-40000"],
+  );
+  for (const k of expected.locate) {
+    const [name, s, e] = k.ask;
+    const args = s === null ? [name] : [name, s, e];
+    if (k.error) assert.throws(() => g.locate(...args), { code: k.error }, JSON.stringify(k.ask));
+    else assert.deepEqual(where(g.locate(...args)), [k.contig, k.start, k.end], JSON.stringify(k.ask));
+  }
+  // the same, written as text: a region; a window's name; a window's name and a region; one base
+  assert.deepEqual(where(g.locate("chr1:33,501-33,600")), ["chr1:30001-34000", 3500, 3600]);
+  assert.deepEqual(where(g.locate("chr1:30001-34000")), ["chr1:30001-34000", 0, 4000]);
+  assert.deepEqual(where(g.locate("chr1:30001-34000:30,006-30,010")), ["chr1:30001-34000", 5, 10]);
+  assert.deepEqual(where(g.locate("chr2:601")), ["chr2:501-2000", 100, 101]);
+  assert.throws(() => g.locate("chr1:10-5"), { code: "region" });
+  // the bases a window holds are those of the whole contig there
+  const whole = await R.open(SOURCES.bytes(expected.good.strips.file));
+  const at = g.locate("chr1", 33500, 33600);
+  for (const plane of ["ref", "gt", "flags", "ps", "x-frac"])
+    assert.deepEqual(await g.read(at.contig, plane, at.start, at.end), await whole.read("chr1", plane, 33500, 33600), plane);
+  // its sidecar is the whole contig's there: chr2's COMPLEX allele at 501 is the window's first base
+  const side = await g.sidecar("chr2:501-2000");
+  assert.deepEqual(
+    side.filter((x) => x.kind === "COMPLEX"),
+    (await whole.sidecar("chr2")).filter((x) => x.kind === "COMPLEX").map((x) => ({ ...x, offset: x.offset - 500 })),
+  );
+  assert.equal(side[0].offset, 0);
+  assert.deepEqual(R.parseRegion("chr17:7,661,779-7,687,546"), { name: "chr17", start: 7661778, end: 7687546 });
+  assert.deepEqual(R.parseRegion(" chr17 "), { name: "chr17" });
+  assert.deepEqual(R.parseRegion("chr17:7561779-7787546:7,600,001"), { name: "chr17:7561779-7787546", start: 7600000, end: 7600001 });
+  assert.equal(R.parseRegion("chr1:0-5"), null);
+  assert.equal(R.parseRegion(""), null);
+  assert.equal(R.regionText(g.contig("chr1:30001-34000"), 5, 10), "chr1:30,006-30,010");
+  assert.equal(R.regionText(g.contig("chrM")), "chrM:1-997");
 });
 
 test("pages by the offset of their directory, as the Gpxil browser finds them", async () => {
@@ -277,13 +337,13 @@ test("it loads as a classic script, as an ES module and with require()", async (
   const ctx = vm.createContext({});
   vm.runInContext(code, ctx);
   assert.equal(typeof ctx.GpxilRead.open, "function");
-  assert.equal(ctx.GpxilRead.SPEC, "0.2");
+  assert.equal(ctx.GpxilRead.SPEC, "0.3");
   const mjs = path.join(OUT, "gpxil-read.mjs");
   fs.writeFileSync(mjs, code);
   delete globalThis.GpxilRead;
   await import(pathToFileURL(mjs).href);
   assert.equal(typeof globalThis.GpxilRead.open, "function");
-  assert.equal(R.SPEC, "0.2");
+  assert.equal(R.SPEC, "0.3");
 });
 
 test("what the codes mean", () => {

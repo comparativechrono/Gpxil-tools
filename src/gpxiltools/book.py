@@ -247,7 +247,7 @@ def make_book(
         images[key] = pdf.image(stripe, cs_name)
         y = top - i * (bar_h + gap)
         bw = bar_w_max * contig.length / longest
-        c.text(m, y + bar_h * 0.2, name[:12], min(8, bar_h * 0.8), grey=0.25)
+        c.text(m, y + bar_h * 0.2, contig.parent[:12], min(8, bar_h * 0.8), grey=0.25)
         c.image(key, m + 50, y, bw, bar_h)
     c.text_centre(W / 2, m + 12, f"gpxil {gfile.metadata.get('gpxil')} · gpxiltools {__version__}", 7, grey=0.5)
     footer(c)
@@ -298,8 +298,12 @@ def make_book(
     for name in names:
         contig = gfile[name]
         c = _Content()
-        c.text_centre(W / 2, H / 2 + 20, name, 40, bold=True)
-        c.text_centre(W / 2, H / 2 - 10, f"{contig.length:,} bases", 12, grey=0.3)
+        # (a window, spec 3.1: titled by its parent, with the stretch it holds; positions are the parent's)
+        c.text_centre(W / 2, H / 2 + 20, contig.parent, 40, bold=True)
+        if contig.window is not None:
+            c.text_centre(W / 2, H / 2 - 10, f"{contig.start + 1:,} – {contig.end:,}: {contig.length:,} bases", 12, grey=0.3)
+        else:
+            c.text_centre(W / 2, H / 2 - 10, f"{contig.length:,} bases", 12, grey=0.3)
         n_pages = math.ceil(contig.length / per_page)
         c.text_centre(W / 2, H / 2 - 28, f"{n_pages} page{'s' if n_pages != 1 else ''}", 10, grey=0.4)
         footer(c)
@@ -319,8 +323,8 @@ def make_book(
             iw = bpr * dot
             ih = rows_px * dot
             c = _Content()
-            c.text(m, H - m - 10, f"{name}", 9, bold=True)
-            label = f"{s + 1:,} – {e:,}"
+            c.text(m, H - m - 10, contig.parent, 9, bold=True)
+            label = f"{contig.start + s + 1:,} – {contig.start + e:,}"
             c.text(W - m - text_width(label, 9), H - m - 10, label, 9, grey=0.25)
             c.image("Im", m, H - m - layout.header_pt - ih, iw, ih)
             footer(c)

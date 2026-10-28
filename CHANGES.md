@@ -1,5 +1,65 @@
 # Changes
 
+## 0.7.0 (28 October 2026)
+
+Version 0.3 of the specification: windows.
+
+- **Windows** (specification section 3.1): a contig can hold a stretch of a
+  longer sequence, its parent, and say where in it the stretch lies, so that
+  a gene and its surroundings travel in a file of a few kilobytes and keep
+  the chromosome's positions. TP53 and 100 kb either side, out of HG002's
+  chromosome 17, is 76 kB (12 kB without the reference plane), against
+  24.6 MB for the chromosome. A window holds what the whole chromosome's
+  planes hold over its stretch; it is named after the region it holds
+  (`chr17:7561779-7787546`), and its metadata entry's `window` key names the
+  parent, where the window starts in it, and the parent's length, digests
+  and other names.
+- **`gpxil subset FILE chr17:7,561,779-7,787,546`** cuts a window out of a
+  whole contig, or out of another window, reading and encoding again a strip
+  at a time, so it works on a whole genome on the web in a second or two. A
+  contig or a window named whole is copied as it is stored, as before; the
+  name of a sequence that a file holds windows of copies them all. A file
+  with windows is gpxil 0.3, and its `subset` record gives the version of the
+  file it copied, whose rules its planes follow.
+- **`gpxil encode --region chr17:7,561,779-7,787,546`** (repeatable) makes
+  windows straight from a VCF, converting only the calls that join up with
+  the window through overlapping spans, over the stretch they cover: which
+  gives what converting the whole chromosome would. Checked against cutting
+  the same windows out of whole chromosomes, on 41 windows of HG002's
+  chromosome 17 whose edges cut deletions and insertions, and on dense
+  simulated calls of every kind (overlapping indels, symbolic deletions and
+  inversions, breakends, reference blocks, `*` alleles, haploid and missing
+  genotypes, phase sets): the planes and sidecars are the same, base for
+  base. Only phase-set values that stand for identifiers other than numbers
+  can be numbered differently (`phase_set_ids` gives them). Only the
+  contigs asked for (with `--contigs` too) are taken out of the VCF.
+- **Positions on a window are its parent's, in every command**:
+  `GpxilFile.locate(name, start, end)` finds a region of a sequence in the
+  contig that holds it (a window of just that stretch, or the first that
+  holds it all), so `stats`, `render`, `fasta`, `vcf` and `compare` take
+  `chr17:7,661,779-7,687,546` on a window file. `gpxil vcf` writes a
+  window's records with the parent as `CHROM` and its positions; a file's
+  windows of one sequence, overlapping or not, make one sorted stretch of
+  records, each once. `gpxil compare` compares whole chromosomes with
+  windows, and windows with windows, where they overlap. `gpxil info`,
+  `render`, `book` and `stats` label windows by their parent's positions.
+  `Contig.window`, `.parent`, `.start`, `.end`, `.region()`, and
+  `GpxilFile.windows` and `.windows_of()` say where contigs lie. A name ends
+  at the last colon of a region, so a window's name can carry a region:
+  `chr17:7561779-7787546:7,661,779-7,687,546`.
+- A window without its reference plane reads its bases from its parent in
+  the reference given (a FASTA, a gpxil file of the chromosome, or of a
+  window that holds it), checked against its own digests or its parent's.
+- `gpxil validate` checks windows: their `window` key, the file's version,
+  and, where the file holds the parent too, that a window holds what the
+  parent does. The schema of version 0.3 is bundled.
+- Files are written as gpxil 0.3. Readers of 0.2 read them, and a window as
+  an ordinary contig. Files of 0.1 and 0.2 read as before.
+- `js/gpxil-read.js` implements 0.3: a contig's `window`, `parent`, `start`
+  and `end`; `locate()` finds regions as gpxiltools does (the tests check it
+  against gpxiltools' answers); `parseRegion()` and `regionText()`; windows
+  whose metadata says wrong things of where they are are refused.
+
 ## 0.6.0 (28 October 2026)
 
 Version 0.2 of the specification, and a reader in JavaScript.

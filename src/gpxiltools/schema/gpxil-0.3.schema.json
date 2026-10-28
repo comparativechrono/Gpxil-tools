@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/comparativechrono/Gpxil/schema/gpxil-0.3.schema.json",
+  "title": "gpxil 0.3 file metadata",
+  "description": "JSON stored in the ImageDescription of page 0 of a gpxil file (SPEC.md section 9). Unknown keys are allowed and must be ignored by readers.",
+  "type": "object",
+  "required": ["gpxil", "layout", "contigs", "contig", "plane", "length"],
+  "properties": {
+    "gpxil": {"description": "Format version, major.minor.", "type": "string", "pattern": "^0\\.[0-9]+$"},
+    "generator": {"type": "string"},
+    "created": {"type": "string", "description": "ISO 8601 date-time"},
+    "layout": {
+      "type": "object",
+      "required": ["type", "width"],
+      "properties": {
+        "type": {"const": "raster"},
+        "width": {"type": "integer", "minimum": 1, "maximum": 4294967295}
+      }
+    },
+    "palette": {"type": "string"},
+    "reference": {"type": "object", "properties": {"name": {"type": "string"}, "source": {"type": "string"}}},
+    "sample": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["id"],
+          "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "source": {"type": ["string", "null"]},
+            "callable_regions": {
+              "type": ["string", "null"],
+              "description": "Name of the callable-regions file applied, or null."
+            },
+            "haploid_regions": {
+              "type": ["string", "null"],
+              "description": "Description of the haploid regions applied (region file name, whole contigs, or the sex rule), or null."
+            },
+            "sex": {"type": ["string", "null"]}
+          }
+        }
+      ]
+    },
+    "planes": {
+      "type": "object",
+      "propertyNames": {"pattern": "^(ref|gt|flags|gq|dp|ps|x-[A-Za-z0-9_-]+)$"},
+      "additionalProperties": {
+        "type": "object",
+        "required": ["dtype"],
+        "properties": {
+          "dtype": {"enum": ["uint8", "uint16", "uint32", "int8", "int16", "int32", "float32"]},
+          "missing": {"type": "number"},
+          "description": {"type": "string"},
+          "units": {"type": "string"}
+        }
+      }
+    },
+    "contigs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/contig"}},
+    "subset": {
+      "type": "object",
+      "description": "What a file that copies contigs from another, without converting calls again, copied (SPEC.md 9.1). It gives the version of the file copied when the copy has a later one.",
+      "properties": {
+        "of": {"type": "string", "description": "The name of the file copied."},
+        "gpxil": {"type": "string", "pattern": "^0\\.[0-9]+$", "description": "The version of the file copied."},
+        "contigs": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "contig": {"type": "string", "description": "Contig of page 0 (page metadata, section 8.4)."},
+    "plane": {"type": "string", "description": "Plane of page 0."},
+    "length": {"type": "integer", "minimum": 1, "description": "Length of page 0's contig."},
+    "summary": {"type": "object", "description": "Writer's conversion summary (informative)."}
+  },
+  "$defs": {
+    "contig": {
+      "type": "object",
+      "required": ["name", "length", "pages"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[!-~]+$",
+          "description": "Printable ASCII without spaces (SPEC.md 9.3)."
+        },
+        "length": {"type": "integer", "minimum": 1},
+        "width": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+        "pages": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"pattern": "^(ref|gt|flags|gq|dp|ps|x-[A-Za-z0-9_-]+)$"},
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "md5": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "refget": {"type": "string", "pattern": "^SQ\\.[A-Za-z0-9_-]{32}$"},
+        "aliases": {"type": "array", "items": {"type": "string"}},
+        "ploidy": {
+          "oneOf": [{"enum": [1, 2]}, {"const": "mixed"}],
+          "description": "From the gt plane: 1 if haplotype 2 is ABSENT at every base, 2 if nowhere, else mixed."
+        },
+        "vcf_contig": {"type": ["string", "null"]},
+        "callable_bases": {"type": "integer", "minimum": 0},
+        "sidecar_entries": {"type": "integer", "minimum": 0},
+        "phase_sets": {"type": "integer", "minimum": 0},
+        "phase_set_ids": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[1-9][0-9]*$"},
+          "additionalProperties": {"type": "string"}
+        },
+        "invalid_characters_converted_to_N": {"type": "integer", "minimum": 0},
+        "window": {
+          "type": "object",
+          "description": "For a window (SPEC.md 3.1), a contig that holds a stretch of a longer sequence: the sequence, its parent, and where the stretch lies in it.",
+          "required": ["of", "start"],
+          "properties": {
+            "of": {"type": "string", "minLength": 1, "pattern": "^[!-~]+$", "description": "The parent's name."},
+            "start": {"type": "integer", "minimum": 0, "description": "The offset in the parent of the window's offset 0."},
+            "length": {"type": "integer", "minimum": 1, "description": "The parent's length."},
+            "md5": {"type": "string", "pattern": "^[0-9a-f]{32}$", "description": "The parent's MD5."},
+            "refget": {"type": "string", "pattern": "^SQ\\.[A-Za-z0-9_-]{32}$", "description": "The parent's refget identifier."},
+            "aliases": {"type": "array", "items": {"type": "string"}, "description": "The parent's other names."}
+          }
+        },
+        "encoding": {
+          "type": "object",
+          "properties": {
+            "records": {"type": "integer", "minimum": 0},
+            "conflicts": {"type": "integer", "minimum": 0},
+            "ref_mismatches": {"type": "integer", "minimum": 0},
+            "polyploid_skipped": {"type": "integer", "minimum": 0},
+            "skipped_out_of_range": {"type": "integer", "minimum": 0},
+            "spanning_deletion_alleles": {"type": "integer", "minimum": 0},
+            "symbolic_alleles": {"type": "integer", "minimum": 0},
+            "bad_allele_index": {"type": "integer", "minimum": 0},
+            "examples": {"type": "array", "items": {"type": "string"}},
+            "clipped_to_contig_end": {"type": "integer", "minimum": 0},
+            "ploidy_mismatches": {"type": "integer", "minimum": 0},
+            "missing_genotypes": {"type": "integer", "minimum": 0},
+            "spanning_deletions_reassigned": {"type": "integer", "minimum": 0},
+            "overlapping_calls_reassigned": {"type": "integer", "minimum": 0},
+            "nonacgt_inserted_bases": {"type": "integer", "minimum": 0}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"pages": {"not": {"required": ["ref"]}}}},
+          "then": {
+            "anyOf": [
+              {"required": ["md5"]},
+              {"required": ["refget"]},
+              {"required": ["window"], "properties": {"window": {"anyOf": [{"required": ["md5"]}, {"required": ["refget"]}]}}}
+            ]
+          }
+        },
+        {
+          "if": {"properties": {"pages": {"required": ["gt"]}}},
+          "then": {"properties": {"pages": {"required": ["flags"]}}}
+        },
+        {
+          "if": {
+            "properties": {"pages": {"anyOf": [{"required": ["gq"]}, {"required": ["dp"]}, {"required": ["ps"]}]}}
+          },
+          "then": {"properties": {"pages": {"required": ["gt"]}}}
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["contigs"],
+        "properties": {
+          "contigs": {"contains": {"required": ["pages"], "properties": {"pages": {"required": ["gt"]}}}}
+        }
+      },
+      "then": {"required": ["sample"], "properties": {"sample": {"type": "object", "required": ["id"]}}},
+      "else": {"properties": {"sample": {"type": "null"}}}
+    }
+  ]
+}

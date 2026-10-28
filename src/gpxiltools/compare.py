@@ -137,6 +137,29 @@ class _Chunk:
         return _Chunk(s, e, *planes, self.nz[i:j] - a)
 
 
+class _Seq:
+    """A contig seen in the coordinates of its sequence (spec 3.1): a window's offset i is position start + i of its
+    parent; a whole contig is as it is. So files compare base for base whether they hold a whole chromosome or windows
+    of it."""
+
+    def __init__(self, contig):
+        self.c = contig
+        self.name = contig.parent
+        self.start, self.end = contig.start, contig.end
+        self.width = contig.width
+
+    def has(self, plane: str) -> bool:
+        return self.c.has(plane)
+
+    def read(self, plane: str, s: int, e: int):
+        return self.c.read(plane, s - self.start, e - self.start)
+
+    def sidecar(self):
+        from .vcf import SidecarEntry
+
+        return [SidecarEntry(x.offset + self.start, x.hap, x.kind, x.data) for x in self.c.sidecar()]
+
+
 class _Member:
     """One file's contig, read a piece at a time as allele keys."""
 
@@ -259,14 +282,15 @@ def _drop_islands(called: np.ndarray, site: np.ndarray) -> None:
         called[x:y] = False
 
 
-def _quiet(noisy: np.ndarray, a: int, b: int, xs: np.ndarray, gap: int, length: int) -> np.ndarray:
+def _quiet(noisy: np.ndarray, a: int, b: int, xs: np.ndarray, gap: int, bounds: tuple[int, int]) -> np.ndarray:
     """For each x in ``xs``: whether a piece can be cut at x, with no variant in [x - gap, x + gap). ``noisy``
-    covers [a, b); the ends of the contig are always cuts."""
+    covers [a, b); the ends of what the files hold, ``bounds``, are always cuts."""
+    first, last = bounds
     cs = np.concatenate(([0], np.cumsum(noisy, dtype=np.int32)))
     lo = np.maximum(a, xs - gap)
     hi = np.minimum(b, xs + gap)
-    seen = ((xs - gap >= a) | (a == 0)) & ((xs + gap <= b) | (b == length))
-    return ((cs[hi - a] - cs[lo - a] == 0) & seen) | (xs == 0) | (xs == length)
+    seen = ((xs - gap >= a) | (a == first)) & ((xs + gap <= b) | (b == last))
+    return ((cs[hi - a] - cs[lo - a] == 0) & seen) | (xs == first) | (xs == last)
 
 
 def _noisy(members, a: int, b: int) -> np.ndarray:
@@ -276,15 +300,16 @@ def _noisy(members, a: int, b: int) -> np.ndarray:
     return noisy
 
 
-def _pieces(members, start: int, end: int, length: int, chunk: int, gap: int):
+def _pieces(members, start: int, end: int, bounds: tuple[int, int], chunk: int, gap: int):
     """[start, end) read a piece at a time, each piece cut where no file has a variant within ``gap`` bases, so
     nothing compared is cut in two: (s, e, the files' chunks over [s, e)). The first piece may begin before
-    ``start``, and the last end after ``end``."""
+    ``start``, and the last end after ``end``, within ``bounds``: the stretch that all the files hold."""
+    first, last = bounds
     s, look = start, 16 * gap
-    while s > 0:  # (the first cut, at or before start)
-        a, b = max(0, s - look), min(length, start + gap)
-        xs = np.arange(a + gap if a else 0, start + 1)
-        ok = np.flatnonzero(_quiet(_noisy(members, a, b), a, b, xs, gap, length))
+    while s > first:  # (the first cut, at or before start)
+        a, b = max(first, s - look), min(last, start + gap)
+        xs = np.arange(a + gap if a > first else first, start + 1)
+        ok = np.flatnonzero(_quiet(_noisy(members, a, b), a, b, xs, gap, bounds))
         if ok.size:
             s = int(xs[ok[-1]])
             break
@@ -292,14 +317,14 @@ def _pieces(members, start: int, end: int, length: int, chunk: int, gap: int):
     while s < end:
         target, look = min(end, max(s + chunk, start + 1)), 4 * gap
         while True:
-            a, b = max(0, s - gap), min(length, target + look)
+            a, b = max(first, s - gap), min(last, target + look)
             chunks = [m.read(a, b) for m in members]
             near = max(a, target - gap)  # (only the bases near the candidates)
             noisy = np.zeros(b - near, dtype=bool)
             for ch in chunks:
                 noisy |= ch.var[near - a :]
             xs = np.arange(target, b + 1)
-            ok = np.flatnonzero(_quiet(noisy, near, b, xs, gap, length))
+            ok = np.flatnonzero(_quiet(noisy, near, b, xs, gap, bounds))
             if ok.size:
                 x = int(xs[ok[0]])
                 break
@@ -308,14 +333,18 @@ def _pieces(members, start: int, end: int, length: int, chunk: int, gap: int):
         s = x
 
 
-def _check_same_reference(contigs) -> None:
-    first = contigs[0]
-    for c in contigs[1:]:
-        if c.length != first.length:
-            raise ValueError(f"{c.name} has {c.length:,} bases in one file and {first.length:,} in another: not the same reference")
+def _check_same_reference(views) -> None:
+    """The files' contigs are of one sequence: its length and digests (a window's parent's) agree."""
+    first = views[0].c
+    for v in views[1:]:
+        c = v.c
+        n0, n1 = first.parent_length, c.parent_length
+        if n0 is not None and n1 is not None and n0 != n1:
+            raise ValueError(f"{v.name} has {n1:,} bases in one file and {n0:,} in another: not the same reference")
+        d0, d1 = first.parent_digests(), c.parent_digests()
         for k in ("md5", "refget"):
-            if k in c.entry and k in first.entry and c.entry[k] != first.entry[k]:
-                raise ValueError(f"{c.name} has another {k} in one file than in another: not the same reference")
+            if k in d0 and k in d1 and d0[k] != d1[k]:
+                raise ValueError(f"{v.name} has another {k} in one file than in another: not the same reference")
 
 
 def _ref_source(contigs):
@@ -337,29 +366,51 @@ def _ref_reader(ref, s: int, e: int):
     return read
 
 
+def _names(c) -> set:
+    """The names of the sequence a contig holds bases of (a window's parent's)."""
+    return {c.parent, *c.parent_aliases}
+
+
 def _common_regions(gfiles, regions):
-    """(the contig's name in each file, start, end) of the regions asked for, or of every contig all the files have."""
-    if regions:
-        out = []
-        for name, s, e in regions:
-            cs = [g[name] for g in gfiles]
-            e = cs[0].length if e is None else e
-            if not (0 <= s < e <= cs[0].length):
-                raise IndexError(f"{name}:{s + 1}-{e} is outside {cs[0].name} (length {cs[0].length:,})")
-            out.append(([c.name for c in cs], s, e))
-        return out
+    """(each file's contig, seen in its sequence's coordinates; start; end) of the regions asked for, or of every
+    stretch of a sequence that all the files hold: the same contig in each, or windows of it (spec 3.1), where they
+    overlap. Positions are the sequence's: on a window, its parent's."""
     out = []
-    for c in gfiles[0]:
-        names = [c.name]
+    if regions:
+        for name, s, e in regions:
+            got = [g.locate(name, s, e) for g in gfiles]
+            lo = max(c.start + a for c, a, _ in got)
+            hi = min(c.start + b for c, _, b in got)
+            if lo >= hi:
+                raise ValueError(f"the files hold no stretch of {name} in common")
+            out.append(([_Seq(c) for c, _, _ in got], lo, hi))
+        return out
+    for c0 in gfiles[0]:
+        combos = [[c0]]
         for g in gfiles[1:]:
-            hit = next((n for n in (c.name, *c.entry.get("aliases", [])) if n in g), None)
-            if hit is None:
-                break
-            names.append(g[hit].name)
-        else:
-            out.append((names, 0, c.length))
+            combos = [
+                cs + [c]
+                for cs in combos
+                for c in g
+                if _names(c) & _names(c0) and max(c.start, *(x.start for x in cs)) < min(c.end, *(x.end for x in cs))
+            ]
+        for cs in combos:
+            out.append(([_Seq(c) for c in cs], max(c.start for c in cs), min(c.end for c in cs)))
     if not out:
         raise ValueError("the files have no contig in common")
+    return out
+
+
+def _bounds(views) -> tuple[int, int]:
+    """The stretch that all the files hold, in the sequence's coordinates."""
+    return max(v.start for v in views), min(v.end for v in views)
+
+
+def _place(views, s: int, e: int) -> dict:
+    """A region compared, in the sequence's coordinates, and the windows it was read from."""
+    out = {"contig": views[0].name, "start": s + 1, "end": e}
+    if any(v.c.window is not None for v in views):
+        out["windows"] = [v.c.name if v.c.window is not None else None for v in views]
     return out
 
 
@@ -742,17 +793,16 @@ def compare_pair(a, b, regions=None, *, chunk: int = CHUNK, gap: int = GAP, all_
     _need_samples((("A", a), ("B", b)))
     ids = _Ids()
     out, total = [], PairTally()
-    for (na, nb), s, e in _common_regions([a, b], regions):
-        ca, cb = a[na], b[nb]
+    for (ca, cb), s, e in _common_regions([a, b], regions):
         _check_same_reference([ca, cb])
         t = PairTally()
         ma, mb = _Member(ca, ids, confident=_confident(a, all_calls)), _Member(cb, ids, confident=_confident(b, all_calls))
         ref = _ref_source([ca, cb])
-        for s0, e0, (A, B) in _pieces([ma, mb], s, e, ca.length, chunk, gap):
+        for s0, e0, (A, B) in _pieces([ma, mb], s, e, _bounds([ca, cb]), chunk, gap):
             lo, hi = max(s, s0), min(e, e0)
             if lo < hi:
                 _pair_piece(ma, mb, A, B, ids.items, _ref_reader(ref, s0, e0), lo, hi, gap, t, collect=stretches)
-        out.append({"contig": ca.name, "start": s + 1, "end": e, **t.as_dict()})
+        out.append({**_place([ca, cb], s, e), **t.as_dict()})
         total = total + t
     return {
         "mode": "pair",
@@ -1022,10 +1072,10 @@ def _trio_piece(chs, items, ref4_of, lo: int, hi: int, gap: int, t: TrioTally, s
         classes.append(cls)
 
 
-def _trio_region(ms, ids: _Ids, ref, s: int, e: int, length: int, chunk: int, gap: int, classes=None, errors=None) -> TrioTally:
+def _trio_region(ms, ids: _Ids, ref, s: int, e: int, bounds: tuple[int, int], chunk: int, gap: int, classes=None, errors=None) -> TrioTally:
     t = TrioTally()
     sites: dict = {"father": [], "mother": []}
-    for s0, e0, chs in _pieces(ms, s, e, length, chunk, gap):
+    for s0, e0, chs in _pieces(ms, s, e, bounds, chunk, gap):
         lo, hi = max(s, s0), min(e, e0)
         if lo < hi:
             collect = None if errors is None else (ms[0].c.name, errors)
@@ -1044,13 +1094,12 @@ def compare_trio(
     _need_samples((("the child's file", child), ("the father's file", father), ("the mother's file", mother)))
     ids = _Ids()
     out, total = [], TrioTally()
-    for names, s, e in _common_regions([child, father, mother], regions):
-        cs = [g[n] for g, n in zip((child, father, mother), names)]
+    for cs, s, e in _common_regions([child, father, mother], regions):
         _check_same_reference(cs)
         trio = (child, father, mother)
         ms = [_Member(c, ids, want_ps=k > 0, confident=_confident(trio[k], all_calls)) for k, c in enumerate(cs)]
-        t = _trio_region(ms, ids, _ref_source(cs), s, e, cs[0].length, chunk, gap, errors=errors)
-        out.append({"contig": cs[0].name, "start": s + 1, "end": e, **t.as_dict()})
+        t = _trio_region(ms, ids, _ref_source(cs), s, e, _bounds(cs), chunk, gap, errors=errors)
+        out.append({**_place(cs, s, e), **t.as_dict()})
         total = total + t
     return {
         "mode": "trio",
@@ -1086,19 +1135,18 @@ def picture(
     from .render import Rendering, _wrap
 
     trio = len(gfiles) == 3
-    ((names, start, end),) = _common_regions(gfiles, [(contig, start, end)])
-    cs = [g[n] for g, n in zip(gfiles, names)]
+    ((cs, start, end),) = _common_regions(gfiles, [(contig, start, end)])
     _check_same_reference(cs)
     ids = _Ids()
     ref = _ref_source(cs)
     classes: list = []
     if trio:
         ms = [_Member(c, ids, want_ps=k > 0, confident=_confident(g, all_calls)) for k, (c, g) in enumerate(zip(cs, gfiles))]
-        _trio_region(ms, ids, ref, start, end, cs[0].length, chunk, gap, classes)
+        _trio_region(ms, ids, ref, start, end, _bounds(cs), chunk, gap, classes)
     else:
         ms = [_Member(c, ids, confident=_confident(g, all_calls)) for c, g in zip(cs, gfiles)]
         t = PairTally()
-        for s0, e0, (A, B) in _pieces(ms, start, end, cs[0].length, chunk, gap):
+        for s0, e0, (A, B) in _pieces(ms, start, end, _bounds(cs), chunk, gap):
             lo, hi = max(start, s0), min(end, e0)
             if lo < hi:
                 _pair_piece(ms[0], ms[1], A, B, ids.items, _ref_reader(ref, s0, e0), lo, hi, gap, t, classes)
