@@ -231,16 +231,23 @@ test("files it must refuse, each with a code a page can put in its own words, an
     }
   }
   await assert.rejects(R.open(R.fromUrl(base + "no-such-file.gpxil.tif")), { code: "http" });
-  // the 200 MB strip: refused once more than its 10 bytes come out, not after all of it
+  // the 200 MB strip: refused once more than its 256 KiB come out, not after all of it
   const g = await R.open(SOURCES.bytes(expected.bad.bomb.file));
-  await assert.rejects(g.read("c", "ref", 0, 10), /inflates to more than the 10 bytes it holds/);
+  await assert.rejects(g.read("c", "ref", 0, 10), /inflates to more than the 262144 bytes it holds/);
+  // 100,000 directories one after another: walked from the bytes read, a few dozen reads in all
+  let reads = 0;
+  const bytes = R.fromBytes(fs.readFileSync(path.join(OUT, expected.bad.chain.file)));
+  const counted = { key: "chain-counted", size: bytes.size, read: (a, b, what) => (reads++, bytes.read(a, b, what)) };
+  const t0 = Date.now();
+  await assert.rejects((await R.open(counted)).read("c", "gt", 0, 10), { code: "format" });
+  assert.ok(reads < 100 && Date.now() - t0 < 5000, `${reads} reads, ${Date.now() - t0} ms`);
   const z = zlib.deflateSync(Buffer.from("ACGT".repeat(1000)));
   assert.equal(new TextDecoder().decode(await R.inflate(z, 4000)), "ACGT".repeat(1000));
   await assert.rejects(R.inflate(z, 3999), { code: "limit" });
   await assert.rejects(R.inflate(z.subarray(0, z.length - 6)), { code: "format" }); // (cut short)
 });
 
-test("odd files that read: a tag of 2^30 values, names that differ only in case", async () => {
+test("odd files that read: a tag of 2^30 values, names that differ only in case, a float plane with predictor 2, padding after a zlib stream", async () => {
   const many = await R.open(SOURCES.url(expected.odd["many-values"]));
   assert.equal(
     Array.from(await many.read("c", "ref", 0, 20))
@@ -252,6 +259,17 @@ test("odd files that read: a tag of 2^30 values, names that differ only in case"
   const first = async (name) => R.base((await g.read(name, "ref", 0, 1))[0]);
   assert.deepEqual([await first("a"), await first("A"), await first("b"), await first("B")], ["A", "C", "G", "G"]);
   assert.equal(g.contig("chrA").name, "a"); // (ignoring case, the first contig of the name)
+  const f = await R.open(SOURCES.url(expected.odd["float-pred2"]));
+  assert.ok(bytesOf(await f.read("c", "x-f", 0, 64)).equals(bin("float-pred2.bin")));
+  const padded = await R.open(SOURCES.blob(expected.odd.padded));
+  assert.equal(
+    Array.from(await padded.read("c", "ref", 0, 20))
+      .map(R.base)
+      .join(""),
+    "ACGT".repeat(5),
+  );
+  const z = Buffer.concat([zlib.deflateSync(Buffer.from("ACGT")), Buffer.alloc(5)]);
+  assert.equal(new TextDecoder().decode(await R.inflate(z)), "ACGT"); // (as zlib reads it)
 });
 
 test("it loads as a classic script, as an ES module and with require()", async () => {

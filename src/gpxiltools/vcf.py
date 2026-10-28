@@ -9,6 +9,7 @@ back to VCF gives an equivalent, normalised call set.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import re
@@ -527,12 +528,15 @@ class PlaneBuilder:
     def add(self, call: Call) -> None:
         st = self.stats
         st.records += 1
+        text = call.ref + "".join(call.alts)
+        if text != text.upper():  # (REF and sequence ALT alleles are read case-insensitively, spec 6.2: iter_calls does)
+            call = dataclasses.replace(call, ref=call.ref.upper(), alts=[a if is_symbolic(a) else a.upper() for a in call.alts])
         p0 = call.pos - 1
         alts = call.alts
         n = self.length
-        if p0 < 0 or p0 >= n or p0 + len(call.ref) > n:
+        if not call.ref or p0 < 0 or p0 >= n or p0 + len(call.ref) > n:
             st.skipped_out_of_range += 1
-            st.note(f"{self.contig}:{call.pos} outside the contig (length {n})")
+            st.note(f"{self.contig}:{call.pos} " + (f"outside the contig (length {n})" if call.ref else "has no REF allele"))
             return
         only_refblock = not alts or all(a in _REFBLOCK_ALTS for a in alts)
         symbolic = any(is_symbolic(a) for a in alts)
@@ -682,9 +686,12 @@ class PlaneBuilder:
         return lo, max(hi, lo + 1), int.from_bytes(hashlib.blake2b(what.encode(), digest_size=8).digest(), "little")
 
     def _fits(self, h: int, c: tuple[int, int, int] | None) -> bool:
-        """Whether an allele (as :meth:`_occupies` gives it) fits haplotype ``h``: it occupies nothing, or no ALT allele
-        of an earlier call occupies there an offset it occupies, or the same allele was put there before (spec 6.5)."""
-        return c is None or c[2] in self.placed[h] or not _bits_any(self.occupied[h], c[0], c[1])
+        """Whether an allele (as :meth:`_occupies` gives it) fits haplotype ``h`` (spec 6.5): it occupies nothing; or
+        the same allele was put on ``h`` before; or it wasn't put on the other haplotype, and no ALT allele of an
+        earlier call occupies there an offset it occupies."""
+        if c is None or c[2] in self.placed[h]:
+            return True
+        return c[2] not in self.placed[1 - h] and not _bits_any(self.occupied[h], c[0], c[1])
 
     def _place_overlapping(self, alleles: list[str], call: Call, p0: int, span_end: int) -> list[str]:
         """Unphased genotype of two different alleles: each on a haplotype it fits, if the written order can't.
