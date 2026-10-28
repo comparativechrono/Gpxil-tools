@@ -69,7 +69,7 @@ def read_header(path) -> VcfHeader:
                 lines.append(line)
                 if line.startswith("##contig=<"):
                     m_id = re.search(r"[<,]ID=([^,>]+)", line)
-                    m_len = re.search(r"[<,]length=(\d+)", line)
+                    m_len = re.search(r"[<,]length=([0-9]+)", line)
                     if m_id:
                         contigs[m_id.group(1)] = int(m_len.group(1)) if m_len else None
                 elif line.startswith("##FORMAT=<"):

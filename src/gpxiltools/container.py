@@ -785,7 +785,7 @@ class GpxilWriter:
             extra["phase_sets"] = len(seen["ps"])
             ids = src.entry.get("phase_set_ids")
             if isinstance(ids, dict):
-                kept = {k: v for k, v in ids.items() if str(k).isdigit() and int(k) in seen["ps"]}
+                kept = {k: v for k, v in ids.items() if str(k).isascii() and str(k).isdigit() and int(k) in seen["ps"]}
                 if kept:
                     extra["phase_set_ids"] = kept
         if side:

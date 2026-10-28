@@ -26,7 +26,7 @@ BLOCK = 1 << 18  #: bytes fetched at a time (a gpxil strip is at most this befor
 CACHE_BLOCKS = 64  #: blocks kept (16 MB)
 WHOLE_FILE_LIMIT = 32 << 20  #: a server without range requests is accepted for files up to this size
 
-_CONTENT_RANGE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)")
+_CONTENT_RANGE = re.compile(r"bytes\s+([0-9]+)-([0-9]+)/([0-9]+|\*)")
 
 
 def is_url(path) -> bool:
@@ -73,7 +73,7 @@ class RangeFile(io.RawIOBase):
             return None
         finally:
             self.requests += 1
-        return int(n) if n and n.strip().isdigit() else None
+        return int(n) if n and n.strip().isascii() and n.strip().isdigit() else None
 
     def _probe(self) -> int:
         status, body, content_range = self._get(0, self.block - 1)
