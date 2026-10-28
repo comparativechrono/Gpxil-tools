@@ -292,6 +292,7 @@ class EncodeStats:
     missing_genotypes: int = 0
     spanning_deletion_alleles: int = 0
     spanning_deletions_reassigned: int = 0
+    overlapping_calls_reassigned: int = 0
     symbolic_alleles: int = 0
     nonacgt_inserted_bases: int = 0
     polyploid_skipped: int = 0
@@ -315,6 +316,7 @@ class EncodeStats:
             "missing_genotypes",
             "spanning_deletion_alleles",
             "spanning_deletions_reassigned",
+            "overlapping_calls_reassigned",
             "symbolic_alleles",
             "nonacgt_inserted_bases",
             "polyploid_skipped",
@@ -446,12 +448,16 @@ class PlaneBuilder:
         w[pos] = state | _ASSERTED | keep
         return True
 
-    def _add_insertion(self, h: int, anchor: int, seq: str) -> None:
+    @staticmethod
+    def _inserted(seq: str) -> tuple[str, int]:
+        """Inserted bases as the sidecar keeps them (spec 7): uppercase, U as T, others as N; and how many were others."""
         seq = seq.upper().replace("U", "T")
         bad = len(_ACGTN.findall(seq))
-        if bad:
-            self.stats.nonacgt_inserted_bases += bad
-            seq = _ACGTN.sub("N", seq)
+        return (_ACGTN.sub("N", seq) if bad else seq), bad
+
+    def _add_insertion(self, h: int, anchor: int, seq: str) -> None:
+        seq, bad = self._inserted(seq)
+        self.stats.nonacgt_inserted_bases += bad
         key = (anchor, h + 1)
         if key in self.ins and self.ins[key] != seq:
             self.stats.conflicts += 1
@@ -506,7 +512,7 @@ class PlaneBuilder:
         st.gt_counts[call.gt] += 1
         if len(alleles) > 2:
             st.polyploid_skipped += 1
-            st.note(f"{self.contig}:{call.pos} ploidy {len(alleles)} not supported in gpxil 0.1")
+            st.note(f"{self.contig}:{call.pos} ploidy {len(alleles)} not supported by gpxil")
             return
         span = span_end - p0
         strong = np.zeros(span, dtype=bool)
@@ -520,6 +526,7 @@ class PlaneBuilder:
         else:
             if len(alleles) == 2 and not phased:
                 alleles = self._place_spanning_deletion(alleles, call, p0, span_end)
+                alleles = self._place_overlapping(alleles, call, p0, span_end)
             for h, a in enumerate(alleles):
                 s = self._apply_allele(h, a, call, p0, len(call.ref), span_end)
                 if s is not None:
@@ -585,6 +592,106 @@ class PlaneBuilder:
         if len(deleted) == 1 and deleted[0] != star[0]:
             self.stats.spanning_deletions_reassigned += 1
             return [alleles[1], alleles[0]]
+        return alleles
+
+    def _alt_index(self, a: str, call: Call) -> int | None:
+        """The ALT allele an allele number names (1-based), or None for REF, a missing allele or a number that isn't one."""
+        if not a.isdigit():
+            return None
+        idx = int(a)
+        return idx if 0 < idx <= len(call.alts) else None
+
+    def _would_write(self, a: str, call: Call, p0: int, span_end: int):
+        """What allele ``a`` of ``call`` asserts, as :meth:`_apply_allele` would write it, but without writing it.
+
+        Returns ``(states, written, insertions, complex_data)`` over the span, ``written`` marking the bases the
+        allele asserts REF or a strong state at; or None for an allele that asserts no sequence of its own (the
+        REF allele, a missing allele, ``*``, a placeholder, an allele number with no ALT allele).
+        """
+        idx = self._alt_index(a, call)
+        if idx is None:
+            return None
+        alt = call.alts[idx - 1]
+        if alt == "*" or alt in _REFBLOCK_ALTS:
+            return None
+        span = span_end - p0
+        states = np.zeros(span, dtype=np.uint8)
+        written = np.zeros(span, dtype=bool)
+        if is_symbolic(alt):
+            end = call.end
+            if end is None and alt.startswith("<DEL") and call.svlen and idx - 1 < len(call.svlen) and call.svlen[idx - 1]:
+                end = call.pos + abs(call.svlen[idx - 1])
+            if alt.startswith("<DEL") and end is not None and end > call.pos:
+                stop = min(end, self.length) - p0  # (POS is the padding base, REF; bases POS+1..END deleted)
+                states[1:stop] = C.HAP_DEL
+                written[:stop] = True
+                return states, written, [], None
+            states[0] = C.HAP_COMPLEX
+            written[0] = True
+            return states, written, [], f"REF={call.ref};ALT={alt}" + (f";END={end}" if end is not None else "")
+        ev = allele_events(call.ref, alt)
+        for off, s in ev.subs:
+            states[off] = s
+        for off, length in ev.dels:
+            states[off : off + length] = C.HAP_DEL
+        same = np.isin(states, C.HAP_SUB_CODES) & (states == np.bitwise_and(self.ref[p0:span_end], 0x0F))
+        states[same] = C.HAP_REF
+        written[:] = states != C.HAP_UNKNOWN  # (an N in ALT asserts no base in particular)
+        return states, written, [(p0 + anchor, self._inserted(seq)[0]) for anchor, seq in ev.ins], None
+
+    def _fits(self, h: int, p0: int, what) -> bool:
+        """Whether an allele (as :meth:`_would_write` gives it) fits haplotype ``h``: it writes REF or a strong
+        state nowhere that haplotype is already asserted with a different strong state, and inserts nothing, and
+        puts no COMPLEX allele, where it already has a different one (spec 6.5)."""
+        if what is None:
+            return True
+        states, written, ins, data = what
+        seg = self.w[h][p0 : p0 + states.shape[0]]
+        cur = seg & _STATE_MASK
+        if (written & ((seg & _ASSERTED) != 0) & _strong(cur) & (cur != states)).any():
+            return False
+        for anchor, seq in ins:
+            got = self.ins.get((anchor, h + 1))
+            if got is not None and got != seq:
+                return False
+        if data is not None:
+            got = self.complex.get((p0, h + 1))
+            if got is not None and got != data and (self.w[h][p0] & _STATE_MASK) == C.HAP_COMPLEX:
+                return False
+        return True
+
+    def _place_overlapping(self, alleles: list[str], call: Call, p0: int, span_end: int) -> list[str]:
+        """Unphased genotype of two different alleles: each on a haplotype it fits, if the written order can't.
+
+        In an unphased genotype the allele order means nothing. Two heterozygous calls that overlap can't both be
+        on one haplotype, yet applied as written they would both go to haplotype 2 and run together (two
+        deletions becoming one). So when an allele doesn't fit the haplotype the written order gives it (it would
+        write over another call's variant there), and the alleles swapped both fit, they are swapped (spec 6.5).
+        """
+        a, b = alleles
+        star = [i for i in (self._alt_index(a, call), self._alt_index(b, call)) if i and call.alts[i - 1] == "*"]
+        if a == b or star:
+            return alleles  # (homozygous; or a '*' allele, which _place_spanning_deletion has placed)
+        # quick: nothing asserted with a strong state over the span, no insertion and no COMPLEX allele there
+        busy = (p0, 1) in self.complex or (p0, 2) in self.complex
+        if not busy:
+            if span_end - p0 == 1:
+                for w in self.w:
+                    v = int(w[p0])
+                    busy = busy or bool(v & _INS) or (bool(v & _ASSERTED) and (v & _STATE_MASK) not in _WEAK)
+            else:
+                for w in self.w:
+                    seg = w[p0:span_end]
+                    busy = busy or bool((seg & _INS).any()) or bool((((seg & _ASSERTED) != 0) & _strong(seg & _STATE_MASK)).any())
+        if not busy:
+            return alleles
+        wa, wb = self._would_write(a, call, p0, span_end), self._would_write(b, call, p0, span_end)
+        if self._fits(0, p0, wa) and self._fits(1, p0, wb):
+            return alleles
+        if self._fits(0, p0, wb) and self._fits(1, p0, wa):
+            self.stats.overlapping_calls_reassigned += 1
+            self.stats.note(f"{self.contig}:{call.pos} {call.gt} put the other way round: it overlaps another call")
+            return [b, a]
         return alleles
 
     def _apply_allele(self, h: int, a: str, call: Call, p0: int, m: int, span_end: int) -> np.ndarray | None:

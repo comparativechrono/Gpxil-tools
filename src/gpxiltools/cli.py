@@ -53,6 +53,7 @@ def _open(a):
 
 
 def cmd_encode(a) -> int:
+    from .container import FORMAT_VERSION
     from .encode import encode
 
     out = a.output or (os.path.basename(a.vcf or a.fasta).split(".")[0] + ".gpxil.tif")
@@ -81,6 +82,10 @@ def cmd_encode(a) -> int:
     print(f"wrote {out}: {summary['contigs']} contigs, {summary['bases']:,} bases, {mb:,.1f} MB in {summary['seconds']}s", file=sys.stderr)
     if summary.get("conflicts"):
         print(f"note: {summary['conflicts']} conflicting overlapping calls (later record kept); see `gpxil info --json`", file=sys.stderr)
+    n = summary.get("overlapping_calls_reassigned") or 0
+    if n:
+        what = "call overlaps another, so its alleles were" if n == 1 else "calls overlap others, so their alleles were"
+        print(f"note: {n:,} unphased {what} put the other way round (gpxil {FORMAT_VERSION}, section 6.5)", file=sys.stderr)
     n = summary.get("ref_mismatches") or 0
     if n:
         # (the usual cause: a VCF called against another reference, such as GRCh37 on GRCh38)

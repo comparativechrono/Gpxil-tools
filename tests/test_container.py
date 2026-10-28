@@ -59,7 +59,7 @@ def test_page_descriptions_and_viewer_compatibility(tmp_path):
         w.add_contig("c2", {"ref": a[:500]})
     with tifffile.TiffFile(p) as tf:
         d1 = json.loads(tf.pages[1].description)
-        assert d1 == {"gpxil": "0.1", "contig": "c2", "plane": "ref", "length": 500}
+        assert d1 == {"gpxil": "0.2", "contig": "c2", "plane": "ref", "length": 500}
         assert tf.pages[0].tags["PageName"].value == "c1 ref"
         assert tf.pages[0].photometric == 3  # palette
         meta = json.loads(tf.pages[0].description)

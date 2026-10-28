@@ -18,6 +18,8 @@ from collections.abc import Callable, Iterable
 from .container import (
     COMPRESSIONS,
     DEFAULT_COMPRESSION,
+    FORMAT_VERSION,
+    KNOWN_VERSIONS,
     STANDARD_PLANES,
     BigTiffNeeded,
     GpxilFile,
@@ -49,7 +51,7 @@ def contig_names(g: GpxilFile, contigs: Iterable[str] | None) -> list[str]:
                 continue
             if _REGION.match(n):
                 raise ValueError(
-                    f"{n} is a region: gpxil subset copies whole contigs (gpxil 0.1 has no files of part of a contig);"
+                    f"{n} is a region: gpxil subset copies whole contigs (a gpxil file holds whole contigs);"
                     " gpxil fasta, vcf and render take --region"
                 )
             have = ", ".join(g.contigs[:8]) + (", …" if len(g) > 8 else "")
@@ -142,6 +144,8 @@ def _write(g: GpxilFile, out, jobs, compression: str, level: int | None, bigtiff
         sample=meta.get("sample"),
         metadata={k: v for k, v in meta.items() if k not in _OWN_KEYS and k not in ("summary", "subset")},
         require_codec=False,  # (copy_contig checks the codec where strips must be encoded again)
+        # (a copy follows the version its source does: its planes were made by that version's rules)
+        version=str(meta.get("gpxil")) if str(meta.get("gpxil")) in KNOWN_VERSIONS else FORMAT_VERSION,
     )
     writer.plane_info = {p: {k: v for k, v in (d or {}).items() if k != "dtype"} for p, d in (meta.get("planes") or {}).items()}
     try:
