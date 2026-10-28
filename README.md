@@ -51,9 +51,10 @@ gpxil subset HG002.gpxil.tif chr17 chr21 --no-ref -o HG002_17_21.noref.gpxil.tif
 # two genomes compared base by base (B taken as the truth: precision, recall, F1),
 # indels written at other places in a repeat found the same; or a child with both
 # parents: Mendelian errors, candidate new mutations, where each variant came from,
-# and crossovers where the parents are phased; -o draws a region of it
+# and crossovers where the parents are phased; -o draws a region of it (--draw)
 gpxil compare HG002.calls.gpxil.tif HG002.benchmark.gpxil.tif --region chr17
-gpxil compare HG002.gpxil.tif --father HG003.gpxil.tif --mother HG004.gpxil.tif -o trio.png --region chr17:7,661,779-7,687,546
+gpxil compare HG002.gpxil.tif --father HG003.gpxil.tif --mother HG004.gpxil.tif --region chr17 \
+    -o TP53-trio.png --draw chr17:7,661,779-7,687,546 --width 256 --scale 2
 
 # pictures (coordinates are 1-based, inclusive)
 gpxil render HG002.gpxil.tif chr21:30,000,001-30,250,000 -o region.png --width 500

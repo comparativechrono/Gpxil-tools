@@ -27,8 +27,9 @@ Genomes compared. Files are unchanged.
 - Calls outside the regions called with confidence (a file written with a
   BED file keeps them, each an island among bases not called) are left out
   of both, unless `--all-calls`.
-- `-o` draws the first region, one pixel a base, its classes over the
-  reference faded. `--json` gives every count to programs.
+- `-o` draws a region (`--draw`, or the first compared), one pixel a base,
+  its classes over the reference faded. `--json` gives every count to
+  programs.
 - In Python: `gpxiltools.compare.compare_pair`, `compare_trio`, `picture`
   and `format_compare`. Chromosome 17 takes about 4 s for two genomes and
   6 s for a trio, reading a megabase at a time.

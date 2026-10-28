@@ -302,6 +302,9 @@ def test_cli(pair, trio, tmp_path, capsys):
     from PIL import Image
 
     assert Image.open(png).size == (200, 16)
+    # the whole of chr1 counted, and only a region of it drawn
+    assert main([*args[:-4], "--draw", "chr1:4,001-4,400", "-o", str(png), "--width", "100"]) == 0
+    assert "chr1:1-6,000" in capsys.readouterr().out and Image.open(png).size == (100, 4)
     for bad in (["compare", str(pair[0])], ["compare", str(pair[0]), str(pair[1]), "--father", str(trio[1])]):
         with pytest.raises(SystemExit):
             main(bad)
