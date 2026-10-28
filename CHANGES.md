@@ -25,7 +25,7 @@ Version 0.3 of the specification: windows.
   windows straight from a VCF, converting only the calls that join up with
   the window through overlapping spans, over the stretch they cover: which
   gives what converting the whole chromosome would. Checked against cutting
-  the same windows out of whole chromosomes, on 41 windows of HG002's
+  the same windows out of whole chromosomes, on 116 windows of HG002's
   chromosome 17 whose edges cut deletions and insertions, and on dense
   simulated calls of every kind (overlapping indels, symbolic deletions and
   inversions, breakends, reference blocks, `*` alleles, haploid and missing
@@ -36,14 +36,19 @@ Version 0.3 of the specification: windows.
 - **Phase-set identifiers that aren't numbers** (VCF `PS` should be one) are
   numbered, as the specification now requires (section 5.5), from all the
   phased calls of the contig, whichever are converted, so that a window's
-  values are its whole parent's, and every window's of one parent alike.
+  values are its whole parent's, and every window's of one parent alike. A
+  number is written in the digits 0 to 9, and compared by value (`077` is
+  77): `+77` or `²` is an identifier like any other.
 - **Positions on a window are its parent's, in every command**:
   `GpxilFile.locate(name, start, end)` finds a region of a sequence in the
   contig that holds it (a window of just that stretch, or the first that
   holds it all), so `stats`, `render`, `fasta`, `vcf` and `compare` take
   `chr17:7,661,779-7,687,546` on a window file. Names are found as
-  gpxil-read.js finds them: as written, else ignoring case, with or without
-  `chr` (`GpxilFile.find`). `gpxil info`, `render`, `book` and `stats` label
+  gpxil-read.js finds them (`GpxilFile.find`): as written, else a whole
+  contig ignoring case, with or without `chr`; a window by its name as
+  written, so `17` isn't a window `chr17:1-500`. `GpxilFile.region_of()`
+  reads a region given as text as the CLI and gpxil-read.js do, and
+  `locate()` takes one. `gpxil info`, `render`, `book` and `stats` label
   windows by their parent's positions. `Contig.window`, `.parent`, `.start`,
   `.end`, `.region()`, and `GpxilFile.windows` and `.windows_of()` say where
   contigs lie. A name ends at the last colon of a region, so a window's name
@@ -54,14 +59,22 @@ Version 0.3 of the specification: windows.
   one window cuts and the next holds is written whole (on 116 windows of
   HG002's chromosome 17, in 41 stretches, the 860 records are those of one
   window per stretch); `gpxil compare` compares each base once, and `gpxil
-  stats` counts each base once in all. A sequence named alone is all its
-  windows in `stats`, `vcf` and `book`. A window that a deletion covers to
-  its end writes it on the base before the window, as N, so that it
-  encodes back (specification section 11.4).
-- Regions: `CHROM:POS` is one base; numbers can have spaces, and don't
-  begin with 0, so a name with colons in it (`HLA-A*01:01:01:01`) stays a
-  name; a region from position 0 is an error. gpxil-read.js reads regions
-  the same way.
+  stats` counts each base once in all. A region is read through the
+  stretch that holds it, in every command, so a region in one window ends
+  as the region of one window of all the stretch would, and a region that
+  windows hold only together is found in them (`locate(..., join=True)`).
+  Windows may have different planes: each base keeps the planes of the
+  windows that hold it, and where none with the sample's planes does,
+  nothing is known of it. A sequence named alone is all its windows in
+  `stats`, `vcf` and `book`. A deletion at a window's first base is
+  written on the base before the window, as N, so that the window's VCF
+  encodes back to it (specification section 11.4).
+- Regions: `CHROM:POS` is one base; numbers are the digits 0 to 9, with
+  commas or spaces, and don't begin with 0, so a name with colons in it
+  (`HLA-A*01:01:01:01`) stays a name; a region from position 0 is an error.
+  A file's contig named like a region (`HLA-A*01:14`) is that contig, and
+  lists of names (`--contigs`, `subset`) split at commas but those that
+  group a region's digits. gpxil-read.js reads regions the same way.
 - A window without its reference plane reads its bases from its parent in
   the reference given (a FASTA, a gpxil file of the chromosome, or of a
   window that holds it), checked against its own digests or its parent's.

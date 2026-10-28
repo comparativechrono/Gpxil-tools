@@ -173,6 +173,15 @@ test("windows (section 3.1): where they lie in their sequence, and regions found
     if (k.error) assert.throws(() => g.locate(...args), { code: k.error }, JSON.stringify(k.ask));
     else assert.deepEqual(where(g.locate(...args)), [k.contig, k.start, k.end], JSON.stringify(k.ask));
   }
+  // regions as text, as gpxiltools reads them
+  for (const k of expected.locate_text) {
+    if (k.error) assert.throws(() => g.locate(k.ask), { code: k.error }, k.ask);
+    else assert.deepEqual(where(g.locate(k.ask)), [k.contig, k.start, k.end], k.ask);
+  }
+  // names are matched loosely (case, "chr") for whole contigs only: a window by its name as written
+  assert.equal(g.contig("CHR1:30001-34000"), null);
+  assert.equal(g.contig("chr1:30001-34000").name, "chr1:30001-34000");
+  assert.equal(g.contig("CHRM").name, "chrM");
   // the same, written as text: a region; a window's name; a window's name and a region; one base
   assert.deepEqual(where(g.locate("chr1:33,501-33,600")), ["chr1:30001-34000", 3500, 3600]);
   assert.deepEqual(where(g.locate("chr1:30001-34000")), ["chr1:30001-34000", 0, 4000]);

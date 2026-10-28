@@ -654,12 +654,12 @@
       don't begin with 0, so a name with colons in it (HLA-A*01:01:01:01) is a name. null for an interval that isn't
       one (from position 0, or ending before it starts). gpxiltools' parse_region is the same */
   function parseRegion(text) {
-    const t = String(text || "").trim();
+    const t = String(text || "").replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
     if (!t) return null;
-    const m = t.match(/^(.+):\s*([1-9][\d,\s]*?)\s*(?:-\s*([1-9][\d,\s]*?))?$/);
-    if (!m) return /^.+:\s*0\s*(?:-\s*[\d,\s]+)?$/.test(t) ? null : { name: t };
-    const s = Number(m[2].replace(/[,\s]/g, ""));
-    const e = m[3] === undefined ? s : Number(m[3].replace(/[,\s]/g, ""));
+    const m = t.match(/^(.+):[ ]*([1-9][0-9, ]*?)[ ]*(?:-[ ]*([1-9][0-9, ]*?))?$/);
+    if (!m) return /^.+:[ ]*0[ ]*(?:-[ ]*[0-9, ]+)?$/.test(t) ? null : { name: t };
+    const s = Number(m[2].replace(/[, ]/g, ""));
+    const e = m[3] === undefined ? s : Number(m[3].replace(/[, ]/g, ""));
     if (!(Number.isSafeInteger(s) && Number.isSafeInteger(e) && s >= 1 && e >= s)) return null;
     return { name: m[1], start: s - 1, end: e };
   }
@@ -701,17 +701,20 @@
         out.parentAliases = out.window ? out.window.aliases : out.aliases;
         return out;
       });
-      // names first, then aliases; exactly as written, then ignoring case; where two match, the first contig
+      // names first, then aliases; exactly as written, then (whole contigs only: a window is found by its name as
+      // written, section 3.1) ignoring case; where two match, the first contig
       this._exact = new Map();
       this._folded = new Map();
       const add = (m, k, c) => m.has(k) || m.set(k, c);
       for (const c of this.contigs) add(this._exact, c.name, c);
       for (const c of this.contigs) for (const a of c.aliases) add(this._exact, a, c);
-      for (const c of this.contigs) add(this._folded, c.name.toLowerCase(), c);
-      for (const c of this.contigs) for (const a of c.aliases) add(this._folded, a.toLowerCase(), c);
+      const whole = this.contigs.filter((c) => !c.window);
+      for (const c of whole) add(this._folded, c.name.toLowerCase(), c);
+      for (const c of whole) for (const a of c.aliases) add(this._folded, a.toLowerCase(), c);
       this._sidecars = new Map();
     }
-    /** a contig by name or alias: as written, else ignoring case, with or without "chr" (null if there is none) */
+    /** a contig by name or alias: as written, else a whole contig ignoring case, with or without "chr" (null if there is
+        none) */
     contig(name) {
       if (name && typeof name === "object") return name;
       const s = String(name);

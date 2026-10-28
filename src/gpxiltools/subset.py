@@ -33,6 +33,7 @@ from .container import (
     parse_region,
     path_name,
     sort_planes,
+    split_names,
 )
 from .encode import contig_aliases
 from .palettes import DEFAULT_PALETTE, PALETTES
@@ -44,14 +45,7 @@ _OWN_KEYS = {"gpxil", "generator", "created", "layout", "palette", "reference", 
 
 def _items(contigs: Iterable[str]) -> list[str]:
     """The contigs and regions asked for: commas separate names, but not in a region, where they group digits."""
-    out = []
-    for item in contigs:
-        item = str(item).strip()
-        if ":" in item:  # (a region, 'chr17:7,661,779-7,687,546', or a window's name)
-            out.append(item)
-        else:
-            out += [x.strip() for x in item.split(",") if x.strip()]
-    return out
+    return [x for item in contigs for x in split_names(item)]
 
 
 def _locate(g: GpxilFile, text: str):
@@ -76,9 +70,9 @@ def plan(g: GpxilFile, contigs: Iterable[str] | None) -> list[tuple[str, int, in
         return [(n, 0, g[n].length) for n in g.contigs]
     jobs = []
     for n in _items(contigs):
-        found = n if n in g else next((a for a in contig_aliases(n) if a in g), None)
+        found = g.find(n) or next((g.find(a) for a in contig_aliases(n) if g.find(a) is not None), None)
         if found is not None:
-            c = g[found]
+            c = found
             jobs.append((c.name, 0, c.length))
         elif g.windows_of(n):  # (a sequence of which the file holds windows: all of them)
             jobs += [(w.name, 0, w.length) for w in g.windows_of(n)]

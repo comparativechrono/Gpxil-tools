@@ -214,7 +214,9 @@ def test_where_regions_are(tmp_path, dense):
             w.locate("c9", 0, 10)
         # names as gpxil-read.js takes them: ignoring case, with or without 'chr'
         assert w.locate("C1", 1800, 1810) == w.locate("chrc1", 1800, 1810) == w.locate("c1", 1800, 1810)
-        assert w.locate("C1:1800-1851") == (x, 0, 52) and w.find("C1:1800-1851") is x and w.find("c9") is None
+        # (a window is found by its name as written: loose matching is for whole contigs, spec 3.1)
+        assert w.locate("C1:1800-1851") == (x, 0, 52) and w.find("c1:1800-1851") is x and w.find("C1:1800-1851") is None
+        assert w.find("c9") is None
         # a region is a stretch of one base or more
         for s, e in ((1805, 1805), (1805, 1800), (-5, 3)):
             with pytest.raises(IndexError):
@@ -388,7 +390,8 @@ def test_vcf_of_a_window_is_its_parents(tmp_path, dense):
         whole = list(iter_vcf_records(g["c1"], start=3333, end=4000))
         assert lines and all(line.startswith("c1\t") for line in lines)
         pos = [int(line.split("\t")[1]) for line in lines]
-        assert pos == sorted(pos) and pos[0] >= 3334
+        # (from the window's first base; a deletion there is anchored on the base before it, as N: spec 11.4)
+        assert pos == sorted(pos) and (pos[0] >= 3334 or (pos[0] == 3333 and lines[0].split("\t")[3].startswith("N")))
         # the same records, but at the window's first bases (a deletion there has no anchor in the window)
         inner = [line for line in whole if int(line.split("\t")[1]) > 3334 + 40]
         assert inner == [line for line in lines if int(line.split("\t")[1]) > 3334 + 40]
@@ -551,8 +554,13 @@ def test_windows_compare_with_whole_contigs_and_each_other(dense):
         assert res["total"]["bases"] == 567
         trio = compare_trio(w, g, g, [("c1", 3333, 3900)])
         assert trio["regions"][0]["contig"] == "c1" and trio["total"]["bases"] == 567
-        with pytest.raises(IndexError, match="isn't all in a window"):
-            compare_pair(w, g, [("c1", 100, 3900)])
+        # (no window holds it all: windows that join up may)
+        if any(j.start <= 100 and 3900 <= j.end for j in joins):
+            res = compare_pair(w, g, [("c1", 100, 3900)])
+            assert res["total"]["bases"] == 3800 and res["total"]["variant_bases"]["either"] == res["total"]["variant_bases"]["same"]
+        else:
+            with pytest.raises(IndexError, match="isn't all in a window"):
+                compare_pair(w, g, [("c1", 100, 3900)])
 
 
 def test_encode_region_on_the_command_line(tmp_path, dense, capsys):
@@ -705,3 +713,200 @@ def test_a_window_with_one_phase_set_needs_no_ps_plane(tmp_path, dense):
     subset(dense["whole"], out, [f"c1:{quiet + 1}-{quiet + 50}"], planes=["ref", "gt", "flags"], **QUIET)
     with pytest.raises(GpxilFormatError, match="more than one phase set"):
         subset(dense["whole"], out, [f"c1:{busy + 1}-{busy + 400}"], planes=["ref", "gt", "flags"], **QUIET)
+
+
+# ------------------------------------------------------------------ windows joined: hand-made cases
+
+
+def _small(tmp_path, records, n=400, seed=5, *, contig="c1"):
+    """A made-up contig of ``n`` bases and a VCF of ``records`` (VCF body lines, ``{ref(i:j)}`` filled in); the
+    reference, and the contig's calls encoded whole."""
+    rng = random.Random(seed)
+    ref = "".join(rng.choice(BASES) for _ in range(n))
+    fa = tmp_path / "ref.fa"
+    fa.write_text(fasta_text({contig: ref}))
+    vcf = tmp_path / "s.vcf"
+    head = [
+        "##fileformat=VCFv4.3",
+        f"##contig=<ID={contig},length={n}>",
+        *(f'##FORMAT=<ID={k},Number=1,Type=String,Description="{k}">' for k in ("GT", "GQ", "DP", "PS")),
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS",
+    ]
+    vcf.write_text("\n".join(head + [r(ref) for r in records]) + "\n")
+    whole = tmp_path / "whole.gpxil.tif"
+    encode(fa, whole, vcf=vcf, width=16, **QUIET)
+    return ref, fa, whole
+
+
+def _rec(pos, ref_fn, alt_fn, gt, **fmt):
+    keys = ["GT", *fmt]
+    vals = [gt, *(str(v) for v in fmt.values())]
+    return lambda ref: f"c1\t{pos}\t.\t{ref_fn(ref)}\t{alt_fn(ref)}\t50\tPASS\t.\t{':'.join(keys)}\t{':'.join(vals)}"
+
+
+def _other_base(ref, i):
+    return "ACGT".replace(ref[i - 1], "")[0]
+
+
+def _body(path, **kw) -> list[str]:
+    return [line for line in _vcf(path, **kw).splitlines() if not line.startswith("#")]
+
+
+def _combine(out, parts):
+    """One file of contigs copied from several (each (path, name))."""
+    with GpxilFile(parts[0][0]) as g0:
+        meta = g0.metadata
+    with GpxilWriter(out, width=16, sample=meta["sample"], reference=meta["reference"]) as w:
+        for path, name in parts:
+            with GpxilFile(path) as g:
+                w.copy_contig(g[name])
+
+
+def test_windows_with_different_planes_join(tmp_path):
+    """A window may leave planes out: joined with one that has them, each base keeps what the file holds there, and
+    where no window with the sample's planes holds a base, nothing is known of it."""
+    recs = [
+        _rec(p, lambda r, p=p: r[p - 1], lambda r, p=p: _other_base(r, p), "0|1", GQ=40 + p % 50, DP=30, PS="blk")
+        for p in (60, 80, 120, 160, 180)
+    ]
+    ref, fa, whole = _small(tmp_path, recs)
+    a, b, c = (tmp_path / f"{x}.gpxil.tif" for x in "abc")
+    subset(whole, a, ["c1:51-150"], **QUIET)  # (every plane)
+    subset(whole, b, ["c1:101-200"], planes=["ref", "gt", "flags"], **QUIET)  # (no quality, depth or phase sets)
+    subset(whole, c, ["c1:101-200"], planes=["ref"], **QUIET)  # (the reference only)
+    mixed, refonly = tmp_path / "mixed.gpxil.tif", tmp_path / "refonly.gpxil.tif"
+    _combine(mixed, [(a, "c1:51-150"), (b, "c1:101-200")])
+    _combine(refonly, [(a, "c1:51-150"), (c, "c1:101-200")])
+    body = _body(mixed, nocall_blocks=False)
+    assert [line.split("\t")[1] for line in body] == ["60", "80", "120", "160", "180"]
+    assert all(line.split("\t")[8] == "GT:GQ:DP:PS" for line in body[:3]) and all(line.split("\t")[8] == "GT" for line in body[3:])
+    assert _body(refonly, nocall_blocks=False) == _body(a, nocall_blocks=False)  # (a window without the sample adds nothing)
+    with GpxilFile(refonly) as g, GpxilFile(a) as one:
+        assert stats(g)["total"]["substitutions"]["heterozygous"] == 3
+        res = compare_pair(g, one)
+        assert res["total"]["events"]["substitutions"]["a"] == {
+            "total": 3,
+            "found": 3,
+            "missing": 0,
+            "other_genotype": 0,
+            "not_compared": 0,
+        }
+
+
+def test_regions_are_read_through_the_windows_that_join(tmp_path, capsys):
+    """A region in one window is read through the windows that overlap or touch it, and one that windows hold only
+    together is found in them: an event that one window cuts is whole."""
+    recs = [_rec(195, lambda r: r[194:206], lambda r: r[194], "1|0"), _rec(120, lambda r: r[119], lambda r: _other_base(r, 120), "0|1")]
+    ref, fa, whole = _small(tmp_path, recs)
+    two, union = tmp_path / "two.gpxil.tif", tmp_path / "union.gpxil.tif"
+    subset(whole, two, ["c1:101-200", "c1:151-300"], **QUIET)
+    subset(whole, union, ["c1:101-300"], **QUIET)
+    for regions in ([("c1", 190, 200)], [("c1", 110, 280)]):
+        assert _body(two, regions=regions) == _body(union, regions=regions) == _body(whole, regions=regions)
+    with GpxilFile(two) as w, GpxilFile(union) as u:
+        assert stats(w, [("c1", 190, 200)])["total"]["deletions"] == stats(u, [("c1", 190, 200)])["total"]["deletions"]
+        assert stats(w, [("c1", 190, 200)])["total"]["deletions"]["bases"] == 11
+        r = stats(w, [("c1", 110, 280)])["regions"][0]
+        assert r["window"] == "c1:101-200+c1:151-300" and r["deletions"]["bases"] == 11
+    assert main(["fasta", str(two), "--region", "c1:111-280", "--which", "1"]) == 0
+    assert capsys.readouterr().out.startswith(">c1:111-280_hap1\n")
+
+
+def test_windows_that_touch_count_once_in_all(tmp_path):
+    """An 11-base deletion and a phase set that cross the edge between two windows that touch: counted once."""
+    recs = [
+        _rec(90, lambda r: r[89:101], lambda r: r[89], "1|0", PS=7),
+        _rec(70, lambda r: r[69], lambda r: _other_base(r, 70), "1|0", PS=7),
+        _rec(120, lambda r: r[119], lambda r: _other_base(r, 120), "0|1", PS=7),
+    ]
+    ref, fa, whole = _small(tmp_path, recs)
+    touching, one = tmp_path / "touching.gpxil.tif", tmp_path / "one.gpxil.tif"
+    subset(whole, touching, ["c1:51-100", "c1:101-150"], **QUIET)
+    subset(whole, one, ["c1:51-150"], **QUIET)
+    with GpxilFile(touching) as t, GpxilFile(one) as o:
+        a, b = stats(t)["total"], stats(o)["total"]
+        assert a["deletions"] == b["deletions"] == {"heterozygous": 1, "homozygous": 0, "bases": 11}
+        assert a["phasing"] == b["phasing"] and b["phasing"]["phase_sets"] == 1
+    # a deletion that runs to the end of a window is counted, as far as the window holds it
+    end = tmp_path / "end.gpxil.tif"
+    subset(whole, end, ["c1:81-95"], **QUIET)
+    with GpxilFile(end) as e:
+        assert stats(e)["total"]["deletions"] == {"heterozygous": 1, "homozygous": 0, "bases": 5}
+
+
+def test_complex_alleles_with_the_same_data_in_windows_that_touch(tmp_path):
+    rng = random.Random(19)
+    ref = list("".join(rng.choice(BASES) for _ in range(100)))
+    ref[10] = ref[20] = "A"
+    ref = "".join(ref)
+    recs = [lambda r: "c1\t11\t.\tA\t<INS>\t50\tPASS\t.\tGT\t1|0", lambda r: "c1\t21\t.\tA\t<INS>\t50\tPASS\t.\tGT\t1|0"]
+    fa = tmp_path / "ref.fa"
+    fa.write_text(fasta_text({"c1": ref}))
+    vcf = tmp_path / "s.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n" + "\n".join(r(ref) for r in recs) + "\n"
+    )
+    whole = tmp_path / "whole.gpxil.tif"
+    encode(fa, whole, vcf=vcf, width=16, **QUIET)
+    two, one = tmp_path / "two.gpxil.tif", tmp_path / "one.gpxil.tif"
+    subset(whole, two, ["c1:6-20", "c1:21-30"], **QUIET)
+    subset(whole, one, ["c1:6-30"], **QUIET)
+    assert _body(two, nocall_blocks=False) == _body(one, nocall_blocks=False) and len(_body(one, nocall_blocks=False)) == 2
+
+
+def test_a_window_that_starts_in_a_deletion_writes_vcf_that_encodes_back(tmp_path):
+    """The deletion is anchored on the base before the window, as N, so that the base after it, where another
+    event is, has a record of its own."""
+    recs = [_rec(50, lambda r: r[49:60], lambda r: r[49], "1|0"), _rec(61, lambda r: r[60], lambda r: _other_base(r, 61), "1|0")]
+    ref, fa, whole = _small(tmp_path, recs, n=200, seed=15)
+    w = tmp_path / "w.gpxil.tif"
+    encode(fa, w, vcf=tmp_path / "s.vcf", regions=[("c1", 55, 80)], width=16, **QUIET)
+    body = _body(w, nocall_blocks=False)
+    assert [line.split("\t")[1:5] for line in body] == [["55", ".", "N" + ref[55:60], "N"], ["61", ".", ref[60], _other_base(ref, 61)]]
+    back = tmp_path / "back.vcf"
+    back.write_text(_vcf(w, nocall_blocks=False))
+    again = tmp_path / "again.gpxil.tif"
+    encode(fa, again, vcf=back, regions=[("c1", 55, 80)], width=16, **QUIET)
+    with GpxilFile(w) as a, GpxilFile(again) as b:
+        assert np.array_equal(a["c1:56-80"].read("gt"), b["c1:56-80"].read("gt")) and b["c1:56-80"].entry["encoding"]["conflicts"] == 0
+
+
+def test_names_with_colons_and_names_in_other_cases(tmp_path, capsys):
+    """'HLA-A*01:14' is a contig's name where the file has one so named, as gpxil-read.js reads it; lists of names
+    split at commas that aren't in a region; a whole contig is found ignoring case, a window only by its name."""
+    rng = random.Random(3)
+    seqs = {"HLA-A*01:14": "".join(rng.choice(BASES) for _ in range(300)), "HLA-A*01:20": "".join(rng.choice(BASES) for _ in range(200))}
+    fa = tmp_path / "hla.fa"
+    fa.write_text(fasta_text(seqs))
+    hla = tmp_path / "hla.gpxil.tif"
+    encode(fa, hla, width=16, **QUIET)
+    with GpxilFile(hla) as g:
+        assert g.region_of("HLA-A*01:14") == ("HLA-A*01:14", None, None) and g.region_of("HLA-A*01:14:5-9") == ("HLA-A*01:14", 4, 9)
+        assert g.locate("HLA-A*01:14")[0].name == "HLA-A*01:14"
+    assert main(["fasta", str(hla), "--region", "HLA-A*01:14"]) == 0
+    assert capsys.readouterr().out.startswith(">HLA-A*01:14\n")
+    out = tmp_path / "two.gpxil.tif"
+    assert main(["subset", str(hla), "HLA-A*01:14,HLA-A*01:20", "-o", str(out)]) == 0
+    with GpxilFile(out) as g:
+        assert g.contigs == ["HLA-A*01:14", "HLA-A*01:20"]
+    # (encode reads a region that is a reference contig's name as that contig)
+    again = tmp_path / "again.gpxil.tif"
+    encode(fa, again, regions=["HLA-A*01:14", "HLA-A*01:20:11-60"], width=16, **QUIET)
+    with GpxilFile(again) as g:
+        assert g.contigs == ["HLA-A*01:14", "HLA-A*01:20:11-60"]
+    assert parse_region("x:1-5,y") == ("x:1-5,y", None, None)
+    from gpxiltools.container import split_names
+
+    assert split_names("chr17:7,661,779-7,687,546,chr2, 3") == ["chr17:7,661,779-7,687,546", "chr2", "3"]
+    assert split_names("HLA-A*01:14,HLA-A*01:20") == ["HLA-A*01:14", "HLA-A*01:20"]
+
+
+def test_phase_sets_written_in_other_digits(tmp_path):
+    """'²' isn't a number in VCF: it is an identifier like any other."""
+    recs = [
+        _rec(30, lambda r: r[29], lambda r: _other_base(r, 30), "0|1", PS="²"),
+        _rec(40, lambda r: r[39], lambda r: _other_base(r, 40), "1|0", PS="077"),
+    ]
+    ref, fa, whole = _small(tmp_path, recs, n=100)
+    with GpxilFile(whole) as g:
+        assert g["c1"].entry["phase_set_ids"] == {"4294967295": "²"} and set(np.unique(g["c1"].read("ps")).tolist()) == {0, 77, 4294967295}

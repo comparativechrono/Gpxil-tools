@@ -432,6 +432,36 @@ def locate_cases(path: str) -> list[dict]:
     return out
 
 
+def locate_text_cases(path: str) -> list[dict]:
+    """Regions given as text, and where gpxiltools finds them (``GpxilFile.locate(text)``, as gpxil-read.js's
+    ``locate(text)``): a contig's name is that contig, else the text is read as a region."""
+    asked = [
+        "chr1:33,501-33,600",
+        "chr1:30001-34000",  # (a window's name)
+        "CHR1:30001-34000",  # (not a name as written: a region, found in the window of just that stretch)
+        "chr1:30001-34000:30,006-30,010",
+        "chr2:601",
+        "chr2: 601 - 610",
+        "2:601-610",
+        "chrM",
+        "chrm",
+        "chr1:10-5",
+        "chr1:0-5",
+        "chr9:1-10",
+        "chr1:01-5",
+    ]
+    out = []
+    with GpxilFile(path) as g:
+        for text in asked:
+            try:
+                c, a, b = g.locate(text)
+                out.append({"ask": text, "contig": c.name, "start": a, "end": b})
+            except (KeyError, IndexError, ValueError) as exc:
+                msg = exc.args[0] if exc.args else ""
+                out.append({"ask": text, "error": "contig" if str(msg).startswith("no contig") else "region"})
+    return out
+
+
 def expected_of(path: str, name: str, out_dir: str) -> dict:
     with GpxilFile(path) as g, tifffile.TiffFile(path) as t:
         offsets = [p.offset for p in t.pages]
@@ -534,6 +564,7 @@ def main(out_dir: str) -> None:
         "bad": bad,
         "odd": odd_files(out_dir),
         "locate": locate_cases(good["windows"]),
+        "locate_text": locate_text_cases(good["windows"]),
     }
     with open(os.path.join(out_dir, "expected.json"), "w") as fh:
         json.dump(expected, fh, indent=1)

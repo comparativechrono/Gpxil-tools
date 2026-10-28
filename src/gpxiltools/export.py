@@ -14,7 +14,7 @@ from typing import BinaryIO
 import numpy as np
 
 from . import codes as C
-from .container import Contig, join_contigs
+from .container import Contig
 
 CHUNK = 1 << 23  #: bases processed at a time
 
@@ -263,12 +263,14 @@ def _record(
     in its parent, spec 11.4)."""
     n = contig.length
     lo = p.lo
-    pad = ""  # (the base before a window, as the anchor of a deletion that runs to its end)
+    pad = ""  # (the base before a window, as the anchor of a deletion at its first base)
     if a0 == 0 and ((p.h[0][0] == C.HAP_DEL) or (p.h[1][0] == C.HAP_DEL)):
-        if b0 < p.hi:
-            b0 += 1  # deletion at the contig's (or a window's) first base: pad with the base after (VCF rule)
-        elif shift > 0:
-            pad = "N"  # deleted to the window's end: the base before it, which the window doesn't hold (spec 11.4)
+        if shift > 0:
+            # a window that starts inside a deletion: the record's anchor is the base before it, which it doesn't
+            # hold, written N (spec 11.4); so the record stops where the deletion's bases in the window do
+            pad = "N"
+        elif b0 < p.hi:
+            b0 += 1  # (a deletion at a sequence's first base, which VCF calls convert to never: the base after)
     ref_ascii = C.REF_TO_ASCII[np.bitwise_and(p.ref[a0 - lo : b0 - lo], 0x0F)]
     refseq = pad + ref_ascii.tobytes().decode()
     alleles: list[str | None] = []
@@ -448,27 +450,29 @@ def iter_vcf_records(
         yield line
 
 
-def _joined_pieces(pieces: list[tuple[Contig, int, int]]) -> list[tuple]:
-    """Pieces ``(contig, start, end)`` of one sequence, in order along it, joined where they overlap or touch: each
-    join as ``(view, start, end)``, the view being the contig of it that holds all the others or a
-    :class:`~gpxiltools.container.Stretch` of them (:func:`~gpxiltools.container.join_contigs`), at its offsets."""
-    out: list[tuple] = []
-    group: list[tuple[Contig, int, int]] = []
-    hi = -1
-
-    def flush():
-        lo_, hi_ = min(c.start + s for c, s, _ in group), max(c.start + e for c, _, e in group)
-        (view,) = join_contigs(list({id(c): c for c, _, _ in group}.values()))
-        out.append((view, lo_ - view.start, hi_ - view.start))
-
-    for c, s, e in sorted(pieces, key=lambda x: (x[0].start + x[1], x[0].start + x[2])):
-        if group and c.start + s > hi:
-            flush()
-            group = []
-        group.append((c, s, e))
-        hi = max(hi, c.start + e)
-    if group:
-        flush()
+def _view_pieces(pieces: list[tuple], views: list) -> list[tuple]:
+    """Pieces ``(contig, start, end)`` of one sequence, read through the file's joins of its contigs with the
+    sample's planes (``views``, :meth:`~gpxiltools.container.GpxilFile.stretches`): ``(view, start, end)`` at the
+    view's offsets, in order along the sequence, those of one view joined where they overlap or touch. A piece of a
+    contig without the sample's planes gives none."""
+    got: dict[int, list] = {}
+    for c, s, e in pieces:
+        if not c.has("gt"):
+            continue
+        a, b = c.start + s, c.start + e
+        for k, v in enumerate(views):
+            lo, hi = max(a, v.start), min(b, v.end)
+            if lo < hi:
+                got.setdefault(k, []).append((lo - v.start, hi - v.start))
+    out = []
+    for k in sorted(got, key=lambda k: views[k].start):
+        merged: list[list[int]] = []
+        for s, e in sorted(got[k]):
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        out += [(views[k], s, e) for s, e in merged]
     return out
 
 
@@ -476,10 +480,10 @@ def _pieces(gfile, contigs, regions) -> list[tuple[Contig, int, int]]:
     """What to export: (contig, start, end), the regions or contigs asked for (a sequence that only windows hold: all
     of them), by default every contig."""
     if regions:
-        return [gfile.locate(n, s, e) for n, s, e in regions]
+        return [gfile.locate(n, s, e, join=True) for n, s, e in regions]
     out = []
     for n in contigs or gfile.contigs:
-        if n not in gfile and gfile.windows_of(n):
+        if gfile.find(n) is None and gfile.windows_of(n):
             out += [(w, 0, w.length) for w in gfile.windows_of(n)]
         else:
             c, s, e = gfile.locate(n)
@@ -527,7 +531,8 @@ def write_vcf(
     count = 0
     for name in seqs:
         upto = 0  # (the position, 0-based, up to which records of the sequence have been written)
-        for c, s, e in _joined_pieces([x for x in pieces if x[0].parent == name and x[0].has("gt")]):
+        views = gfile.stretches(name, need="gt")
+        for c, s, e in _view_pieces([x for x in pieces if x[0].parent == name], views):
             for line in iter_vcf_records(c, chrom=name, nocall_blocks=nocall_blocks, start=s, end=e):
                 if upto and int(line.split("\t", 2)[1]) - 1 < upto:
                     continue  # (a record that reaches back into a stretch written already: written there)

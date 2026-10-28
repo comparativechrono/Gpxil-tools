@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable
 
 import numpy as np
 
-from .container import DEFAULT_COMPRESSION, DEFAULT_WIDTH, BigTiffNeeded, GpxilWriter, check_contig_name, region_text
+from .container import DEFAULT_COMPRESSION, DEFAULT_WIDTH, BigTiffNeeded, GpxilWriter, check_contig_name, parse_region, region_text
 from .fasta import FastaRecord, iter_fasta, sequence_digests
 from .palettes import DEFAULT_PALETTE
 from .vcf import TempSplit, encode_calls, load_bed, phased_ps, ps_numbering, read_header, record_span, window_entries, window_stretch
@@ -68,6 +68,22 @@ def male_haploid_mask(name: str, length: int) -> np.ndarray | None:
     return mask
 
 
+def _region_names(r) -> list[str]:
+    """The names a region asked for may be of: its contig's; for one given as text, also all of the text (a contig
+    may be named 'HLA-A*01:14')."""
+    if not isinstance(r, str):
+        return [r[0]]
+    return list(dict.fromkeys([r.strip(), parse_region(r)[0]]))
+
+
+def _region_of(r, known_as: set[str]) -> tuple[str, int | None, int | None]:
+    """A region asked for, on a contig known by ``known_as``: given as text, the whole contig if the text is its name
+    (as gpxil-read.js reads it), else the region it reads as."""
+    if not isinstance(r, str):
+        return tuple(r)
+    return (r.strip(), None, None) if r.strip() in known_as else parse_region(r)
+
+
 def reference_records(path, *, invalid: str = "error", wanted: Callable[[str], bool] | None = None):
     """The reference's sequences, one :class:`FastaRecord` per contig.
 
@@ -121,7 +137,7 @@ def encode(
     haploid_contigs: Iterable[str] = (),
     sex: str | None = None,
     contigs: Iterable[str] | None = None,
-    regions: Iterable[tuple[str, int | None, int | None]] | None = None,
+    regions: Iterable[tuple[str, int | None, int | None] | str] | None = None,
     ucsc_names: bool = False,
     include_ref: bool = True,
     planes: Iterable[str] | None = None,
@@ -140,11 +156,13 @@ def encode(
     reference plane, such as the Gpxil browser's GRCh38 files.
 
     ``regions``, ``(contig, start, end)`` with 0-based positions and the end
-    excluded (None and None: the whole contig), replace ``contigs``: each
-    stretch becomes a window (spec 3.1), a contig named for it
-    (``chr17:7561779-7787546``) that keeps the chromosome's positions and
-    holds what the whole chromosome's planes would hold there. Only the calls
-    that join up with it through overlapping spans are converted.
+    excluded (None and None: the whole contig), or text
+    (``chr17:7,561,779-7,787,546``; the name of a contig of the reference is
+    that contig), replace ``contigs``: each stretch becomes a window (spec
+    3.1), a contig named for it (``chr17:7561779-7787546``) that keeps the
+    chromosome's positions and holds what the whole chromosome's planes would
+    hold there. Only the calls that join up with it through overlapping spans
+    are converted.
 
     Returns a summary dict (also stored in the file's metadata). With
     ``bigtiff=None`` the file is classic TIFF unless it would pass 4 GiB, in
@@ -171,7 +189,13 @@ def encode(
             raise ValueError(f"sample {sample!r} not in {vcf} (samples: {', '.join(hdr.samples[:10])})")
         sample = hdr.samples[sample_index]
         log(f"splitting {os.path.basename(str(vcf))} by contig for sample {sample} ...")
-        asked = None if contigs is None and regions is None else {r[0] for r in regions} if regions is not None else set(contigs)
+        asked = (
+            None
+            if contigs is None and regions is None
+            else {n for r in regions for n in _region_names(r)}
+            if regions is not None
+            else set(contigs)
+        )
         if asked is not None:
             # (only the contigs asked for are kept, under any of their names)
             asked = {x for n in asked for x in (n, ucsc_name(n), *contig_aliases(n), *contig_aliases(ucsc_name(n)))}
@@ -190,7 +214,7 @@ def encode(
             haploid_contigs=haploid_contigs,
             sex=sex,
             contigs=None if contigs is None else set(contigs),
-            regions=None if regions is None else [tuple(r) for r in regions],
+            regions=None if regions is None else [r if isinstance(r, str) else tuple(r) for r in regions],
             ucsc_names=ucsc_names,
             include_ref=include_ref,
             planes=None if planes is None else list(planes),
@@ -290,7 +314,7 @@ def _encode_once(
 
         def wanted(n: str) -> bool:
             if regions is not None:
-                return any(r[0] in names_of(n) for r in regions)
+                return any(x in names_of(n) for r in regions for x in _region_names(r))
             return contigs is None or bool(names_of(n) & contigs)
 
         for rec in reference_records(fasta, invalid=invalid, wanted=wanted):
@@ -299,7 +323,8 @@ def _encode_once(
             if regions is not None:
                 # (whole contigs, and windows: their [start, end), in order)
                 targets = []
-                for k, (n, s, e) in enumerate(regions):
+                for k, r in enumerate(regions):
+                    n, s, e = _region_of(r, known_as)
                     if n in known_as:
                         found.add(k)
                         targets.append(None if e is None and not s else (s or 0, rec.length if e is None else e))
@@ -427,7 +452,7 @@ def _encode_once(
                 )
             calls = None  # (free the masks before the next contig)
         if regions is not None:
-            missing = [regions[k][0] for k in range(len(regions)) if k not in found]
+            missing = [_region_names(regions[k])[-1] for k in range(len(regions)) if k not in found]
             if missing:
                 raise ValueError(
                     f"the reference has no contig {missing[0]!r}" + (f" (nor {', '.join(missing[1:4])})" if len(missing) > 1 else "")

@@ -56,7 +56,7 @@
  "haplotype_1": "GTGGnc",
  "haplotype_2": "ACGTGGgc",
  "vcf_records": [
-  "chrT\t5\t.\tACG\tG\t.\tPASS\t.\tGT\t1|0",
+  "chrT\t4\t.\tNAC\tN\t.\tPASS\t.\tGT\t1|0",
   "chrT\t8\t.\tT\tTGG\t.\tPASS\t.\tGT\t1|1",
   "chrT\t9\t.\tA\tG\t.\tgpxil_filtered\t.\tGT\t./1"
  ]

@@ -9,8 +9,10 @@ ImageDescription.
 
 from __future__ import annotations
 
+import bisect
 import datetime as _dt
 import functools
+import heapq
 import io
 import json
 import math
@@ -51,8 +53,23 @@ def later_version(a, b) -> str:
 
 #: NAME:START-END or NAME:POS, 1-based; numbers may have commas and spaces, and don't begin with 0, so that a name with
 #: colons in it (HLA-A*01:01:01:01) is a name. The name ends at the last colon (gpxil-read.js's parseRegion is the same)
-_REGION = re.compile(r"^(.+):\s*([1-9][\d,\s]*?)\s*(?:-\s*([1-9][\d,\s]*?))?$")
-_ZERO = re.compile(r"^.+:\s*0\s*(?:-\s*[\d,\s]+)?$")  # (a region from position 0: an error, not a name)
+_REGION = re.compile(r"^(.+):[ ]*([1-9][0-9, ]*?)[ ]*(?:-[ ]*([1-9][0-9, ]*?))?$")
+_ZERO = re.compile(r"^.+:[ ]*0[ ]*(?:-[ ]*[0-9, ]+)?$")  # (a region from position 0: an error, not a name)
+#: commas that group a region's digits, after the piece of a region before them (split_names)
+_DIGIT_GROUP = re.compile(r"^[0-9]{3}(?:[ ]*-.*)?$")
+
+
+def split_names(text: str) -> list[str]:
+    """Names and regions given as text, separated by commas: 'chr1,chr2' -> ['chr1', 'chr2']; but commas that group
+    a region's digits stay in it, 'chr17:7,661,779-7,687,546,chr2' -> ['chr17:7,661,779-7,687,546', 'chr2'], and a
+    name with colons in it is a name, 'HLA-A*01:14,HLA-A*01:20' -> both."""
+    out: list[str] = []
+    for piece in str(text).split(","):
+        if out and ":" in out[-1] and _DIGIT_GROUP.match(piece.strip(" ")):
+            out[-1] += "," + piece
+        else:
+            out.append(piece)
+    return [x.strip(" ") for x in out if x.strip(" ")]
 
 
 def parse_region(text: str) -> tuple[str, int | None, int | None]:
@@ -60,7 +77,7 @@ def parse_region(text: str) -> tuple[str, int | None, int | None]:
     excluded out; 'chr17:7,676,154' -> one base, ('chr17', 7676153, 7676154); 'chr17' -> ('chr17', None, None). The
     name ends at the last colon, so a window's name (spec 3.1), 'chr17:7561779-7787546', can be followed by a region
     as well; numbers don't begin with 0, so 'HLA-A*01:01:01:01' is a name."""
-    text = str(text).strip()
+    text = str(text).strip(" \t\r\n")
     m = _REGION.match(text)
     if not m:
         if not text:
@@ -68,7 +85,7 @@ def parse_region(text: str) -> tuple[str, int | None, int | None]:
         if _ZERO.match(text):
             raise ValueError(f"bad interval in {text!r}: positions count from 1")
         return text, None, None
-    num = lambda x: int(re.sub(r"[,\s]", "", x))  # noqa: E731
+    num = lambda x: int(re.sub(r"[, ]", "", x))  # noqa: E731
     s = num(m.group(2))
     e = s if m.group(3) is None else num(m.group(3))
     if e < s:
@@ -222,10 +239,11 @@ def check_contig_name(name: str) -> None:
 
 
 def _whole_number(x) -> bool:
-    """An integer, also as JSON may write one (2.0), as JSON Schema's integer is."""
-    if isinstance(x, bool):
+    """An integer, also as JSON may write one (2.0), as JSON Schema's integer is; and one that JSON readers hold
+    exactly (at most 2^53 - 1, as gpxil-read.js reads it)."""
+    if isinstance(x, bool) or not (isinstance(x, int) or (isinstance(x, float) and x.is_integer())):
         return False
-    return isinstance(x, int) or (isinstance(x, float) and x.is_integer())
+    return abs(x) <= 2**53 - 1
 
 
 def check_window(name: str, length: int, window, aliases: Iterable[str] = ()) -> dict:
@@ -1064,15 +1082,29 @@ class Contig:
         return C.ref_to_ascii(self.read("ref", start, end)).decode("ascii")
 
 
+#: what a stretch reads where none of its contigs that have the sample's planes holds a base: nothing known there
+#: (spec 5.2-5.5). The reference, and extension planes, can't be made up: a stretch has them only if all its contigs do
+_STRETCH_FILL = {
+    "gt": ((C.HAP_UNKNOWN << 4) | C.HAP_UNKNOWN, np.uint8),
+    "flags": (0, np.uint8),
+    "gq": (C.QUAL_MISSING, np.uint8),
+    "dp": (C.QUAL_MISSING, np.uint8),
+    "ps": (0, np.uint32),
+}
+
+
 class Stretch:
     """Contigs of one sequence that overlap or touch, read as one contig over the stretch of it they cover together.
 
     Each holds what its parent holds over its bases (spec 3.1), so where they overlap they agree, and a stretch holds
     what a window of all of it would: an event cut by the end of one window is whole in the stretch, if another holds
-    the rest of it. A base is read from the contig that holds it and reaches furthest. The sidecars are merged, each
-    entry once (a window's copy, at its first base, of the COMPLEX entry of the allele that base belongs to, spec 3.1,
-    is left out where the entry itself is there). Offsets are the stretch's own: offset ``i`` is position ``start + i``
-    of the sequence. It reads as a :class:`Contig` does (``read``, ``has``, ``sidecar``, ``region`` …).
+    the rest of it. A base of a plane is read from a contig that has the plane and holds the base (the one that
+    reaches furthest). Where no contig with the sample's planes holds a base, the stretch says nothing is known there
+    (gt UNKNOWN, no flags, quality, depth or phase set), so contigs with different planes join too; it has the
+    reference, and extension planes, only if all its contigs do. The sidecars are merged, each entry once (a
+    window's copy, at its first base, of the COMPLEX entry of the allele that base belongs to, spec 3.1, is left out
+    where the entry itself is there). Offsets are the stretch's own: offset ``i`` is position ``start + i`` of the
+    sequence. It reads as a :class:`Contig` does (``read``, ``has``, ``sidecar``, ``region`` …).
     """
 
     def __init__(self, contigs: Iterable[Contig]):
@@ -1084,76 +1116,122 @@ class Stretch:
         self.end = max(c.end for c in self.parts)
         self.length = self.end - self.start
         self.parent = first.parent
-        self.parent_length = first.parent_length
-        self.parent_aliases = first.parent_aliases
+        self.parent_length = next((c.parent_length for c in self.parts if c.parent_length is not None), None)
+        self.parent_aliases = list(dict.fromkeys(a for c in self.parts for a in c.parent_aliases))
         self.width = first.width
         self.name = "+".join(c.name for c in self.parts)
         #: (where it lies, as a window's key says)
         self.window = {"of": self.parent, "start": self.start}
-        self.planes = [p for p in first.planes if all(p in c.pages for c in self.parts)]
+        self.planes = sort_planes({p for c in self.parts for p in c.planes if self.has(p)})
+        self._segments_of: dict[str, tuple[list, list]] = {}
         self._sidecar: list[SidecarEntry] | None = None
 
     def __repr__(self) -> str:
         return f"<Stretch {self.region()} of {', '.join(c.name for c in self.parts)}>"
 
     def parent_digests(self) -> dict:
-        return self.parts[0].parent_digests()
+        return next((d for d in (c.parent_digests() for c in self.parts) if d), {})
 
     def region(self, start: int = 0, end: int | None = None, *, commas: bool = True) -> str:
         end = self.length if end is None else end
         return region_text(self.parent, self.start + start, self.start + end, commas=commas)
 
     def has(self, plane: str) -> bool:
+        if plane in _STRETCH_FILL:
+            return any(c.has(plane) for c in self.parts)
         return all(c.has(plane) for c in self.parts)
+
+    def _segments(self, plane: str) -> tuple[list, list]:
+        """The stretch in pieces ``(a, b, contig)`` at its offsets, each read from the contig with the plane that holds
+        it and reaches furthest (None: no contig with the plane holds it); and the pieces' starts, to look them up."""
+        if plane not in self._segments_of:
+            parts = sorted((c for c in self.parts if c.has(plane)), key=lambda c: c.start)
+            bounds = sorted({self.start, self.end, *(c.start for c in parts), *(c.end for c in parts)})
+            heap: list = []
+            i = 0
+            segs: list[tuple[int, int, Contig | None]] = []
+            for a, b in zip(bounds, bounds[1:]):
+                while i < len(parts) and parts[i].start <= a:
+                    heapq.heappush(heap, (-parts[i].end, i, parts[i]))
+                    i += 1
+                while heap and -heap[0][0] <= a:
+                    heapq.heappop(heap)
+                owner = heap[0][2] if heap else None
+                if segs and segs[-1][2] is owner:
+                    segs[-1] = (segs[-1][0], b - self.start, owner)
+                else:
+                    segs.append((a - self.start, b - self.start, owner))
+            self._segments_of[plane] = (segs, [s[0] for s in segs])
+        return self._segments_of[plane]
 
     def read(self, plane: str, start: int = 0, end: int | None = None) -> np.ndarray:
         end = self.length if end is None else end
         if not (0 <= start <= end <= self.length):
             raise IndexError(f"{self.region()}: {start}-{end} outside 0-{self.length}")
-        pieces, pos = [], start
+        if not self.has(plane):
+            raise MissingPlaneError(f"{self.name} has no {plane!r} plane in all its contigs")
+        fill = _STRETCH_FILL.get(plane)
+        segs, starts = self._segments(plane)
+        pieces = []
+        k = max(0, bisect.bisect_right(starts, start) - 1)
+        pos = start
         while pos < end:
-            x = self.start + pos  # (in the sequence)
-            c = max((c for c in self.parts if c.start <= x < c.end), key=lambda c: c.end)
-            y = min(self.start + end, c.end)
-            pieces.append(c.read(plane, x - c.start, y - c.start))
-            pos = y - self.start
+            a, b, c = segs[k]
+            y = min(end, b)
+            if c is None:
+                pieces.append(np.full(y - pos, fill[0], dtype=fill[1]))
+            else:
+                pieces.append(c.read(plane, self.start + pos - c.start, self.start + y - c.start))
+            pos = y
+            k += 1
         if not pieces:
-            return self.parts[0].read(plane, 0, 0)
+            if fill is not None:
+                return np.zeros(0, dtype=fill[1])
+            return next(c for c in self.parts if c.has(plane)).read(plane, 0, 0)
         return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
 
     def sidecar(self) -> list[SidecarEntry]:
         if self._sidecar is None:
             seen: set[tuple] = set()
-            first: dict[tuple[int, str], int] = {}  # (hap, data) of a COMPLEX entry: where it is first
-            out = []
-            for c in self.parts:
+            out: list[SidecarEntry] = []
+            for c in sorted((c for c in self.parts if c.has("gt")), key=lambda c: c.start):
                 shift = c.start - self.start
                 for e in c.sidecar():
                     at = e.offset + shift
                     key = (at, e.hap, e.kind, e.data)
                     if key in seen:
                         continue
-                    if e.kind == "COMPLEX":
-                        if e.offset == 0 and first.get((e.hap, e.data), at) < at:
-                            continue  # (a window's copy of the entry, which another holds)
-                        first.setdefault((e.hap, e.data), at)
+                    if e.kind == "COMPLEX" and e.offset == 0 and shift > 0 and self._copied(out, at, e):
+                        continue  # (a window's copy of the entry that begins the run, which another window holds)
                     seen.add(key)
                     out.append(SidecarEntry(at, e.hap, e.kind, e.data))
             out.sort(key=lambda e: (e.offset, e.hap, e.kind))
             self._sidecar = out
         return self._sidecar
 
+    def _copied(self, entries: list[SidecarEntry], at: int, e: SidecarEntry) -> bool:
+        """Whether a COMPLEX entry at a window's first base, stretch offset ``at``, is the window's copy (spec 3.1):
+        the base before it is COMPLEX on that haplotype, in a run whose nearest entry before is the same."""
+        gt = int(self.read("gt", at - 1, at)[0])
+        if ((gt >> 4) if e.hap == 1 else (gt & 0x0F)) != C.HAP_COMPLEX:
+            return False
+        before = [x for x in entries if x.kind == "COMPLEX" and x.hap == e.hap and x.offset < at]
+        return bool(before) and max(before, key=lambda x: x.offset).data == e.data
 
-def join_contigs(contigs: Iterable[Contig]) -> list[Contig | Stretch]:
+
+def join_contigs(contigs: Iterable[Contig], need: str | None = None) -> list[Contig | Stretch]:
     """Contigs of one sequence joined where they overlap or touch, in order along it: each join as the contig of it
-    that holds all the others, or as a :class:`Stretch` of them."""
+    that holds all the others, or as a :class:`Stretch` of them. With ``need``, only the contigs that have that
+    plane."""
     out: list[Contig | Stretch] = []
     group: list[Contig] = []
-    for c in sorted(contigs, key=lambda c: (c.start, -c.end)):
-        if group and c.start > max(x.end for x in group):
+    hi = -1
+    for c in sorted((c for c in contigs if need is None or c.has(need)), key=lambda c: (c.start, -c.end)):
+        if group and c.start > hi:
             out.append(_joined(group))
             group = []
         group.append(c)
+        hi = max(hi, c.end) if len(group) > 1 else c.end
     if group:
         out.append(_joined(group))
     return out
@@ -1161,7 +1239,11 @@ def join_contigs(contigs: Iterable[Contig]) -> list[Contig | Stretch]:
 
 def _joined(group: list[Contig]) -> Contig | Stretch:
     lo, hi = min(c.start for c in group), max(c.end for c in group)
-    return next((c for c in group if c.start == lo and c.end == hi), None) or Stretch(group)
+    whole = next((c for c in group if c.start == lo and c.end == hi), None)
+    # (one contig that holds all the others, with every plane they have: itself)
+    if whole is not None and all(set(c.planes) <= set(whole.planes) for c in group):
+        return whole
+    return Stretch(group)
 
 
 class GpxilFile:
@@ -1220,11 +1302,13 @@ class GpxilFile:
         for e in meta["contigs"]:
             for a in e.get("aliases", []):
                 self._aliases.setdefault(a, e["name"])
-        # names, then other names, ignoring case: where two match, the first contig (as gpxil-read.js's contig())
+        # names, then other names, ignoring case, of whole contigs (a window is found by its name as written, so that
+        # a name loosely matched is never a window's: spec 3.1); where two match, the first (as gpxil-read.js's)
         self._folded: dict[str, str] = {}
-        for e in meta["contigs"]:
+        whole = [e for e in meta["contigs"] if "window" not in e]
+        for e in whole:
             self._folded.setdefault(e["name"].lower(), e["name"])
-        for e in meta["contigs"]:
+        for e in whole:
             for a in e.get("aliases", []):
                 self._folded.setdefault(a.lower(), e["name"])
 
@@ -1297,8 +1381,8 @@ class GpxilFile:
         return [c for c in self._contigs.values() if c.window is not None]
 
     def find(self, name: str) -> Contig | None:
-        """A contig by name or other name: as written, else ignoring case, with or without 'chr' (as gpxil-read.js's
-        ``contig()``); None if there is none. ``g[name]`` takes names only as written."""
+        """A contig by name or other name: as written, else a whole contig ignoring case, with or without 'chr' (as
+        gpxil-read.js's ``contig()``); None if there is none. ``g[name]`` takes names only as written."""
         if name in self:
             return self[name]
         n = str(name).lower()
@@ -1323,32 +1407,48 @@ class GpxilFile:
         wins = self.windows_of(whole.name if whole is not None else name)
         return ([whole] if whole is not None else []) + [w for w in wins if w is not whole]
 
-    def stretches(self, name: str | None = None) -> list[Contig | Stretch]:
+    def stretches(self, name: str | None = None, need: str | None = None) -> list[Contig | Stretch]:
         """The contigs of a sequence (by default, of every sequence, each in the order the file first holds it),
         joined where they overlap or touch: along each sequence in order, each join as the contig of it that holds
-        all the others, or as a :class:`Stretch` of them."""
+        all the others, or as a :class:`Stretch` of them. With ``need``, only the contigs that have that plane."""
         if name is not None:
-            return join_contigs(self.sequence_contigs(name))
+            return join_contigs(self.sequence_contigs(name), need)
         seqs: dict[str, list[Contig]] = {}
         for c in self:
             seqs.setdefault(c.parent, []).append(c)
-        return [s for cs in seqs.values() for s in join_contigs(cs)]
+        return [s for cs in seqs.values() for s in join_contigs(cs, need)]
 
-    def stretch_of(self, contig: Contig) -> Contig | Stretch:
-        """The join of the file's contigs of a contig's sequence that holds it (see :meth:`stretches`)."""
-        for s in join_contigs([c for c in self if c.parent == contig.parent]):
+    def stretch_of(self, contig: Contig | Stretch, need: str | None = None) -> Contig | Stretch:
+        """The join of the file's contigs of a contig's sequence that holds it (see :meth:`stretches`); the contig
+        itself if it has no ``need`` plane, or is a stretch already."""
+        if isinstance(contig, Stretch):
+            return contig
+        for s in join_contigs([c for c in self if c.parent == contig.parent], need):
             if s.start <= contig.start and contig.end <= s.end:
                 return s
         return contig
 
-    def locate(self, name: str, start: int | None = None, end: int | None = None) -> tuple[Contig, int, int]:
+    def region_of(self, text: str) -> tuple[str, int | None, int | None]:
+        """A region given as text, as gpxil-read.js's ``locate(text)`` reads it: the whole of a contig named so (as
+        :meth:`find` finds it), else :func:`parse_region` (``chr17:7,661,779-7,687,546``, ``chr17:7,676,154``)."""
+        c = self.find(str(text).strip(" \t\r\n"))
+        return (c.name, None, None) if c is not None else parse_region(text)
+
+    def locate(self, name: str, start: int | None = None, end: int | None = None, *, join: bool = False) -> tuple:
         """Where a region is: the contig that holds it, and the offsets ``[s, e)`` of the region there.
 
-        ``name`` names a contig, whole or a window, or a sequence that windows of the file hold (spec 3.1). ``start``
-        and ``end`` (0-based, the end excluded) are positions in the sequence, so on a window they are positions in
-        its parent, and a region of the parent is found in a window that holds all of it. Without them the region is
-        the whole contig: for a sequence that only windows hold, its window, if it has one only.
+        ``name`` names a contig, whole or a window (as :meth:`find` finds it), or a sequence that windows of the file
+        hold (spec 3.1). ``start`` and ``end`` (0-based, the end excluded) are positions in the sequence, so on a
+        window they are positions in its parent, and a region of the parent is found in a window that holds all of
+        it. Without them the region is the whole contig: for a sequence that only windows hold, its window, if it
+        has one only; and a ``name`` that no contig has is read as a region, ``chr17:7,661,779-7,687,546``, as
+        gpxil-read.js's ``locate(text)`` reads it. With ``join``, a region that no window holds all of, but windows
+        that overlap or touch hold together, is found in their :class:`Stretch`.
         """
+        if start is None and end is None and self.find(name) is None:
+            n, s, e = parse_region(name)  # (a region given as text: chr17:7,661,779-7,687,546)
+            if s is not None:
+                return self.locate(n, s, e, join=join)
         whole = start is None and end is None
         c = self.find(name)
         if c is not None:
@@ -1379,6 +1479,10 @@ class GpxilFile:
                     if s < e <= w.end:
                         return w, s - w.start, e - w.start
             e = s + 1 if end is None else end
+            if join and s < e:
+                for v in self.stretches(name):
+                    if v.start <= s and e <= v.end:
+                        return v, s - v.start, e - v.start
             raise IndexError(
                 f"{region_text(name, s, e, commas=True)} isn't all in a window of {path_name(self.path)}: it holds {_listed(wins)}"
             )

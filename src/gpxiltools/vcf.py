@@ -410,12 +410,9 @@ def record_span(call: Call, n: int) -> tuple[int, int, bool] | None:
 
 
 def ps_key(ps: str) -> str:
-    """A phase-set identifier as it is compared (spec 5.5): an integer from 1 to 2^32-1 as its digits ('077' is 77)."""
-    try:
-        v = int(ps)
-    except ValueError:
-        return ps
-    return str(v) if 1 <= v <= 0xFFFFFFFF else ps
+    """A phase-set identifier as it is compared (spec 5.5): one written in the digits 0-9 is an integer, compared as
+    one ('077' is 77, '00' is 0); any other is compared as it is written."""
+    return str(int(ps)) if ps.isascii() and ps.isdigit() else ps
 
 
 def phased_ps(call: Call, n: int) -> str | None:
@@ -435,7 +432,7 @@ def ps_numbering(keys: Iterable[str]) -> dict[str, int]:
     keys = list(dict.fromkeys(ps_key(k) for k in keys))
     out: dict[str, int] = {}
     for k in keys:
-        if k.isdigit() and 1 <= int(k) <= 0xFFFFFFFF:
+        if k.isascii() and k.isdigit() and 1 <= int(k) <= 0xFFFFFFFF:
             out[k] = int(k)
     taken = set(out.values())
     nxt = 0xFFFFFFFF

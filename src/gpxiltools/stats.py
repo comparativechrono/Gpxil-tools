@@ -286,7 +286,7 @@ def region_tally(contig, start: int = 0, end: int | None = None, *, chunk: int =
                 lo, hi = s + int(pos[f]), s + int(pos[lst])
                 b = blocks.setdefault(v, [lo, hi])
                 b[0], b[1] = min(b[0], lo), max(b[1], hi)
-    # deletions that begin in the region and go on past it: followed to their ends
+    # deletions that begin in the region and go on past it: followed to their ends, or to the end of the contig
     s = end
     while any(r.following for r in runs) and s < contig.length:
         e = min(contig.length, s + chunk)
@@ -295,6 +295,9 @@ def region_tally(contig, start: int = 0, end: int | None = None, *, chunk: int =
             if r.following:
                 r.follow(C.normalize_states(f(gt)) == C.HAP_DEL, s, contig.length)
         s = e
+    for r in runs:
+        if r.following:
+            r._close(contig.length)  # (a deletion to the end of what the contig holds)
     # deletions: homozygous when both haplotypes have the same run, or there is one copy
     same = {(a, b) for a, b, _ in runs[0].runs} & {(a, b) for a, b, _ in runs[1].runs}
     for k, r in enumerate(runs):
@@ -338,22 +341,31 @@ def _one_copy_at(contig, offset: int) -> bool:
 
 def _wanted(gfile, regions) -> list[tuple]:
     """The regions asked for, each ``(contig, start, end)`` at the contig's own offsets: a sequence named that only
-    windows hold (spec 3.1) is each of them."""
+    windows hold (spec 3.1) is each of them; a region that windows hold together, their stretch."""
     out = []
     for name, s, e in regions or [(n, None, None) for n in gfile.contigs]:
         if s is None and e is None and gfile.find(name) is None and len(gfile.windows_of(name)) > 1:
             out += [(w, 0, w.length) for w in gfile.windows_of(name)]
         else:
-            out.append(gfile.locate(name, s, e))
+            out.append(gfile.locate(name, s, e, join=True))
     return out
+
+
+def _through(gfile, c, s: int, e: int) -> tuple:
+    """A region read through the file's join of the contigs of its sequence that holds it (a Stretch of windows that
+    overlap or touch), so that an event cut by the end of one window is counted whole: (view, start, end)."""
+    v = gfile.stretch_of(c)
+    return v, c.start + s - v.start, c.start + e - v.start
 
 
 def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple]:
     """Tallies of ``regions``: ``(contig, start, end)``, 0-based, start and end None for the whole contig, end None
     for the rest of it (default: every contig). On a window (spec 3.1) they are positions in its parent, and a
-    sequence named that only windows hold is each of its windows. Returns ``(contig, start, end, Tally)`` with the
-    :class:`~gpxiltools.container.Contig` and its own offsets."""
-    return [(c, s, e, region_tally(c, s, e, chunk=chunk)) for c, s, e in _wanted(gfile, regions)]
+    sequence named that only windows hold is each of its windows. A region is read through the file's windows that
+    overlap or touch the one that holds it, so an event that one cuts is counted whole, in the region it begins in.
+    Returns ``(contig, start, end, Tally)`` with the :class:`~gpxiltools.container.Contig` (or the
+    :class:`~gpxiltools.container.Stretch` of windows that hold it together) and its own offsets."""
+    return [(c, s, e, region_tally(*_through(gfile, c, s, e), chunk=chunk)) for c, s, e in _wanted(gfile, regions)]
 
 
 def _in_all(gfile, parts, chunk: int) -> Tally:
@@ -365,12 +377,12 @@ def _in_all(gfile, parts, chunk: int) -> Tally:
         seqs.setdefault(c.parent, []).append((c, s, e, t))
     for name, ps in seqs.items():
         spans = sorted((c.start + s, c.start + e) for c, s, e, _ in ps)
-        if all(a[1] <= b[0] for a, b in zip(spans, spans[1:])):
-            got = [t for *_, t in ps]  # (no two overlap: the sum of them)
+        if all(a[1] < b[0] for a, b in zip(spans, spans[1:])):
+            got = [t for *_, t in ps]  # (no two overlap or touch: the sum of them)
         else:
             union: list[list[int]] = []
             for a, b in spans:
-                if union and a < union[-1][1]:
+                if union and a <= union[-1][1]:
                     union[-1][1] = max(union[-1][1], b)
                 else:
                     union.append([a, b])

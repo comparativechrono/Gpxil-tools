@@ -12,23 +12,32 @@ from . import __version__
 
 def _names(text: str) -> list[str]:
     """Contig names given as text: commas separate them, but not in a region, where they group digits."""
-    from .subset import _items
+    from .container import split_names
 
-    return _items([text])
+    return split_names(text)
 
 
 def _region(text: str | None):
-    """'chr21' -> ('chr21', None, None); 'chr21:5,000,001-5,100,000' -> ('chr21', 5000000, 5100000), and
-    'chr21:5,000,001' one base: 0-based, the end excluded. The name ends at the last colon, so a window's name (spec
-    3.1) can be a region's too."""
+    """A region given as text, checked that it reads as one, and kept as text: what it is depends on the file (a
+    contig may be named 'HLA-A*01:14'), so each command reads it with the file's ``region_of`` (:func:`_in`)."""
     if text is None:
         return None
     from .container import parse_region
 
     try:
-        return parse_region(text)
+        parse_region(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"{exc}; use CONTIG or CONTIG:START-END (1-based, inclusive)") from None
+    return text
+
+
+def _in(g, texts):
+    """Regions given as text, as the file reads them: ``(name, start, end)``, 0-based, the end excluded; 'chr21'
+    the whole contig, 'chr21:5,000,001-5,100,000' a region, 'chr21:5,000,001' one base, and a contig's name always
+    that contig (spec 3.1: a window's name is its region)."""
+    if texts is None:
+        return None
+    return [g.region_of(x) for x in texts]
 
 
 class _TextAsBytes:
@@ -185,7 +194,7 @@ def cmd_stats(a) -> int:
     from .stats import format_stats, stats
 
     with _open(a) as g:
-        res = stats(g, a.regions or None)
+        res = stats(g, _in(g, a.regions) or None)
     print(json.dumps(res, indent=2) if a.json else format_stats(res))
     return 0
 
@@ -206,10 +215,11 @@ def cmd_compare(a) -> int:
         for path in [a.files[0], a.father, a.mother] if trio else a.files:
             files.append(GpxilFile(path, reference=a.reference))
         kw = {"gap": a.gap, "all_calls": a.all_calls}
-        res = compare_trio(*files, a.region, **kw) if trio else compare_pair(*files, a.region, **kw)
+        regions = _in(files[0], a.region)
+        res = compare_trio(*files, regions, **kw) if trio else compare_pair(*files, regions, **kw)
         if a.output:
             first = res["regions"][0]
-            name, start, end = a.draw or (first["contig"], first["start"] - 1, first["end"])
+            name, start, end = files[0].region_of(a.draw) if a.draw else (first["contig"], first["start"] - 1, first["end"])
             pic = picture(files, name, start, end, bases_per_row=a.width, palette=a.palette, **kw)
             pic = pic.scaled(a.scale)
             if a.output.lower().endswith((".tif", ".tiff")):
@@ -232,7 +242,7 @@ def cmd_render(a) -> int:
     from .render import render
 
     with _open(a) as g:
-        c, start, end = g.locate(*a.region)
+        c, start, end = g.locate(*g.region_of(a.region))
         r = render(c, mode=a.mode, palette=a.palette, start=start, end=end, bases_per_row=a.width, mark_insertions=a.mark_insertions)
         if a.layout == "hilbert":
             import numpy as np
@@ -284,9 +294,9 @@ def cmd_fasta(a) -> int:
         with _open(a) as g:
             if a.which != "ref" and not g.sample_id:
                 raise SystemExit(f"gpxil: error: {a.file} has no sample, so only --which ref can be exported")
-            regions = [a.region] if a.region else [(n, None, None) for n in g.contigs]
+            regions = [g.region_of(a.region)] if a.region else [(n, None, None) for n in g.contigs]
             for name, s, e in regions:
-                c, s, e = g.locate(name, s, e)
+                c, s, e = g.locate(name, s, e, join=True)
                 if a.which != "ref" and not c.has("gt"):
                     print(f"note: {c.name} has no genotype plane (no calls); skipped", file=sys.stderr)
                     continue
@@ -314,7 +324,7 @@ def cmd_vcf(a) -> int:
     out = open(a.output, "w") if a.output else sys.stdout
     try:
         with _open(a) as g:
-            n = write_vcf(g, out, _names(a.contigs) if a.contigs else None, nocall_blocks=not a.no_nocall_blocks, regions=a.region)
+            n = write_vcf(g, out, _names(a.contigs) if a.contigs else None, nocall_blocks=not a.no_nocall_blocks, regions=_in(g, a.region))
     finally:
         if a.output:
             out.close()

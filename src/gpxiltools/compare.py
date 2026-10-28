@@ -381,7 +381,7 @@ def _common_regions(gfiles, regions):
     out = []
     if regions:
         for name, s, e in regions:
-            got = [g.locate(name, s, e) for g in gfiles]
+            got = [g.locate(name, s, e, join=True) for g in gfiles]
             lo = max(c.start + a for c, a, _ in got)
             hi = min(c.start + b for c, _, b in got)
             if lo >= hi:

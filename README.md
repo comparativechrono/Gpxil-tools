@@ -258,12 +258,13 @@ agree with bcftools on every non-overlapping record; where records overlap
   different haplotypes became one, which `gpxil compare` sees as one. Encode
   such a VCF again for version 0.2's rule (spec section 6.5).
 - A window holds only its stretch: a deletion that begins before it is seen
-  from its first base, and an insertion after the base before it, or a
-  COMPLEX allele that starts before it, isn't in it; its VCF records at its
-  ends say only what it holds (windows of a chromosome that overlap or touch
-  are read together, as one stretch of it). Readers of version 0.2 and
-  earlier (gpxiltools 0.6, say) read a window as an ordinary contig, with
-  positions counted from its first base.
+  from its first base, an insertion after the base before it isn't in it,
+  and a COMPLEX allele that starts before it and runs into it is held as a
+  copy at its first base; its VCF records at its ends say only what it holds
+  (windows of a chromosome that overlap or touch are read together, as one
+  stretch of it). Readers of version 0.2 and earlier (gpxiltools 0.6, say)
+  read a window as an ordinary contig, with positions counted from its first
+  base.
 
 A gpxil file of a person, and every faithful rendering or book of it, is that
 person's genome: handle it like the VCF it came from.
