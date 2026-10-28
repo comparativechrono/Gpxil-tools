@@ -31,8 +31,8 @@ Genomes compared. Files are unchanged.
   its classes over the reference faded. `--json` gives every count to
   programs.
 - In Python: `gpxiltools.compare.compare_pair`, `compare_trio`, `picture`
-  and `format_compare`. Chromosome 17 takes about 4 s for two genomes and
-  6 s for a trio, reading a megabase at a time.
+  and `format_compare`. Chromosome 17 takes about 2.5 s, for two genomes or
+  a trio (about 10 s in the browser), reading a megabase at a time.
 - Checked against VCF records, independently of gpxiltools, on GIAB's HG002
   (v4.2.1 against v5.0q) and the HG002-HG003-HG004 trio, and on 806 indels
   moved along repeats ([Gpxil-scratchpad, experiment 03](https://github.com/comparativechrono/gpxil-scratchpad/tree/main/experiments/03-compare)).
