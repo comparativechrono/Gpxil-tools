@@ -12,7 +12,7 @@ import numpy as np
 from .container import DEFAULT_COMPRESSION, DEFAULT_WIDTH, BigTiffNeeded, GpxilWriter, check_contig_name, region_text
 from .fasta import FastaRecord, iter_fasta, sequence_digests
 from .palettes import DEFAULT_PALETTE
-from .vcf import TempSplit, encode_calls, load_bed, read_header, record_span, window_entries, window_stretch
+from .vcf import TempSplit, encode_calls, load_bed, phased_ps, ps_numbering, read_header, record_span, window_entries, window_stretch
 
 # GRCh38 pseudoautosomal regions, 0-based half-open (GRC definitions).
 GRCH38_PAR = {
@@ -82,6 +82,14 @@ def reference_records(path, *, invalid: str = "error", wanted: Callable[[str], b
         return
     with GpxilFile(path) as g:
         for c in g:
+            if c.window is not None:
+                # (a window holds a stretch of its sequence: a VCF's calls on the sequence can't all be placed on it)
+                if wanted is None or any(wanted(n) for n in (c.parent, *c.parent_aliases)):
+                    raise GpxilFormatError(
+                        f"{path}: {c.name} is a window of {c.parent} (a stretch of it), so it can't be the reference:"
+                        f" give all of {c.parent} (a FASTA file, or a gpxil file of it), with --region for a stretch"
+                    )
+                continue
             names = [c.name, *c.entry.get("aliases", [])]
             if wanted is not None and not any(wanted(n) for n in names):
                 continue
@@ -336,9 +344,17 @@ def _encode_once(
                     calls = (vname, callable_mask, haploid_mask)
                     got: list = []
 
-                    def spans(vname=vname, n=rec.length, got=got):
+                    def scan(vname=vname, n=rec.length, got=got):
+                        """the spans of the contig's calls, and the values of its phase-set identifiers (spec 5.5):
+                        worked out once, for all its windows"""
                         if not got:
-                            got.append([record_span(c, n) for c in split.calls(vname)])
+                            spans, keys = [], []
+                            for c in split.calls(vname):
+                                spans.append(record_span(c, n))
+                                k = phased_ps(c, n)
+                                if k is not None:
+                                    keys.append(k)
+                            got.append((spans, ps_numbering(keys)))
                         return got[0]
 
             for target in targets:
@@ -364,7 +380,7 @@ def _encode_once(
                 if calls:
                     vname, callable_mask, haploid_mask = calls
                     var_planes, side, stats, ps_ids = _convert(
-                        split, vname, rec, name, target, callable_mask, haploid_mask, [p for p in plane_set if p != "ref"], spans
+                        split, vname, rec, name, target, callable_mask, haploid_mask, [p for p in plane_set if p != "ref"], scan
                     )
                     data.update(var_planes)
                     entry["vcf_contig"] = vname
@@ -435,17 +451,19 @@ def _encode_once(
     return totals
 
 
-def _convert(split, vname, rec, name, target, callable_mask, haploid_mask, planes, spans):
+def _convert(split, vname, rec, name, target, callable_mask, haploid_mask, planes, scan):
     """The sample's planes, sidecar, counts and phase sets of a contig, or of a window ``target`` = (start, end) of it
     (spec 3.1): converted from the calls that join up with the window through overlapping spans, alone, over the
-    stretch they cover, and cut to the window, which gives what converting the whole contig would. ``spans()`` gives
-    the spans of the contig's calls (:func:`record_span`), worked out once for all its windows."""
+    stretch they cover, and cut to the window, which gives what converting the whole contig would. ``scan()`` gives
+    the spans of the contig's calls (:func:`record_span`) and the values of its phase-set identifiers
+    (:func:`ps_numbering`), worked out once for all its windows."""
     n = rec.length
     if target is None:
         calls = split.calls(vname) if vname else iter(())
         return encode_calls(rec.codes, calls, contig=name, callable_mask=callable_mask, haploid_mask=haploid_mask, planes=planes)
     s, e = target
-    a, b, keep = window_stretch(spans() if vname else (), s, e)
+    spans, ps_values = scan() if vname else ((), {})
+    a, b, keep = window_stretch(spans, s, e)
     calls = split.calls(vname, keep) if vname else iter(())
     var_planes, side, stats, ps_ids = encode_calls(
         rec.codes[a:b],
@@ -456,6 +474,7 @@ def _convert(split, vname, rec, name, target, callable_mask, haploid_mask, plane
         planes=planes,
         origin=a,
         contig_length=n,
+        ps_values=ps_values,
     )
     cut = {p: np.ascontiguousarray(v[s - a : e - a]) for p, v in var_planes.items()}
     side = window_entries(side, s - a, e - a, int(var_planes["gt"][s - a])) if side else side

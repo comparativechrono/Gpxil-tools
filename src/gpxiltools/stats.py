@@ -336,25 +336,59 @@ def _one_copy_at(contig, offset: int) -> bool:
     return bool(C.hap2(contig.read("gt", offset, offset + 1))[0] == C.HAP_ABSENT)
 
 
-def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple]:
-    """Tallies of ``regions``: ``(contig, start, end)``, 0-based, start and end None for the whole contig, end None
-    for the rest of it (default: every contig). On a window (spec 3.1) they are positions in its parent. Returns
-    ``(contig, start, end, Tally)`` with the :class:`~gpxiltools.container.Contig` and its own offsets."""
-    if not regions:
-        regions = [(n, None, None) for n in gfile.contigs]
+def _wanted(gfile, regions) -> list[tuple]:
+    """The regions asked for, each ``(contig, start, end)`` at the contig's own offsets: a sequence named that only
+    windows hold (spec 3.1) is each of them."""
     out = []
-    for name, s, e in regions:
-        c, s, e = gfile.locate(name, s, e)
-        out.append((c, s, e, region_tally(c, s, e, chunk=chunk)))
+    for name, s, e in regions or [(n, None, None) for n in gfile.contigs]:
+        if s is None and e is None and gfile.find(name) is None and len(gfile.windows_of(name)) > 1:
+            out += [(w, 0, w.length) for w in gfile.windows_of(name)]
+        else:
+            out.append(gfile.locate(name, s, e))
     return out
 
 
+def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple]:
+    """Tallies of ``regions``: ``(contig, start, end)``, 0-based, start and end None for the whole contig, end None
+    for the rest of it (default: every contig). On a window (spec 3.1) they are positions in its parent, and a
+    sequence named that only windows hold is each of its windows. Returns ``(contig, start, end, Tally)`` with the
+    :class:`~gpxiltools.container.Contig` and its own offsets."""
+    return [(c, s, e, region_tally(c, s, e, chunk=chunk)) for c, s, e in _wanted(gfile, regions)]
+
+
+def _in_all(gfile, parts, chunk: int) -> Tally:
+    """The tally of all the regions together, each base once: where regions of a sequence overlap (windows that
+    overlap, say, or the sequence and a window of it), their union is counted, read as one stretch."""
+    total = None
+    seqs: dict[str, list] = {}
+    for c, s, e, t in parts:
+        seqs.setdefault(c.parent, []).append((c, s, e, t))
+    for name, ps in seqs.items():
+        spans = sorted((c.start + s, c.start + e) for c, s, e, _ in ps)
+        if all(a[1] <= b[0] for a, b in zip(spans, spans[1:])):
+            got = [t for *_, t in ps]  # (no two overlap: the sum of them)
+        else:
+            union: list[list[int]] = []
+            for a, b in spans:
+                if union and a < union[-1][1]:
+                    union[-1][1] = max(union[-1][1], b)
+                else:
+                    union.append([a, b])
+            views = gfile.stretches(name)  # (the file's contigs of the sequence, joined where they overlap or touch)
+            got = []
+            for a, b in union:
+                v = next(v for v in views if v.start <= a and b <= v.end)
+                got.append(region_tally(v, a - v.start, b - v.start, chunk=chunk))
+        for t in got:
+            total = t if total is None else total + t
+    return total
+
+
 def stats(gfile, regions=None, *, chunk: int = CHUNK) -> dict:
-    """What the file holds, counted per region and in all, as plain data (:func:`format_stats` makes a table of it)."""
+    """What the file holds, counted per region and in all, as plain data (:func:`format_stats` makes a table of it).
+    In all, each base is counted once, where regions overlap."""
     parts = tally(gfile, regions, chunk=chunk)
-    total = parts[0][3]
-    for *_, t in parts[1:]:
-        total = total + t
+    total = _in_all(gfile, parts, chunk)
     meta = gfile.metadata
     return {
         "file": str(gfile.path).rstrip("/").rsplit("/", 1)[-1],

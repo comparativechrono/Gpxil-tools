@@ -409,6 +409,45 @@ def record_span(call: Call, n: int) -> tuple[int, int, bool] | None:
     return p0, min(span_end, n), span_end > n
 
 
+def ps_key(ps: str) -> str:
+    """A phase-set identifier as it is compared (spec 5.5): an integer from 1 to 2^32-1 as its digits ('077' is 77)."""
+    try:
+        v = int(ps)
+    except ValueError:
+        return ps
+    return str(v) if 1 <= v <= 0xFFFFFFFF else ps
+
+
+def phased_ps(call: Call, n: int) -> str | None:
+    """The phase-set identifier a record gives its bases (spec 5.5, 6.5): that of a phased call of two alleles with a
+    ``PS``, not skipped (section 6.2); else None."""
+    if call.ps in (None, ".", "") or record_span(call, n) is None:
+        return None
+    alleles, phased = parse_gt(call.gt)
+    return ps_key(call.ps) if phased and len(alleles) == 2 else None
+
+
+def ps_numbering(keys: Iterable[str]) -> dict[str, int]:
+    """The values of a contig's phase-set identifiers (spec 5.5), given those of its phased calls in file order
+    (:func:`phased_ps`): an integer from 1 to 2^32-1 is itself, and the others take the largest values that none of
+    those integers takes, downwards from 2^32-1, in order of first appearance. So a window's values are those of a
+    contig of its whole parent, whichever calls it converts."""
+    keys = list(dict.fromkeys(ps_key(k) for k in keys))
+    out: dict[str, int] = {}
+    for k in keys:
+        if k.isdigit() and 1 <= int(k) <= 0xFFFFFFFF:
+            out[k] = int(k)
+    taken = set(out.values())
+    nxt = 0xFFFFFFFF
+    for k in keys:
+        if k not in out:
+            while nxt in taken:
+                nxt -= 1
+            out[k] = nxt
+            taken.add(nxt)
+    return out
+
+
 class PlaneBuilder:
     """Accumulates one sample's calls on one contig into gt/flags/... planes.
 
@@ -429,9 +468,13 @@ class PlaneBuilder:
         contig: str = "",
         origin: int = 0,
         contig_length: int | None = None,
+        ps_values: dict[str, int] | None = None,
     ):
         n = ref.shape[0]
         self.ref = ref
+        #: the values of the contig's phase-set identifiers (:func:`ps_numbering`), for a window; else worked out from the
+        #: calls given, which are then all the contig's
+        self.ps_values = ps_values
         self.contig = contig
         self.length = n
         self.origin = origin
@@ -547,12 +590,7 @@ class PlaneBuilder:
         self.w[h][anchor] |= _INS
 
     def _ps_ordinal(self, ps: str) -> int:
-        try:
-            v = int(ps)
-            if 1 <= v <= 0xFFFFFFFF:
-                ps = str(v)  # '077' and '77' are the same VCF integer
-        except ValueError:
-            pass
+        ps = ps_key(ps)  # ('077' and '77' are the same VCF integer)
         i = self._ps_index.get(ps)
         if i is None:
             self.ps_keys.append(ps)
@@ -872,38 +910,22 @@ class PlaneBuilder:
         return planes, side
 
     def _finish_ps(self, chunk: int) -> np.ndarray:
-        """Map phase-set ordinals to stored values (spec 5.5).
-
-        An integer PS in 1..2^32-1 is stored as is. Other identifiers get the
-        largest values not used by an integer PS on this contig, in order of
-        first appearance. Identifiers that end up on no base (every base of
-        their calls taken by other calls) are dropped.
-        """
+        """Map phase-set ordinals to stored values (spec 5.5): those of :func:`ps_numbering`, over every identifier
+        of the contig's phased calls. ``ps_ids`` gets those that end up on bases (an identifier all of whose bases
+        other calls took is on none)."""
         nkeys = len(self.ps_keys)
         counts = np.zeros(nkeys + 1, dtype=np.int64)
         for s in range(0, self.length, chunk):
             counts += np.bincount(self.ps_ord[s : s + chunk], minlength=nkeys + 1)
-        used = [i for i in range(1, nkeys + 1) if counts[i]]
-        ints: dict[int, int] = {}
-        for i in used:
-            try:
-                v = int(self.ps_keys[i - 1])
-            except ValueError:
-                continue
-            if 1 <= v <= 0xFFFFFFFF:
-                ints[i] = v
-        taken = set(ints.values())
+        values = self.ps_values if self.ps_values is not None else ps_numbering(self.ps_keys)
         lut = np.zeros(nkeys + 1, dtype=np.uint32)
-        nxt = 0xFFFFFFFF
-        for i in used:
-            v = ints.get(i)
-            if v is None:
-                while nxt in taken:
-                    nxt -= 1
-                v = nxt
-                taken.add(v)
-            lut[i] = v
-            self.ps_ids[self.ps_keys[i - 1]] = int(v)
+        for i in range(1, nkeys + 1):
+            key = self.ps_keys[i - 1]
+            if key not in values:
+                raise ValueError(f"{self.contig}: the phase set {key!r} isn't among the contig's (ps_values)")
+            lut[i] = values[key]
+            if counts[i]:
+                self.ps_ids[key] = int(values[key])
         ps = np.empty(self.length, dtype=np.uint32)
         for s in range(0, self.length, chunk):
             ps[s : s + chunk] = lut[self.ps_ord[s : s + chunk]]
@@ -942,10 +964,12 @@ def encode_calls(
     planes: Iterable[str] = ("gt", "flags"),
     origin: int = 0,
     contig_length: int | None = None,
+    ps_values: dict[str, int] | None = None,
 ) -> tuple[dict[str, np.ndarray], list[SidecarEntry], EncodeStats, dict[str, int]]:
     """Build variant planes for one contig from an iterable of :class:`Call`; or for a stretch of it that starts
     at ``origin`` (``ref`` and the masks being the stretch's, ``contig_length`` the contig's), from calls that lie
-    inside the stretch (see :func:`window_stretch`)."""
+    inside the stretch (see :func:`window_stretch`), with ``ps_values`` the values of the whole contig's phase-set
+    identifiers (:func:`ps_numbering`)."""
     wanted = set(planes)
     builder = PlaneBuilder(
         ref,
@@ -957,6 +981,7 @@ def encode_calls(
         contig=contig,
         origin=origin,
         contig_length=contig_length,
+        ps_values=ps_values,
     )
     for call in calls:
         builder.add(call)

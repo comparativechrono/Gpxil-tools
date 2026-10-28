@@ -91,7 +91,7 @@
         },
         "md5": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "refget": {"type": "string", "pattern": "^SQ\\.[A-Za-z0-9_-]{32}$"},
-        "aliases": {"type": "array", "items": {"type": "string"}},
+        "aliases": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "^[!-~]+$"}},
         "ploidy": {
           "oneOf": [{"enum": [1, 2]}, {"const": "mixed"}],
           "description": "From the gt plane: 1 if haplotype 2 is ABSENT at every base, 2 if nowhere, else mixed."
@@ -116,7 +116,11 @@
             "length": {"type": "integer", "minimum": 1, "description": "The parent's length."},
             "md5": {"type": "string", "pattern": "^[0-9a-f]{32}$", "description": "The parent's MD5."},
             "refget": {"type": "string", "pattern": "^SQ\\.[A-Za-z0-9_-]{32}$", "description": "The parent's refget identifier."},
-            "aliases": {"type": "array", "items": {"type": "string"}, "description": "The parent's other names."}
+            "aliases": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1, "pattern": "^[!-~]+$"},
+              "description": "The parent's other names."
+            }
           }
         },
         "encoding": {
@@ -174,6 +178,11 @@
       },
       "then": {"required": ["sample"], "properties": {"sample": {"type": "object", "required": ["id"]}}},
       "else": {"properties": {"sample": {"type": "null"}}}
+    },
+    {
+      "description": "A file that holds a window is gpxil 0.3 or later (SPEC.md 3.1, 9.1).",
+      "if": {"required": ["contigs"], "properties": {"contigs": {"contains": {"required": ["window"]}}}},
+      "then": {"properties": {"gpxil": {"pattern": "^0\\.([3-9]|[1-9][0-9]+)$"}}}
     }
   ]
 }

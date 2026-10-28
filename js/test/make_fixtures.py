@@ -276,6 +276,9 @@ def hand_files(out_dir: str) -> dict:
         ("window-text", {"of": "x", "start": "10"}),
         ("window-list", [1, 2]),
         ("window-no-parent", {"start": 3}),
+        ("window-length-null", {"of": "x", "start": 3, "length": None}),
+        ("window-md5-null", {"of": "x", "start": 3, "md5": None}),
+        ("window-refget-number", {"of": "x", "start": 3, "refget": 7}),
     ):
         contigs = [{"name": "c", "length": 20, "pages": {"ref": 0}, "window": window}]
         desc = json.dumps(
@@ -408,6 +411,14 @@ def locate_cases(path: str) -> list[dict]:
         ["chr1:30001-34000", 10, 20],
         ["chr9", None, None],
         ["chr1", 39990, 40010],  # (past the end of the window)
+        ["CHR1", 33500, 33600],  # (names ignoring case, with or without "chr", as contig() takes them)
+        ["1", 30000, 30010],
+        ["Chr2", 600, 610],
+        ["chr1", 33600, 33500],  # (a stretch of no bases, or less)
+        ["chr1", 33500, 33500],
+        ["chr1", 0, None],  # (from position 0 on: not "the whole contig")
+        ["chr1", 30005, None],
+        ["chrM", 0, None],
     ]
     out = []
     with GpxilFile(path) as g:

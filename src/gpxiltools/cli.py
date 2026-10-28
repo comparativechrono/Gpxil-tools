@@ -10,9 +10,17 @@ import sys
 from . import __version__
 
 
+def _names(text: str) -> list[str]:
+    """Contig names given as text: commas separate them, but not in a region, where they group digits."""
+    from .subset import _items
+
+    return _items([text])
+
+
 def _region(text: str | None):
-    """'chr21' -> ('chr21', None, None); 'chr21:5,000,001-5,100,000' -> ('chr21', 5000000, 5100000): 0-based, the end
-    excluded. The name ends at the last colon, so a window's name (spec 3.1) can be a region's too."""
+    """'chr21' -> ('chr21', None, None); 'chr21:5,000,001-5,100,000' -> ('chr21', 5000000, 5100000), and
+    'chr21:5,000,001' one base: 0-based, the end excluded. The name ends at the last colon, so a window's name (spec
+    3.1) can be a region's too."""
     if text is None:
         return None
     from .container import parse_region
@@ -78,8 +86,9 @@ def cmd_encode(a) -> int:
         invalid="N" if a.invalid_to_n else "error",
         bigtiff=True if a.bigtiff else None,
     )
-    mb = summary["bytes"] / 1e6
-    print(f"wrote {out}: {summary['contigs']} contigs, {summary['bases']:,} bases, {mb:,.1f} MB in {summary['seconds']}s", file=sys.stderr)
+    size = f"{summary['bytes'] / 1e6:,.1f} MB" if summary["bytes"] >= 1e5 else f"{summary['bytes'] / 1e3:,.1f} kB"
+    nc = summary["contigs"]
+    print(f"wrote {out}: {nc} contig{'s' if nc != 1 else ''}, {summary['bases']:,} bases, {size} in {summary['seconds']}s", file=sys.stderr)
     if summary.get("conflicts"):
         print(f"note: {summary['conflicts']} conflicting overlapping calls (later record kept); see `gpxil info --json`", file=sys.stderr)
     n = summary.get("overlapping_calls_reassigned") or 0
@@ -254,7 +263,7 @@ def cmd_book(a) -> int:
         info = make_book(
             g,
             a.output,
-            contigs=a.contigs.split(",") if a.contigs else None,
+            contigs=_names(a.contigs) if a.contigs else None,
             mode=a.mode,
             palette=a.palette,
             colorspace="rgb" if a.rgb else "cmyk",
@@ -305,7 +314,7 @@ def cmd_vcf(a) -> int:
     out = open(a.output, "w") if a.output else sys.stdout
     try:
         with _open(a) as g:
-            n = write_vcf(g, out, a.contigs.split(",") if a.contigs else None, nocall_blocks=not a.no_nocall_blocks, regions=a.region)
+            n = write_vcf(g, out, _names(a.contigs) if a.contigs else None, nocall_blocks=not a.no_nocall_blocks, regions=a.region)
     finally:
         if a.output:
             out.close()

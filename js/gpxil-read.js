@@ -636,6 +636,7 @@
       throw bad("its parent's aliases must be a list of names");
     const parent = new Set([w.of, ...(w.aliases || [])]);
     if (parent.has(c.name) || c.aliases.some((a) => parent.has(a))) throw bad("its names must differ from its parent's");
+    for (const k of ["md5", "refget"]) if (w[k] !== undefined && typeof w[k] !== "string") throw bad(`its parent's ${k} must be a string`);
     const str = (k) => (typeof w[k] === "string" ? w[k] : null);
     return {
       of: w.of,
@@ -649,12 +650,14 @@
 
   /** "chr17:7,661,779-7,687,546" -> {name: "chr17", start: 7661778, end: 7687546} (0-based, the end excluded);
       "chr17:7,661,779" -> one base; "chr17" -> {name: "chr17"}. The name ends at the last colon, so a window's name
-      (chr17:7561779-7787546) is a name too, and can be followed by a region. null for an interval that isn't one */
+      (chr17:7561779-7787546) is a name too, and can be followed by a region; numbers may have commas and spaces, and
+      don't begin with 0, so a name with colons in it (HLA-A*01:01:01:01) is a name. null for an interval that isn't
+      one (from position 0, or ending before it starts). gpxiltools' parse_region is the same */
   function parseRegion(text) {
     const t = String(text || "").trim();
     if (!t) return null;
-    const m = t.match(/^(.+):([\d,\s]+)(?:-([\d,\s]+))?$/);
-    if (!m) return { name: t };
+    const m = t.match(/^(.+):\s*([1-9][\d,\s]*?)\s*(?:-\s*([1-9][\d,\s]*?))?$/);
+    if (!m) return /^.+:\s*0\s*(?:-\s*[\d,\s]+)?$/.test(t) ? null : { name: t };
     const s = Number(m[2].replace(/[,\s]/g, ""));
     const e = m[3] === undefined ? s : Number(m[3].replace(/[,\s]/g, ""));
     if (!(Number.isSafeInteger(s) && Number.isSafeInteger(e) && s >= 1 && e >= s)) return null;
@@ -737,6 +740,8 @@
         it all. Without positions, the whole contig (for a sequence that only windows hold, its window, if it has
         one only). A text, "chr17:7,661,779-7,687,546", is read as a region, unless it is a contig's name */
     locate(name, start, end) {
+      if (start === null) start = undefined; // (null as in JSON: not given)
+      if (end === null) end = undefined;
       if (start === undefined && end === undefined && !(name && typeof name === "object")) {
         if (!this.contig(name)) {
           const r = parseRegion(name);
@@ -744,7 +749,7 @@
           if (r.start !== undefined) return this.locate(r.name, r.start, r.end);
         }
       }
-      const whole = end === undefined && !start;
+      const whole = start === undefined && end === undefined;
       const c = this.contig(name);
       if (c) {
         if (whole) return { contig: c, start: 0, end: c.length };
@@ -786,7 +791,6 @@
             .join(", ")})`,
         );
       }
-      if (start !== undefined && end !== undefined && this.contig(`${name}:${start + 1}-${end}`)) return this.locate(`${name}:${start + 1}-${end}`);
       throw fail("contig", `no contig ${name}`);
     }
     /** the page of a contig's plane */

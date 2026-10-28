@@ -49,23 +49,31 @@ def later_version(a, b) -> str:
     return str(a) if version_key(a) >= version_key(b) else str(b)
 
 
-_REGION = re.compile(r"^(.+):([\d,]+)-([\d,]+)$")
+#: NAME:START-END or NAME:POS, 1-based; numbers may have commas and spaces, and don't begin with 0, so that a name with
+#: colons in it (HLA-A*01:01:01:01) is a name. The name ends at the last colon (gpxil-read.js's parseRegion is the same)
+_REGION = re.compile(r"^(.+):\s*([1-9][\d,\s]*?)\s*(?:-\s*([1-9][\d,\s]*?))?$")
+_ZERO = re.compile(r"^.+:\s*0\s*(?:-\s*[\d,\s]+)?$")  # (a region from position 0: an error, not a name)
 
 
 def parse_region(text: str) -> tuple[str, int | None, int | None]:
     """'chr17:7,661,779-7,687,546' -> ('chr17', 7661778, 7687546): 1-based and inclusive in, 0-based with the end
-    excluded out. 'chr17' -> ('chr17', None, None). The name ends at the last colon, so a window's name (spec 3.1),
-    'chr17:7561779-7787546', can be followed by a region as well."""
+    excluded out; 'chr17:7,676,154' -> one base, ('chr17', 7676153, 7676154); 'chr17' -> ('chr17', None, None). The
+    name ends at the last colon, so a window's name (spec 3.1), 'chr17:7561779-7787546', can be followed by a region
+    as well; numbers don't begin with 0, so 'HLA-A*01:01:01:01' is a name."""
     text = str(text).strip()
     m = _REGION.match(text)
     if not m:
         if not text:
             raise ValueError("an empty region")
+        if _ZERO.match(text):
+            raise ValueError(f"bad interval in {text!r}: positions count from 1")
         return text, None, None
-    name, s, e = m.group(1), int(m.group(2).replace(",", "")), int(m.group(3).replace(",", ""))
-    if s < 1 or e < s:
+    num = lambda x: int(re.sub(r"[,\s]", "", x))  # noqa: E731
+    s = num(m.group(2))
+    e = s if m.group(3) is None else num(m.group(3))
+    if e < s:
         raise ValueError(f"bad interval in {text!r}: give START-END, 1-based, START no more than END")
-    return name, s - 1, e
+    return m.group(1), s - 1, e
 
 
 def region_text(name: str, start: int, end: int, *, commas: bool = False) -> str:
@@ -214,7 +222,10 @@ def check_contig_name(name: str) -> None:
 
 
 def _whole_number(x) -> bool:
-    return isinstance(x, int) and not isinstance(x, bool)
+    """An integer, also as JSON may write one (2.0), as JSON Schema's integer is."""
+    if isinstance(x, bool):
+        return False
+    return isinstance(x, int) or (isinstance(x, float) and x.is_integer())
 
 
 def check_window(name: str, length: int, window, aliases: Iterable[str] = ()) -> dict:
@@ -227,8 +238,11 @@ def check_window(name: str, length: int, window, aliases: Iterable[str] = ()) ->
         raise GpxilFormatError(f"window {name}: 'of' must name its parent, in printable ASCII without whitespace")
     if not _whole_number(start) or start < 0:
         raise GpxilFormatError(f"window {name}: 'start' must be a whole number, 0 or more (got {start!r})")
-    if plen is not None and (not _whole_number(plen) or plen < 1):
+    if "length" in window and (not _whole_number(plen) or plen < 1):
         raise GpxilFormatError(f"window {name}: the parent's 'length' must be a whole number, 1 or more (got {plen!r})")
+    window = {**window, "start": int(start), **({"length": int(plen)} if plen is not None else {})}
+    start = window["start"]
+    plen = window.get("length")
     if plen is not None and start + length > plen:
         raise GpxilFormatError(f"window {name} runs past the end of {of}: {start:,} + {length:,} bases > {plen:,}")
     others = window.get("aliases", [])
@@ -741,13 +755,15 @@ class GpxilWriter:
         if digester is not None and "ref" not in pages:  # (not written, but its bases can be read: for the digests)
             for s in range(start, end, 1 << 24):
                 digester.update(src.read("ref", s, min(end, s + (1 << 24))))
-        extra: dict = {k: src.entry[k] for k in ("vcf_contig", "invalid_characters_converted_to_N") if k in src.entry}
+        # (the VCF contig, with the sample's planes only, as copy_contig keeps it)
+        keys = ("vcf_contig", "invalid_characters_converted_to_N") if "gt" in pages else ("invalid_characters_converted_to_N",)
+        extra: dict = {k: src.entry[k] for k in keys if k in src.entry}
         if digester is not None:
             extra.update(digester.result())
         extra["window"] = win
         if "gt" in pages:
             extra["ploidy"] = 1 if seen["absent2"] == n else 2 if seen["absent2"] == 0 else "mixed"
-        if "ps" in pages:
+        if "ps" in pages and seen["ps"]:  # (as encode writes it: with no phase set on its bases, none)
             extra["phase_sets"] = len(seen["ps"])
             ids = src.entry.get("phase_set_ids")
             if isinstance(ids, dict):
@@ -975,7 +991,11 @@ class Contig:
             if (n is not None and len(codes) != n) or len(codes) < self.end:
                 raise GpxilFormatError(f"{rec_name} in {path} has length {len(codes):,}, not {n or self.length:,}")
             if self.window is None or not any(isinstance(self.entry.get(k), str) for k in ("md5", "refget")):
-                dig = sequence_digests(codes)  # (a whole contig; or a window that gives only its parent's digests)
+                # (a whole contig; or a window that gives only its parent's digests: worked out once for the record)
+                got = self._g._ref_digests
+                if got is None or got[0] != rec_name or got[1] is not codes:
+                    got = self._g._ref_digests = (rec_name, codes, sequence_digests(codes))
+                dig = got[2]
                 for k, v in self.parent_digests().items():
                     if dig[k] != v:
                         raise GpxilFormatError(f"{rec_name} in {path} does not match the {k} of {self.parent}")
@@ -1044,6 +1064,106 @@ class Contig:
         return C.ref_to_ascii(self.read("ref", start, end)).decode("ascii")
 
 
+class Stretch:
+    """Contigs of one sequence that overlap or touch, read as one contig over the stretch of it they cover together.
+
+    Each holds what its parent holds over its bases (spec 3.1), so where they overlap they agree, and a stretch holds
+    what a window of all of it would: an event cut by the end of one window is whole in the stretch, if another holds
+    the rest of it. A base is read from the contig that holds it and reaches furthest. The sidecars are merged, each
+    entry once (a window's copy, at its first base, of the COMPLEX entry of the allele that base belongs to, spec 3.1,
+    is left out where the entry itself is there). Offsets are the stretch's own: offset ``i`` is position ``start + i``
+    of the sequence. It reads as a :class:`Contig` does (``read``, ``has``, ``sidecar``, ``region`` …).
+    """
+
+    def __init__(self, contigs: Iterable[Contig]):
+        self.parts = sorted(contigs, key=lambda c: (c.start, -c.end))
+        if not self.parts or len({c.parent for c in self.parts}) != 1:
+            raise ValueError("a stretch is of contigs of one sequence")
+        first = self.parts[0]
+        self.start = first.start
+        self.end = max(c.end for c in self.parts)
+        self.length = self.end - self.start
+        self.parent = first.parent
+        self.parent_length = first.parent_length
+        self.parent_aliases = first.parent_aliases
+        self.width = first.width
+        self.name = "+".join(c.name for c in self.parts)
+        #: (where it lies, as a window's key says)
+        self.window = {"of": self.parent, "start": self.start}
+        self.planes = [p for p in first.planes if all(p in c.pages for c in self.parts)]
+        self._sidecar: list[SidecarEntry] | None = None
+
+    def __repr__(self) -> str:
+        return f"<Stretch {self.region()} of {', '.join(c.name for c in self.parts)}>"
+
+    def parent_digests(self) -> dict:
+        return self.parts[0].parent_digests()
+
+    def region(self, start: int = 0, end: int | None = None, *, commas: bool = True) -> str:
+        end = self.length if end is None else end
+        return region_text(self.parent, self.start + start, self.start + end, commas=commas)
+
+    def has(self, plane: str) -> bool:
+        return all(c.has(plane) for c in self.parts)
+
+    def read(self, plane: str, start: int = 0, end: int | None = None) -> np.ndarray:
+        end = self.length if end is None else end
+        if not (0 <= start <= end <= self.length):
+            raise IndexError(f"{self.region()}: {start}-{end} outside 0-{self.length}")
+        pieces, pos = [], start
+        while pos < end:
+            x = self.start + pos  # (in the sequence)
+            c = max((c for c in self.parts if c.start <= x < c.end), key=lambda c: c.end)
+            y = min(self.start + end, c.end)
+            pieces.append(c.read(plane, x - c.start, y - c.start))
+            pos = y - self.start
+        if not pieces:
+            return self.parts[0].read(plane, 0, 0)
+        return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+
+    def sidecar(self) -> list[SidecarEntry]:
+        if self._sidecar is None:
+            seen: set[tuple] = set()
+            first: dict[tuple[int, str], int] = {}  # (hap, data) of a COMPLEX entry: where it is first
+            out = []
+            for c in self.parts:
+                shift = c.start - self.start
+                for e in c.sidecar():
+                    at = e.offset + shift
+                    key = (at, e.hap, e.kind, e.data)
+                    if key in seen:
+                        continue
+                    if e.kind == "COMPLEX":
+                        if e.offset == 0 and first.get((e.hap, e.data), at) < at:
+                            continue  # (a window's copy of the entry, which another holds)
+                        first.setdefault((e.hap, e.data), at)
+                    seen.add(key)
+                    out.append(SidecarEntry(at, e.hap, e.kind, e.data))
+            out.sort(key=lambda e: (e.offset, e.hap, e.kind))
+            self._sidecar = out
+        return self._sidecar
+
+
+def join_contigs(contigs: Iterable[Contig]) -> list[Contig | Stretch]:
+    """Contigs of one sequence joined where they overlap or touch, in order along it: each join as the contig of it
+    that holds all the others, or as a :class:`Stretch` of them."""
+    out: list[Contig | Stretch] = []
+    group: list[Contig] = []
+    for c in sorted(contigs, key=lambda c: (c.start, -c.end)):
+        if group and c.start > max(x.end for x in group):
+            out.append(_joined(group))
+            group = []
+        group.append(c)
+    if group:
+        out.append(_joined(group))
+    return out
+
+
+def _joined(group: list[Contig]) -> Contig | Stretch:
+    lo, hi = min(c.start for c in group), max(c.end for c in group)
+    return next((c for c in group if c.start == lo and c.end == hi), None) or Stretch(group)
+
+
 class GpxilFile:
     """An open gpxil file: a path, a URL (read with HTTP range requests) or a binary file object.
 
@@ -1072,6 +1192,7 @@ class GpxilFile:
         self._ref_contigs: dict[str, tuple[Contig, int]] = {}
         self._ref_cache: tuple[str, np.ndarray] | None = None  # (the FASTA record read last: its name and codes)
         self._ref_checked: set[str] = set()  # (the contigs checked against the FASTA's digests)
+        self._ref_digests: tuple | None = None  # (the digests of the FASTA record read last: its name, codes, digests)
         if reference is not None:
             self.attach_reference(reference)
         try:
@@ -1099,6 +1220,13 @@ class GpxilFile:
         for e in meta["contigs"]:
             for a in e.get("aliases", []):
                 self._aliases.setdefault(a, e["name"])
+        # names, then other names, ignoring case: where two match, the first contig (as gpxil-read.js's contig())
+        self._folded: dict[str, str] = {}
+        for e in meta["contigs"]:
+            self._folded.setdefault(e["name"].lower(), e["name"])
+        for e in meta["contigs"]:
+            for a in e.get("aliases", []):
+                self._folded.setdefault(a.lower(), e["name"])
 
     def __enter__(self) -> GpxilFile:
         return self
@@ -1135,6 +1263,7 @@ class GpxilFile:
         self._ref_contigs = {}
         self._ref_cache = None
         self._ref_checked = set()
+        self._ref_digests = None
 
     def _reference_gpxil(self) -> GpxilFile:
         if self._ref_file is None:
@@ -1167,9 +1296,50 @@ class GpxilFile:
         """The file's windows (spec 3.1), in file order."""
         return [c for c in self._contigs.values() if c.window is not None]
 
+    def find(self, name: str) -> Contig | None:
+        """A contig by name or other name: as written, else ignoring case, with or without 'chr' (as gpxil-read.js's
+        ``contig()``); None if there is none. ``g[name]`` takes names only as written."""
+        if name in self:
+            return self[name]
+        n = str(name).lower()
+        for k in (n, "chr" + n, n[3:] if n.startswith("chr") else n):
+            if k in self._folded:
+                return self._contigs[self._folded[k]]
+        return None
+
     def windows_of(self, name: str) -> list[Contig]:
-        """The windows of the sequence ``name`` (their parent's name, or another name of it), in file order."""
-        return [c for c in self.windows if name == c.parent or name in c.parent_aliases]
+        """The windows of the sequence ``name`` (their parent's name, or another name of it; ignoring case, with or
+        without 'chr', as gpxil-read.js's ``windowsOf()``), in file order."""
+        n = str(name).lower()
+        want = {n, "chr" + n, n[3:] if n.startswith("chr") else n}
+        return [c for c in self.windows if any(x.lower() in want for x in (c.parent, *c.parent_aliases))]
+
+    def sequence_contigs(self, name: str) -> list[Contig]:
+        """The contigs that hold bases of the sequence ``name``: the sequence itself, if the file holds it whole, and
+        its windows (spec 3.1), in file order."""
+        whole = self.find(name)
+        if whole is not None and whole.window is not None:
+            whole = None  # (a window's own name: not the name of a sequence)
+        wins = self.windows_of(whole.name if whole is not None else name)
+        return ([whole] if whole is not None else []) + [w for w in wins if w is not whole]
+
+    def stretches(self, name: str | None = None) -> list[Contig | Stretch]:
+        """The contigs of a sequence (by default, of every sequence, each in the order the file first holds it),
+        joined where they overlap or touch: along each sequence in order, each join as the contig of it that holds
+        all the others, or as a :class:`Stretch` of them."""
+        if name is not None:
+            return join_contigs(self.sequence_contigs(name))
+        seqs: dict[str, list[Contig]] = {}
+        for c in self:
+            seqs.setdefault(c.parent, []).append(c)
+        return [s for cs in seqs.values() for s in join_contigs(cs)]
+
+    def stretch_of(self, contig: Contig) -> Contig | Stretch:
+        """The join of the file's contigs of a contig's sequence that holds it (see :meth:`stretches`)."""
+        for s in join_contigs([c for c in self if c.parent == contig.parent]):
+            if s.start <= contig.start and contig.end <= s.end:
+                return s
+        return contig
 
     def locate(self, name: str, start: int | None = None, end: int | None = None) -> tuple[Contig, int, int]:
         """Where a region is: the contig that holds it, and the offsets ``[s, e)`` of the region there.
@@ -1179,9 +1349,9 @@ class GpxilFile:
         its parent, and a region of the parent is found in a window that holds all of it. Without them the region is
         the whole contig: for a sequence that only windows hold, its window, if it has one only.
         """
-        whole = end is None and not start
-        if name in self:
-            c = self[name]
+        whole = start is None and end is None
+        c = self.find(name)
+        if c is not None:
             if whole:
                 return c, 0, c.length
             s = c.start if start is None else start
@@ -1206,14 +1376,12 @@ class GpxilFile:
             for w in exact or wins:
                 if w.start <= s < w.end:
                     e = w.end if end is None else end
-                    if e <= w.end:
+                    if s < e <= w.end:
                         return w, s - w.start, e - w.start
             e = s + 1 if end is None else end
             raise IndexError(
                 f"{region_text(name, s, e, commas=True)} isn't all in a window of {path_name(self.path)}: it holds {_listed(wins)}"
             )
-        if start is not None and end is not None and region_text(name, start, end) in self:
-            return self.locate(region_text(name, start, end))  # (a contig named like a region)
         have = ", ".join(self.contigs[:8]) + (", …" if len(self) > 8 else "")
         raise KeyError(f"no contig {name!r} in {self.path} (it has {have})")
 

@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import codes as C
+from .container import Stretch
 
 CHUNK = 1 << 20  #: bases read at a time (each piece cut where no file has a variant nearby)
 GAP = 50  #: bases where two files differ no more than this far apart are one stretch
@@ -140,7 +141,7 @@ class _Chunk:
 class _Seq:
     """A contig seen in the coordinates of its sequence (spec 3.1): a window's offset i is position start + i of its
     parent; a whole contig is as it is. So files compare base for base whether they hold a whole chromosome or windows
-    of it."""
+    of it. A file's windows that overlap or touch are seen as one (a :class:`~gpxiltools.container.Stretch`)."""
 
     def __init__(self, contig):
         self.c = contig
@@ -374,7 +375,9 @@ def _names(c) -> set:
 def _common_regions(gfiles, regions):
     """(each file's contig, seen in its sequence's coordinates; start; end) of the regions asked for, or of every
     stretch of a sequence that all the files hold: the same contig in each, or windows of it (spec 3.1), where they
-    overlap. Positions are the sequence's: on a window, its parent's."""
+    overlap. Positions are the sequence's: on a window, its parent's. A file's windows that overlap or touch are seen
+    as one stretch of the sequence, so that every base is compared once, and an event cut by the end of one window
+    is seen whole where another holds the rest of it."""
     out = []
     if regions:
         for name, s, e in regions:
@@ -383,15 +386,16 @@ def _common_regions(gfiles, regions):
             hi = min(c.start + b for c, _, b in got)
             if lo >= hi:
                 raise ValueError(f"the files hold no stretch of {name} in common")
-            out.append(([_Seq(c) for c, _, _ in got], lo, hi))
+            out.append(([_Seq(g.stretch_of(c)) for g, (c, _, _) in zip(gfiles, got)], lo, hi))
         return out
-    for c0 in gfiles[0]:
+    joined = [g.stretches() for g in gfiles]
+    for c0 in joined[0]:
         combos = [[c0]]
-        for g in gfiles[1:]:
+        for js in joined[1:]:
             combos = [
                 cs + [c]
                 for cs in combos
-                for c in g
+                for c in js
                 if _names(c) & _names(c0) and max(c.start, *(x.start for x in cs)) < min(c.end, *(x.end for x in cs))
             ]
         for cs in combos:
@@ -407,10 +411,13 @@ def _bounds(views) -> tuple[int, int]:
 
 
 def _place(views, s: int, e: int) -> dict:
-    """A region compared, in the sequence's coordinates, and the windows it was read from."""
+    """A region compared, in the sequence's coordinates, and the windows it was read from: in each file, a window's
+    name, the names of the windows that overlap or touch, read as one, or None for a whole contig."""
     out = {"contig": views[0].name, "start": s + 1, "end": e}
     if any(v.c.window is not None for v in views):
-        out["windows"] = [v.c.name if v.c.window is not None else None for v in views]
+        out["windows"] = [
+            [x.name for x in v.c.parts] if isinstance(v.c, Stretch) else v.c.name if v.c.window is not None else None for v in views
+        ]
     return out
 
 

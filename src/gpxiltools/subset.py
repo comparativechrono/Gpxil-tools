@@ -85,7 +85,7 @@ def plan(g: GpxilFile, contigs: Iterable[str] | None) -> list[tuple[str, int, in
         else:
             c, s, e = _locate(g, n)
             jobs.append((c.name, s, e))
-    # (in the order of the file's sequences, and along each, windows by where they lie in it)
+    # (in the order of the file's sequences: each, if it is copied whole, then its windows by where they lie in it)
     seqs: dict[str, int] = {}
     for c in g:
         seqs.setdefault(c.parent, len(seqs))
@@ -93,7 +93,8 @@ def plan(g: GpxilFile, contigs: Iterable[str] | None) -> list[tuple[str, int, in
 
     def key(j):
         c = g[j[0]]
-        return seqs[c.parent], c.start + j[1], c.start + j[2], order[j[0]]
+        window = c.window is not None or (j[1], j[2]) != (0, c.length)
+        return seqs[c.parent], window, c.start + j[1], c.start + j[2], order[j[0]]
 
     return sorted(dict.fromkeys(jobs), key=key)
 
@@ -182,6 +183,10 @@ def _write(g: GpxilFile, out, jobs, compression: str, level: int | None, bigtiff
     palette = meta.get("palette") if meta.get("palette") in PALETTES else DEFAULT_PALETTE
     cuts = [j for j in jobs if (j[1], j[2]) != (0, g[j[0]].length)]
     source_version = str(meta["gpxil"])
+    # (the version whose rules for calls, section 6, the planes follow: the source's, or, for a copy of a copy, the
+    # version its own subset record gives)
+    rec = meta.get("subset")
+    rules = str(rec["gpxil"]) if isinstance(rec, dict) and rec.get("gpxil") else source_version
     writer = GpxilWriter(
         out,
         width=int((meta.get("layout") or {}).get("width") or g[jobs[0][0]].width),
@@ -213,7 +218,7 @@ def _write(g: GpxilFile, out, jobs, compression: str, level: int | None, bigtiff
             log(f"  {info.name}: {what}, {','.join(info.pages)}  [{time.time() - t0:.0f}s]")
         record = {
             "of": path_name(g.path),
-            "gpxil": source_version,
+            "gpxil": rules,
             "generator": meta.get("generator"),
             "created": meta.get("created"),
             "contigs": [c.name for c in writer.contigs],

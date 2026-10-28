@@ -374,6 +374,12 @@ def _check_windows(g: GpxilFile, rep: Report, chunk: int) -> None:
     if version_key(version) < version_key(WINDOW_VERSION):
         rep.error(f"the file holds windows, which came with gpxil {WINDOW_VERSION}, but says it is gpxil {version} (sections 3.1, 9.1)")
     for w in wins:
+        if w.start == 0 and w.parent_length is not None and w.length >= w.parent_length:
+            rep.error(
+                f"window {w.name} holds all of {w.parent}: a contig of all of a sequence is the sequence, without a window key (section 3.1)"
+            )
+    _check_overlapping_windows(g, wins, rep, chunk)
+    for w in wins:
         if w.parent not in g:
             continue
         p = g[w.parent]
@@ -402,3 +408,36 @@ def _check_windows(g: GpxilFile, rep: Report, chunk: int) -> None:
             theirs = {x for x in theirs if not (x[0] == 0 and x[2] == "COMPLEX")}
             if mine != theirs:
                 rep.error(f"window {w.name}: its sidecar differs from that of {p.name} over the same bases (section 3.1)")
+
+
+def _check_overlapping_windows(g: GpxilFile, wins, rep: Report, chunk: int) -> None:
+    """Windows of one parent that overlap hold the same over the bases they share (section 3.1: each holds what the
+    parent does), in every plane both have and in their sidecars (a COMPLEX entry where the shared bases begin aside:
+    one window may hold a copy there, section 3.1)."""
+    by_parent: dict[str, list] = {}
+    for w in wins:
+        by_parent.setdefault(w.parent, []).append(w)
+    for ws in by_parent.values():
+        ws = sorted(ws, key=lambda w: w.start)
+        for i, a in enumerate(ws):
+            for b in ws[i + 1 :]:
+                if b.start >= a.end:
+                    break
+                lo, hi = b.start, min(a.end, b.end)
+                for plane in sorted(set(a.pages) & set(b.pages)):
+                    for s in range(lo, hi, chunk):
+                        e = min(hi, s + chunk)
+                        if not np.array_equal(a.read(plane, s - a.start, e - a.start), b.read(plane, s - b.start, e - b.start)):
+                            rep.error(f"windows {a.name} and {b.name}: their {plane} planes differ over the bases they share (section 3.1)")
+                            break
+                if "gt" in a.pages and "gt" in b.pages and _shared(a, lo, hi) != _shared(b, lo, hi):
+                    rep.error(f"windows {a.name} and {b.name}: their sidecars differ over the bases they share (section 3.1)")
+
+
+def _shared(w, lo: int, hi: int) -> set:
+    """A window's sidecar entries at positions ``[lo, hi)`` of its parent, but a COMPLEX entry at ``lo``."""
+    return {
+        (w.start + e.offset, e.hap, e.kind, e.data)
+        for e in w.sidecar()
+        if lo <= w.start + e.offset < hi and not (w.start + e.offset == lo and e.kind == "COMPLEX")
+    }

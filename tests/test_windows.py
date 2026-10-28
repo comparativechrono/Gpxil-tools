@@ -21,7 +21,7 @@ from gpxiltools.cli import main
 from gpxiltools.compare import compare_pair, compare_trio
 from gpxiltools.container import GpxilFile, GpxilFormatError, GpxilWriter, check_window, parse_region
 from gpxiltools.encode import encode
-from gpxiltools.export import iter_vcf_records, write_vcf
+from gpxiltools.export import haplotype_sequence, iter_vcf_records, write_vcf
 from gpxiltools.fasta import encode_sequence, sequence_digests
 from gpxiltools.stats import stats
 from gpxiltools.subset import subset
@@ -164,10 +164,10 @@ def test_windows_converted_on_their_own_hold_what_the_whole_contig_does(dense):
             assert x.name == f"c1:{s + 1}-{e}" and x.window["of"] == "c1" and (x.start, x.end) == (s, e)
             assert x.window["length"] == c.length and x.window["md5"] == c.entry["md5"] and x.window["aliases"] == c.entry["aliases"]
             assert x.planes == c.planes
-            for p in x.planes:
-                if p != "ps":
-                    assert np.array_equal(x.read(p), c.read(p, s, e)), (x.name, p)
-            assert _phase_sets(x) == _phase_sets(c, s, e), x.name  # (the values may be numbered differently)
+            for p in x.planes:  # (ps too: spec 5.5 numbers a contig's identifiers alike, whichever calls are converted)
+                assert np.array_equal(x.read(p), c.read(p, s, e)), (x.name, p)
+            ids = x.entry.get("phase_set_ids", {})
+            assert all(c.entry["phase_set_ids"][k] == v for k, v in ids.items()) and _phase_sets(x) == _phase_sets(c, s, e)
             assert _sidecar(x) == _sidecar(c, s, e), x.name
             assert x.entry["md5"] == sequence_digests(c.read("ref", s, e))["md5"]
             a2 = int(np.count_nonzero(C.hap2(x.read("gt")) == C.HAP_ABSENT))
@@ -188,8 +188,7 @@ def test_windows_cut_out_of_the_whole_contig_are_the_same(dense):
         for a, b in zip(k, w):
             assert a.window == b.window and a.planes == b.planes
             for p in a.planes:
-                if p != "ps":
-                    assert np.array_equal(a.read(p), b.read(p)), (a.name, p)
+                assert np.array_equal(a.read(p), b.read(p)), (a.name, p)
             assert _phase_sets(a) == _phase_sets(b) and a.sidecar() == b.sidecar()
             for key in ("md5", "refget", "ploidy", "vcf_contig", "sidecar_entries"):
                 assert a.entry.get(key) == b.entry.get(key), key
@@ -213,11 +212,32 @@ def test_where_regions_are(tmp_path, dense):
             w.locate("c1")  # (several windows: which?)
         with pytest.raises(KeyError, match="no contig 'c9'"):
             w.locate("c9", 0, 10)
+        # names as gpxil-read.js takes them: ignoring case, with or without 'chr'
+        assert w.locate("C1", 1800, 1810) == w.locate("chrc1", 1800, 1810) == w.locate("c1", 1800, 1810)
+        assert w.locate("C1:1800-1851") == (x, 0, 52) and w.find("C1:1800-1851") is x and w.find("c9") is None
+        # a region is a stretch of one base or more
+        for s, e in ((1805, 1805), (1805, 1800), (-5, 3)):
+            with pytest.raises(IndexError):
+                w.locate("c1", s, e)
+    cut = tmp_path / "cut.gpxil.tif"
+    subset(dense["whole"], cut, ["c1:1001-2000"], **QUIET)
+    with GpxilFile(cut) as k:
+        assert k.locate("c1") == (k["c1:1001-2000"], 0, 1000)  # (the only window: the sequence named alone)
+        with pytest.raises(IndexError):
+            k.locate("c1", 0)  # (from position 0 on: not in the window)
+        assert k.locate("c1", 1500) == (k["c1:1001-2000"], 500, 1000)
     assert parse_region("chr17:7,661,779-7,687,546") == ("chr17", 7661778, 7687546)
     assert parse_region("chr17:7561779-7787546:7,600,001-7,600,010") == ("chr17:7561779-7787546", 7600000, 7600010)
     assert parse_region(" chr17 ") == ("chr17", None, None) and parse_region("HLA-A*01:01") == ("HLA-A*01:01", None, None)
-    with pytest.raises(ValueError, match="bad interval"):
-        parse_region("chr1:10-9")
+    # one base; spaces in numbers; numbers don't begin with 0, so a name with colons in it is a name
+    assert parse_region("chr17:7,676,154") == ("chr17", 7676153, 7676154)
+    assert parse_region("chr17: 7 661 779 - 7 687 546") == ("chr17", 7661778, 7687546)
+    assert parse_region("HLA-A*01:01:01:01") == ("HLA-A*01:01:01:01", None, None)
+    assert parse_region("HLA-A*01:01:01:01:1-100") == ("HLA-A*01:01:01:01", 0, 100)
+    assert parse_region("chr17:,-5") == ("chr17:,-5", None, None)
+    for bad in ("chr1:10-9", "chr1:0-5", "chr1:0"):
+        with pytest.raises(ValueError, match="bad interval"):
+            parse_region(bad)
 
 
 def _first_holding(w, s, e):
@@ -231,11 +251,18 @@ def _offsets(w, s, e):
 
 def test_window_entries_are_checked(tmp_path):
     ok = {"of": "chr1", "start": 10, "length": 100}
-    assert check_window("chr1:11-20", 10, ok) is ok
+    assert check_window("chr1:11-20", 10, ok) == ok
+    # (JSON may write a whole number as 2.0, as JSON Schema's integer allows: it is read as the integer)
+    got = check_window("chr1:11-20", 10, {"of": "chr1", "start": 10.0, "length": 100.0})
+    assert got == ok and type(got["start"]) is int and type(got["length"]) is int
     for window, msg in [
         ({"of": "chr1"}, "'start' must be a whole number"),
         ({"of": "chr1", "start": -1}, "'start' must be a whole number"),
         ({"of": "chr1", "start": True}, "'start' must be a whole number"),
+        ({"of": "chr1", "start": 2.5}, "'start' must be a whole number"),
+        ({"of": "chr1", "start": 2, "length": None}, "'length' must be a whole number"),
+        ({"of": "chr1", "start": 2, "md5": None}, "'md5' must be a string"),
+        ({"of": "chr1", "start": 2, "refget": 5}, "'refget' must be a string"),
         ({"start": 3}, "'of' must name its parent"),
         ({"of": "chr 1", "start": 3}, "'of' must name its parent"),
         ({"of": "chr1", "start": 95, "length": 100}, "runs past the end of chr1"),
@@ -296,7 +323,24 @@ def test_copies_and_cuts_and_versions(tmp_path, dense):
     assert e["contigs"] == len(dense["windows"]) and e["pages_encoded"] == 0
     f = subset(dense["whole"], tmp_path / "f.gpxil.tif", ["c1:1-4000", "c2"], **QUIET)
     assert f["names"] == ["c1", "c2"] and f["windows"] == 0 and f["gpxil"] == "0.3"
-    for p in "abcdef":
+    # copies of copies: the planes still follow the rules of 0.2, and say so
+    g_ = subset(tmp_path / "c.gpxil.tif", tmp_path / "g.gpxil.tif", None, **QUIET)
+    h_ = subset(tmp_path / "c.gpxil.tif", tmp_path / "h.gpxil.tif", ["c1:221-260"], **QUIET)
+    assert g_["gpxil"] == h_["gpxil"] == "0.3"
+    for p in "gh":
+        with GpxilFile(tmp_path / f"{p}.gpxil.tif") as x:
+            assert x.metadata["subset"]["gpxil"] == "0.2", p
+    # a window without the sample's planes doesn't name the VCF contig, and one with no phase set counts none
+    ref_only = subset(dense["whole"], tmp_path / "i.gpxil.tif", ["c1:101-200"], planes=["ref"], **QUIET)
+    with GpxilFile(tmp_path / "i.gpxil.tif") as x, GpxilFile(dense["whole"]) as g:
+        assert ref_only["names"] == ["c1:101-200"] and "vcf_contig" not in x["c1:101-200"].entry
+        ps = g["c1"].read("ps")
+        quiet = next((s for s in range(0, len(ps) - 30, 10) if not ps[s : s + 30].any()), None)
+    if quiet is not None:
+        subset(dense["whole"], tmp_path / "j.gpxil.tif", [f"c1:{quiet + 1}-{quiet + 30}"], **QUIET)
+        with GpxilFile(tmp_path / "j.gpxil.tif") as x:
+            assert "ps" in x[x.contigs[0]].pages and "phase_sets" not in x[x.contigs[0]].entry
+    for p in "abcdefghi":
         assert validate(tmp_path / f"{p}.gpxil.tif").ok, p
 
 
@@ -345,10 +389,9 @@ def test_vcf_of_a_window_is_its_parents(tmp_path, dense):
         assert lines and all(line.startswith("c1\t") for line in lines)
         pos = [int(line.split("\t")[1]) for line in lines]
         assert pos == sorted(pos) and pos[0] >= 3334
-        # the same records, but at the window's first bases (a deletion there has no anchor in the window); phase
-        # sets numbered as the files number them (spec 3.1, rule 1), so compared as the identifiers they stand for
-        inner = [_ps_as_ids(line, g["c1"]) for line in whole if int(line.split("\t")[1]) > 3334 + 40]
-        assert inner == [_ps_as_ids(line, x) for line in lines if int(line.split("\t")[1]) > 3334 + 40]
+        # the same records, but at the window's first bases (a deletion there has no anchor in the window)
+        inner = [line for line in whole if int(line.split("\t")[1]) > 3334 + 40]
+        assert inner == [line for line in lines if int(line.split("\t")[1]) > 3334 + 40]
         out = io.StringIO()
         n = write_vcf(w, out, regions=[("c1", 3400, 3900)])
         body = [line for line in out.getvalue().splitlines() if not line.startswith("#")]
@@ -363,13 +406,87 @@ def test_vcf_of_a_window_is_its_parents(tmp_path, dense):
     assert (tmp_path / "w.vcf").read_text().count("\nc1\t") == n
 
 
-def _ps_as_ids(line: str, contig) -> str:
-    f = line.split("\t")
-    keys, vals = f[8].split(":"), f[9].split(":")
-    if "PS" in keys:
-        i = keys.index("PS")
-        vals[i] = contig.entry.get("phase_set_ids", {}).get(vals[i], vals[i])
-    return "\t".join(f[:9] + [":".join(vals)])
+def _vcf(path, **kw) -> str:
+    out = io.StringIO()
+    with GpxilFile(path) as g:
+        write_vcf(g, out, **kw)
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("nocall_blocks", [False, True])
+def test_overlapping_windows_write_the_records_of_their_union(tmp_path, dense, nocall_blocks):
+    """A file's windows of a sequence that overlap or touch are read as one stretch (spec 11.4): their VCF is that
+    of one window of all the stretch, so an event cut by the end of one window is whole where another holds it."""
+    with GpxilFile(dense["wins"]) as w:
+        joins = [(j.start, j.end) for j in w.stretches("c1")]
+    union = tmp_path / "union.gpxil.tif"
+    subset(dense["whole"], union, [f"c1:{a + 1}-{b}" if (a, b) != (0, dense["n"]) else "c1" for a, b in joins], **QUIET)
+    assert _vcf(dense["wins"], nocall_blocks=nocall_blocks) == _vcf(union, nocall_blocks=nocall_blocks)
+    # a deletion that crosses the end of the first of two windows, and one anchored on its last base
+    both = tmp_path / "both.gpxil.tif"
+    subset(dense["whole"], both, ["c1:1001-1200", "c1:1151-1400"], **QUIET)
+    one = tmp_path / "one.gpxil.tif"
+    subset(dense["whole"], one, ["c1:1001-1400"], **QUIET)
+    assert _vcf(both, nocall_blocks=nocall_blocks) == _vcf(one, nocall_blocks=nocall_blocks)
+    # and the sequence with a window of it: the sequence's records, each once
+    plus = tmp_path / "plus.gpxil.tif"
+    subset(dense["whole"], plus, ["c1", "c1:1001-1200"], **QUIET)
+    with GpxilFile(plus) as x:
+        assert x.contigs == ["c1", "c1:1001-1200"]  # (a sequence before its windows)
+    assert (
+        _vcf(plus, nocall_blocks=nocall_blocks).split("\n#CHROM")[1]
+        == _vcf(dense["whole"], contigs=["c1"], nocall_blocks=nocall_blocks).split("\n#CHROM")[1]
+    )
+
+
+def test_a_window_inside_a_deletion(tmp_path):
+    """A window that a deletion covers to its end has no base after it to anchor the record on: it takes the base
+    before it, which it doesn't hold, as N (spec 11.4); and the record encodes back to the window."""
+    rng = random.Random(7)
+    ref = "".join(rng.choice(BASES) for _ in range(200))
+    fa = tmp_path / "ref.fa"
+    fa.write_text(fasta_text({"c1": ref}))
+    vcf = tmp_path / "s.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n##contig=<ID=c1,length=200>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n"
+        f"c1\t50\t.\t{ref[49:80]}\t{ref[49]}\t50\tPASS\t.\tGT\t1|0\n"
+    )
+    whole = tmp_path / "whole.gpxil.tif"
+    encode(fa, whole, vcf=vcf, width=16, **QUIET)
+    win = tmp_path / "win.gpxil.tif"
+    subset(whole, win, ["c1:61-70"], **QUIET)
+    body = [line for line in _vcf(win, nocall_blocks=False).splitlines() if not line.startswith("#")]
+    assert body == [f"c1\t60\t.\tN{ref[60:70]}\tN\t.\tPASS\t.\tGT\t1|0"]
+    again = tmp_path / "again.vcf"
+    again.write_text(_vcf(win, nocall_blocks=False))
+    out = tmp_path / "again.gpxil.tif"
+    encode(fa, out, vcf=again, regions=[("c1", 60, 70)], width=16, **QUIET)
+    with GpxilFile(out) as a, GpxilFile(win) as b:
+        assert np.array_equal(a["c1:61-70"].read("gt"), b["c1:61-70"].read("gt"))
+        assert haplotype_sequence(a["c1:61-70"], 1) == b"" and haplotype_sequence(a["c1:61-70"], 2).upper() == ref[60:70].encode()
+
+
+def test_windows_and_their_sequence_encoded_together_are_valid(tmp_path, dense):
+    """Phase sets with identifiers that aren't numbers take the same values in a contig and its windows (spec 5.5),
+    so a file of both is valid, and its VCF keeps each phase set one."""
+    out = tmp_path / "both.gpxil.tif"
+    encode(dense["fa"], out, vcf=dense["vcf"], regions=[("c1", None, None), ("c1", 150, 250), ("c1", 1000, 3000)], width=64, **QUIET)
+    rep = validate(out)
+    assert rep.ok, rep.errors
+    with GpxilFile(out) as g, GpxilFile(dense["whole"]) as h:
+        for c in g.windows:
+            assert np.array_equal(c.read("ps"), h["c1"].read("ps", c.start, c.end))
+
+
+def test_a_reference_of_windows_is_refused(tmp_path, dense):
+    ref = tmp_path / "ref.gpxil.tif"
+    subset(dense["whole"], ref, ["c1:101-300"], planes=["ref"], **QUIET)
+    with pytest.raises(GpxilFormatError, match="is a window of c1"):
+        encode(ref, tmp_path / "x.gpxil.tif", vcf=dense["vcf"], **QUIET)
+    with pytest.raises(GpxilFormatError, match="is a window of c1"):
+        encode(ref, tmp_path / "x.gpxil.tif", vcf=dense["vcf"], regions=[("c1", 150, 200)], **QUIET)
 
 
 def test_fasta_stats_render_and_info_give_the_parents_positions(tmp_path, dense, capsys):
@@ -417,15 +534,21 @@ def _pdf_text(path) -> bytes:
 
 def test_windows_compare_with_whole_contigs_and_each_other(dense):
     with GpxilFile(dense["whole"]) as g, GpxilFile(dense["wins"]) as w:
-        res = compare_pair(w, g)  # (every stretch both hold: the windows, against the whole contig)
-        assert len(res["regions"]) == len(dense["windows"])
+        # every stretch both hold: the windows, joined where they overlap or touch, against the whole contig, each
+        # base once
+        res = compare_pair(w, g)
+        joins = w.stretches("c1")
+        assert [(r["start"] - 1, r["end"]) for r in res["regions"]] == [(j.start, j.end) for j in joins]
+        assert res["total"]["bases"] == sum(j.length for j in joins)
         for r in res["regions"]:
             assert r["contig"] == "c1" and r["windows"][1] is None and r["windows"][0]
             assert r["variant_bases"]["either"] == r["variant_bases"]["same"]
             assert all(r["events"][k]["a"]["missing"] == r["events"][k]["b"]["missing"] == 0 for k in r["events"])
         res = compare_pair(g, w, [("c1", 3333, 3900)])
-        held = w[res["regions"][0]["windows"][1]]
-        assert res["regions"][0]["windows"][0] is None and held.start <= 3333 and held.end >= 3900 and res["total"]["bases"] == 567
+        held = res["regions"][0]["windows"][1]
+        held = [w[x] for x in (held if isinstance(held, list) else [held])]
+        assert res["regions"][0]["windows"][0] is None and min(x.start for x in held) <= 3333 and max(x.end for x in held) >= 3900
+        assert res["total"]["bases"] == 567
         trio = compare_trio(w, g, g, [("c1", 3333, 3900)])
         assert trio["regions"][0]["contig"] == "c1" and trio["total"]["bases"] == 567
         with pytest.raises(IndexError, match="isn't all in a window"):
@@ -478,6 +601,53 @@ def test_a_window_from_a_genome_on_the_web(tmp_path, dense):
         assert x.metadata["subset"]["of"] == dense["whole"].name
 
 
+def test_stats_count_each_base_once(tmp_path, dense, capsys):
+    """Windows that overlap are counted in all once over the stretch they cover; a sequence named that windows
+    hold is each of them."""
+    two = tmp_path / "two.gpxil.tif"
+    subset(dense["whole"], two, ["c1:1001-2000", "c1:1501-2500"], **QUIET)
+    one = tmp_path / "one.gpxil.tif"
+    subset(dense["whole"], one, ["c1:1001-2500"], **QUIET)
+    with GpxilFile(two) as w, GpxilFile(one) as o:
+        res = stats(w)
+        assert [r["window"] for r in res["regions"]] == ["c1:1001-2000", "c1:1501-2500"]
+        alone = stats(o)
+        assert res["total"]["bases"] == 1500 and {**res["total"], "regions": 1} == alone["total"]
+        assert stats(w, [("c1", None, None)])["regions"] == res["regions"]
+        assert stats(w, [("c1", 1100, 1200), ("c1", 1150, 1250)])["total"]["bases"] == 150
+    assert main(["stats", str(two), "c1"]) == 0
+    out = capsys.readouterr().out
+    assert "c1:1,001-2,000" in out and "c1:1,501-2,500" in out
+
+
+def test_a_book_of_windows(tmp_path, dense):
+    from gpxiltools.book import make_book
+
+    two = tmp_path / "two.gpxil.tif"
+    subset(dense["whole"], two, ["c1:1001-2000", "c1:1501-2500"], **QUIET)
+    pdf = tmp_path / "w.pdf"
+    assert main(["book", str(two), "-o", str(pdf), "--contigs", "c1", "--rgb", "--dpi", "72"]) == 0  # (its windows)
+    text = _pdf_text(pdf)
+    assert b"c1:1.0k" in text and b"c1:1.5k" in text  # (the cover: each window by where it starts)
+    with GpxilFile(two) as w:
+        with pytest.raises(ValueError, match="is a region"):
+            make_book(w, tmp_path / "x.pdf", contigs=["c1:1,100-1,200"])
+        with pytest.raises(KeyError, match="no contig 'c9'"):
+            make_book(w, tmp_path / "x.pdf", contigs=["c9"])
+
+
+def test_validate_checks_windows_against_each_other(tmp_path, dense):
+    bad = tmp_path / "bad.gpxil.tif"
+    with GpxilFile(dense["whole"]) as g, GpxilWriter(bad, width=64, sample=g.metadata["sample"]) as w:
+        w.cut_contig(g["c1"], 100, 300)
+        planes = {p: g["c1"].read(p, 1000, 1200) for p in ("ref", "gt", "flags")}  # (not the bases it says it holds)
+        w.add_contig("c1:201-400", planes, window={"of": "c1", "start": 200, "length": 4000}, **sequence_digests(planes["ref"]))
+        w.add_contig("c2:1-900", {"ref": g["c2"].read("ref")}, window={"of": "c2", "start": 0, "length": 900})
+    rep = validate(bad)
+    assert any("windows c1:101-300 and c1:201-400: their ref planes differ" in e for e in rep.errors), rep.errors
+    assert any("c2:1-900 holds all of c2" in e for e in rep.errors), rep.errors
+
+
 def test_the_metadata_is_the_schemas(dense):
     import importlib.resources
 
@@ -490,6 +660,10 @@ def test_the_metadata_is_the_schemas(dense):
         broken["contigs"][0]["window"]["start"] = -5
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(broken, schema)
+        older = json.loads(json.dumps(w.metadata))
+        older["gpxil"] = "0.2"  # (windows came with 0.3)
+        with pytest.raises(jsonschema.ValidationError, match="does not match"):
+            jsonschema.validate(older, schema)
 
 
 def test_a_fasta_is_read_once_for_all_windows_of_a_chromosome(tmp_path, dense, monkeypatch):
@@ -505,6 +679,18 @@ def test_a_fasta_is_read_once_for_all_windows_of_a_chromosome(tmp_path, dense, m
             for s in range(0, w.length, 250):
                 assert np.array_equal(w.read("ref", s, s + 250), g["c1"].read("ref", w.start + s, w.start + s + 250))
     assert len(reads) == 1
+    # windows that give only their parent's digests: the chromosome is digested once for all of them
+    bare = tmp_path / "bare.gpxil.tif"
+    subset(noref, bare, ["c1:101-200", "c1:2101-2200", "c1:3101-3200"], **QUIET)
+    digested = []
+    real_dig = F.sequence_digests
+    monkeypatch.setattr(F, "sequence_digests", lambda codes: (digested.append(len(codes)), real_dig(codes))[1])
+    with GpxilFile(bare) as x:
+        assert all("md5" not in w.entry and w.window["md5"] for w in x)
+    with GpxilFile(bare, reference=dense["fa"]) as x, GpxilFile(dense["whole"]) as g:
+        for w in x:
+            assert np.array_equal(w.read("ref"), g["c1"].read("ref", w.start, w.end))
+    assert digested == [4000]
 
 
 def test_a_window_with_one_phase_set_needs_no_ps_plane(tmp_path, dense):

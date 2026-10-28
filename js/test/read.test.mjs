@@ -169,7 +169,7 @@ test("windows (section 3.1): where they lie in their sequence, and regions found
   );
   for (const k of expected.locate) {
     const [name, s, e] = k.ask;
-    const args = s === null ? [name] : [name, s, e];
+    const args = s === null && e === null ? [name] : [name, s, e]; // (null for a position not given, as gpxiltools' None)
     if (k.error) assert.throws(() => g.locate(...args), { code: k.error }, JSON.stringify(k.ask));
     else assert.deepEqual(where(g.locate(...args)), [k.contig, k.start, k.end], JSON.stringify(k.ask));
   }
@@ -195,7 +195,14 @@ test("windows (section 3.1): where they lie in their sequence, and regions found
   assert.deepEqual(R.parseRegion(" chr17 "), { name: "chr17" });
   assert.deepEqual(R.parseRegion("chr17:7561779-7787546:7,600,001"), { name: "chr17:7561779-7787546", start: 7600000, end: 7600001 });
   assert.equal(R.parseRegion("chr1:0-5"), null);
+  assert.equal(R.parseRegion("chr1:0"), null);
+  assert.equal(R.parseRegion("chr1:10-9"), null);
   assert.equal(R.parseRegion(""), null);
+  // numbers may have spaces; they don't begin with 0, so a name with colons in it is a name (as gpxiltools reads it)
+  assert.deepEqual(R.parseRegion("chr17: 7 661 779 - 7 687 546"), { name: "chr17", start: 7661778, end: 7687546 });
+  assert.deepEqual(R.parseRegion("HLA-A*01:01:01:01"), { name: "HLA-A*01:01:01:01" });
+  assert.deepEqual(R.parseRegion("HLA-A*01:01:01:01:1-100"), { name: "HLA-A*01:01:01:01", start: 0, end: 100 });
+  assert.deepEqual(R.parseRegion("chr17:,-5"), { name: "chr17:,-5" });
   assert.equal(R.regionText(g.contig("chr1:30001-34000"), 5, 10), "chr1:30,006-30,010");
   assert.equal(R.regionText(g.contig("chrM")), "chrM:1-997");
 });
