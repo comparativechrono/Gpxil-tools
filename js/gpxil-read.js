@@ -8,8 +8,9 @@
  * stored in strips of whole rows or in tiles. This reads its metadata, then any interval of a plane by reading only
  * the strips or tiles that hold it: from a Blob, from bytes, or from the web with HTTP range requests. Data are
  * inflated with the DecompressionStream that browsers and Node 18 or later have. It reads files of any version 0.x
- * of the specification (it implements 0.2), uncompressed or Deflate, with or without a predictor, classic TIFF or
- * BigTIFF, in either byte order.
+ * of the specification (it implements 0.3), uncompressed or Deflate, with or without a predictor, classic TIFF or
+ * BigTIFF, in either byte order. A window (section 3.1), a contig that holds a stretch of a longer sequence, says
+ * where it lies in it, and regions are found in it by the sequence's positions.
  *
  * Files are untrusted input (specification section 13): a file that claims more than this reader decodes at once
  * (a strip or tile of more than 256 MiB, a tag of more than 64 MiB, a sidecar of more than 256 MiB, more than 2^20
@@ -23,6 +24,12 @@
  *   const gt = await g.read("chr17", "gt", 7661778, 7687546);   // Uint8Array; 0-based, the end excluded
  *   const side = await g.sidecar("chr17");                      // [{offset, hap, kind, data}]
  *
+ *   // a window: the contig chr17:7561779-7787546 holds bases 7,561,779 to 7,787,546 of chr17
+ *   const w = await GpxilRead.open(GpxilRead.fromUrl("TP53.gpxil.tif"));
+ *   const { contig, start, end } = w.locate("chr17:7,661,779-7,687,546"); // the window, at its own offsets
+ *   contig.parent, contig.start;                                // "chr17", 7561778: offset i is chr17's start + i
+ *   const tp53 = await w.read(contig, "gt", start, end);
+ *
  * A source is {key, size, read(start, end, what) -> Promise<Uint8Array>}, the end excluded; `what` says what is
  * read ("header", "directory", "tags" or "strips"), for a page that shows what it is loading. Decoded strips are
  * cached by the source's key, so a key must change when its file does. Lower down, new GpxilRead.TiffFile(source)
@@ -32,7 +39,7 @@
 (function (root) {
   "use strict";
 
-  const SPEC = "0.2"; // the version of the gpxil specification this reader implements
+  const SPEC = "0.3"; // the version of the gpxil specification this reader implements
   const MAJOR = "0"; // it reads any version 0.x (specification section 14)
 
   const TAG = {
@@ -67,7 +74,7 @@
   const MAX_PAGES = 1 << 20; // pages in a file
 
   /** an Error with a code, so that a page can say it in its own words: http, not-tiff, not-gpxil, version, format,
-      limit, layout, compression, predictor, contig, plane */
+      limit, layout, compression, predictor, contig, plane, region */
   function fail(code, message) {
     const e = new Error(message);
     e.code = code;
@@ -616,6 +623,54 @@
     return new Gpxil(file, meta);
   }
 
+  /** a window's "window" key (section 3.1, 9.3), checked: its parent named, where it starts in it, inside it, and
+      none of its names its parent's */
+  function checkWindow(c, w) {
+    const bad = (why) => fail("format", `the metadata's window ${c.name}: ${why}`);
+    if (!w || typeof w !== "object" || Array.isArray(w)) throw bad("its window key must be an object, with of and start");
+    if (typeof w.of !== "string" || !/^[\x21-\x7e]+$/.test(w.of)) throw bad("of must name its parent");
+    if (!(Number.isSafeInteger(w.start) && w.start >= 0)) throw bad(`start must be a whole number, 0 or more (it is ${JSON.stringify(w.start)})`);
+    if (w.length !== undefined && !(Number.isSafeInteger(w.length) && w.length >= 1)) throw bad("its parent's length must be a whole number");
+    if (w.length !== undefined && w.start + c.length > w.length) throw bad(`it runs past the end of ${w.of}`);
+    if (w.aliases !== undefined && !(Array.isArray(w.aliases) && w.aliases.every((a) => typeof a === "string")))
+      throw bad("its parent's aliases must be a list of names");
+    const parent = new Set([w.of, ...(w.aliases || [])]);
+    if (parent.has(c.name) || c.aliases.some((a) => parent.has(a))) throw bad("its names must differ from its parent's");
+    for (const k of ["md5", "refget"]) if (w[k] !== undefined && typeof w[k] !== "string") throw bad(`its parent's ${k} must be a string`);
+    const str = (k) => (typeof w[k] === "string" ? w[k] : null);
+    return {
+      of: w.of,
+      start: w.start,
+      length: w.length === undefined ? null : w.length,
+      md5: str("md5"),
+      refget: str("refget"),
+      aliases: (w.aliases || []).slice(),
+    };
+  }
+
+  /** "chr17:7,661,779-7,687,546" -> {name: "chr17", start: 7661778, end: 7687546} (0-based, the end excluded);
+      "chr17:7,661,779" -> one base; "chr17" -> {name: "chr17"}. The name ends at the last colon, so a window's name
+      (chr17:7561779-7787546) is a name too, and can be followed by a region; numbers may have commas and spaces, and
+      don't begin with 0, so a name with colons in it (HLA-A*01:01:01:01) is a name. null for an interval that isn't
+      one (from position 0, or ending before it starts). gpxiltools' parse_region is the same */
+  function parseRegion(text) {
+    const t = String(text || "").replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+    if (!t) return null;
+    const m = t.match(/^(.+):[ ]*([1-9][0-9, ]*?)[ ]*(?:-[ ]*([1-9][0-9, ]*?))?$/);
+    if (!m) return /^.+:[ ]*0[ ]*(?:-[ ]*[0-9, ]+)?$/.test(t) ? null : { name: t };
+    const s = Number(m[2].replace(/[, ]/g, ""));
+    const e = m[3] === undefined ? s : Number(m[3].replace(/[, ]/g, ""));
+    if (!(Number.isSafeInteger(s) && Number.isSafeInteger(e) && s >= 1 && e >= s)) return null;
+    return { name: m[1], start: s - 1, end: e };
+  }
+  const fmt = (n) => n.toLocaleString("en-GB");
+  /** [start, end) of a contig as a region of its sequence: "chr17:7,661,779-7,687,546" */
+  function regionText(contig, start, end) {
+    const s = start === undefined ? 0 : start;
+    const e = end === undefined ? contig.length : end;
+    return `${contig.parent}:${fmt(contig.start + s + 1)}-${fmt(contig.start + e)}`;
+  }
+
   class Gpxil {
     constructor(file, meta) {
       this.file = file;
@@ -628,26 +683,38 @@
           throw fail("format", `the metadata's contig ${i + 1} has no name or length`);
         if ((c.pages !== undefined && !object(c.pages)) || (c.aliases !== undefined && !Array.isArray(c.aliases)))
           throw fail("format", `the metadata's contig ${c.name}: pages must be an object, aliases a list`);
-        return {
+        const out = {
           name: String(c.name),
           length: Number(c.length),
           width: Number(c.width || width),
           pages: c.pages || {},
           aliases: (c.aliases || []).map(String),
           entry: c,
+          window: null,
         };
+        if (c.window !== undefined) out.window = checkWindow(out, c.window);
+        // where the contig lies in its sequence: a window's parent (section 3.1), or itself
+        out.parent = out.window ? out.window.of : out.name;
+        out.start = out.window ? out.window.start : 0;
+        out.end = out.start + out.length;
+        out.parentLength = out.window ? out.window.length : out.length;
+        out.parentAliases = out.window ? out.window.aliases : out.aliases;
+        return out;
       });
-      // names first, then aliases; exactly as written, then ignoring case; where two match, the first contig
+      // names first, then aliases; exactly as written, then (whole contigs only: a window is found by its name as
+      // written, section 3.1) ignoring case; where two match, the first contig
       this._exact = new Map();
       this._folded = new Map();
       const add = (m, k, c) => m.has(k) || m.set(k, c);
       for (const c of this.contigs) add(this._exact, c.name, c);
       for (const c of this.contigs) for (const a of c.aliases) add(this._exact, a, c);
-      for (const c of this.contigs) add(this._folded, c.name.toLowerCase(), c);
-      for (const c of this.contigs) for (const a of c.aliases) add(this._folded, a.toLowerCase(), c);
+      const whole = this.contigs.filter((c) => !c.window);
+      for (const c of whole) add(this._folded, c.name.toLowerCase(), c);
+      for (const c of whole) for (const a of c.aliases) add(this._folded, a.toLowerCase(), c);
       this._sidecars = new Map();
     }
-    /** a contig by name or alias: as written, else ignoring case, with or without "chr" (null if there is none) */
+    /** a contig by name or alias: as written, else a whole contig ignoring case, with or without "chr" (null if there is
+        none) */
     contig(name) {
       if (name && typeof name === "object") return name;
       const s = String(name);
@@ -658,6 +725,79 @@
       const c = this.contig(contig);
       if (!c) throw fail("contig", `no contig ${contig}`);
       return c;
+    }
+    /** the file's windows (section 3.1) */
+    get windows() {
+      return this.contigs.filter((c) => c.window);
+    }
+    /** the windows of a sequence (by its name, or another name of it; as written, else ignoring case, with or
+        without "chr"), in file order */
+    windowsOf(name) {
+      const n = String(name).toLowerCase();
+      const want = new Set([n, "chr" + n, n.replace(/^chr/, "")]);
+      return this.windows.filter((c) => [c.parent, ...c.parentAliases].some((x) => want.has(x.toLowerCase())));
+    }
+    /** where a region is: {contig, start, end}, the contig that holds it and its offsets there (0-based, the end
+        excluded). Give a contig's name (a window's too), or a sequence that windows hold, with positions in the
+        sequence: on a window, positions in its parent, so a region of the parent is found in a window that holds
+        it all. Without positions, the whole contig (for a sequence that only windows hold, its window, if it has
+        one only). A text, "chr17:7,661,779-7,687,546", is read as a region, unless it is a contig's name */
+    locate(name, start, end) {
+      if (start === null) start = undefined; // (null as in JSON: not given)
+      if (end === null) end = undefined;
+      if (start === undefined && end === undefined && !(name && typeof name === "object")) {
+        const text = String(name).replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+        if (!this.contig(name) && this.contig(text)) {
+          name = text; // (a contig's name, with spaces around it)
+        } else if (!this.contig(name)) {
+          const r = parseRegion(name);
+          if (!r) throw fail("region", `${name} isn't a region: give CONTIG or CONTIG:START-END, 1-based`);
+          if (r.start !== undefined) return this.locate(r.name, r.start, r.end);
+        }
+      }
+      const whole = start === undefined && end === undefined;
+      const c = this.contig(name);
+      if (c) {
+        if (whole) return { contig: c, start: 0, end: c.length };
+        const s = start === undefined ? c.start : start;
+        const e = end === undefined ? c.end : end;
+        if (!(c.start <= s && s < e && e <= c.end))
+          throw fail(
+            "region",
+            c.window
+              ? `${c.parent}:${fmt(s + 1)}-${fmt(e)} is outside the window ${c.name}, which holds ${regionText(c)}`
+              : `${c.name}:${fmt(s + 1)}-${fmt(e)} is outside ${c.name} (${fmt(c.length)} bases)`,
+          );
+        return { contig: c, start: s - c.start, end: e - c.start };
+      }
+      const wins = this.windowsOf(name);
+      if (wins.length) {
+        if (whole) {
+          if (wins.length === 1) return { contig: wins[0], start: 0, end: wins[0].length };
+          throw fail(
+            "region",
+            `${wins.length} windows of ${name}: give one, or a region (${wins
+              .slice(0, 4)
+              .map((w) => regionText(w))
+              .join(", ")})`,
+          );
+        }
+        const s = start || 0;
+        const exact = wins.filter((w) => w.start === s && w.end === end);
+        for (const w of exact.length ? exact : wins) {
+          const e = end === undefined ? w.end : end;
+          if (w.start <= s && s < w.end && e <= w.end && s < e) return { contig: w, start: s - w.start, end: e - w.start };
+        }
+        const e = end === undefined ? s + 1 : end;
+        throw fail(
+          "region",
+          `${name}:${fmt(s + 1)}-${fmt(e)} isn't all in a window of this file (${wins
+            .slice(0, 4)
+            .map((w) => regionText(w))
+            .join(", ")})`,
+        );
+      }
+      throw fail("contig", `no contig ${name}`);
     }
     /** the page of a contig's plane */
     page(contig, plane) {
@@ -722,6 +862,8 @@
   const api = {
     SPEC,
     open,
+    parseRegion,
+    regionText,
     TiffFile,
     fromUrl,
     fromBlob,

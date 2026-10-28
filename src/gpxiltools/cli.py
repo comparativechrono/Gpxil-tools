@@ -5,26 +5,36 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 
 from . import __version__
 
 
+def _names(text: str) -> list[str]:
+    """Contig names given as text: commas separate them, but not in a region, where they group digits."""
+    from .container import split_names
+
+    return split_names(text)
+
+
 def _region(text: str | None):
-    """'chr21', 'chr21:5,000,001-5,100,000' -> (contig, start0, end) (end may be None)."""
+    """A region given as text, kept as text: what it is depends on the file (a contig may be named 'HLA-A*01:14', or
+    even 'HLA:0-5'), so each command reads it with the file's ``region_of`` (:func:`_in`), which says what is wrong
+    with a text that is neither a contig's name nor a region."""
     if text is None:
         return None
-    m = re.fullmatch(r"([^:]+)(?::([\d,]+)-([\d,]+))?", text.strip())
-    if not m:
-        raise argparse.ArgumentTypeError(f"bad region {text!r}; use CONTIG or CONTIG:START-END (1-based)")
-    name, s, e = m.groups()
-    if s is None:
-        return name, 0, None
-    s, e = int(s.replace(",", "")), int(e.replace(",", ""))
-    if s < 1 or e < s:
-        raise argparse.ArgumentTypeError(f"bad interval in {text!r}")
-    return name, s - 1, e
+    if not str(text).strip(" \t\r\n"):
+        raise argparse.ArgumentTypeError("an empty region: use CONTIG or CONTIG:START-END (1-based, inclusive)")
+    return text
+
+
+def _in(g, texts):
+    """Regions given as text, as the file reads them: ``(name, start, end)``, 0-based, the end excluded; 'chr21'
+    the whole contig, 'chr21:5,000,001-5,100,000' a region, 'chr21:5,000,001' one base, and a contig's name always
+    that contig (spec 3.1: a window's name is its region)."""
+    if texts is None:
+        return None
+    return [g.region_of(x) for x in texts]
 
 
 class _TextAsBytes:
@@ -56,6 +66,9 @@ def cmd_encode(a) -> int:
     from .container import FORMAT_VERSION
     from .encode import encode
 
+    if a.contigs and a.region:
+        raise SystemExit("gpxil: error: give --contigs or --region, not both")
+
     out = a.output or (os.path.basename(a.vcf or a.fasta).split(".")[0] + ".gpxil.tif")
     summary = encode(
         a.fasta,
@@ -67,6 +80,7 @@ def cmd_encode(a) -> int:
         haploid_contigs=a.haploid_contig or (),
         sex=a.sex,
         contigs=a.contigs.split(",") if a.contigs else None,
+        regions=a.region,
         ucsc_names=a.ucsc_names,
         include_ref=not a.no_ref,
         planes=a.planes.split(",") if a.planes else None,
@@ -78,8 +92,9 @@ def cmd_encode(a) -> int:
         invalid="N" if a.invalid_to_n else "error",
         bigtiff=True if a.bigtiff else None,
     )
-    mb = summary["bytes"] / 1e6
-    print(f"wrote {out}: {summary['contigs']} contigs, {summary['bases']:,} bases, {mb:,.1f} MB in {summary['seconds']}s", file=sys.stderr)
+    size = f"{summary['bytes'] / 1e6:,.1f} MB" if summary["bytes"] >= 1e5 else f"{summary['bytes'] / 1e3:,.1f} kB"
+    nc = summary["contigs"]
+    print(f"wrote {out}: {nc} contig{'s' if nc != 1 else ''}, {summary['bases']:,} bases, {size} in {summary['seconds']}s", file=sys.stderr)
     if summary.get("conflicts"):
         print(f"note: {summary['conflicts']} conflicting overlapping calls (later record kept); see `gpxil info --json`", file=sys.stderr)
     n = summary.get("overlapping_calls_reassigned") or 0
@@ -116,13 +131,20 @@ def cmd_info(a) -> int:
                 + (f", callable regions {s['callable_regions']}" if s.get("callable_regions") else "")
             )
         print(f"layout: raster, width {m['layout']['width']}; palette {m.get('palette')}")
-        print(f"{'contig':<16}{'length':>14}  {'planes':<24}{'records':>10}{'sidecar':>9}")
+        sub = m.get("subset")
+        if isinstance(sub, dict) and sub.get("of"):
+            print(f"copied from {sub['of']}" + (f" (gpxil {sub['gpxil']})" if sub.get("gpxil") else ""))
+        wide = max([16, *(len(c.name) + 2 for c in g)])
+        print(f"{'contig':<{wide}}{'length':>14}  {'planes':<24}{'records':>10}{'sidecar':>9}")
         for c in g:
             e = c.entry
             rec = e.get("encoding", {}).get("records", "")
             print(
-                f"{c.name:<16}{c.length:>14,}  {','.join(c.planes):<24}{rec if rec == '' else f'{rec:,}':>10}{e.get('sidecar_entries', 0):>9,}"
+                f"{c.name:<{wide}}{c.length:>14,}  {','.join(c.planes):<24}{rec if rec == '' else f'{rec:,}':>10}{e.get('sidecar_entries', 0):>9,}"
             )
+        for c in g.windows:
+            n = c.parent_length
+            print(f"{c.name}: a window of {c.parent}" + (f" ({n:,} bp)" if n else "") + f", its bases {c.start + 1:,} to {c.end:,}")
     return 0
 
 
@@ -154,10 +176,12 @@ def cmd_subset(a) -> int:
         level=a.level,
     )
     how = "strips copied as stored" if not info["pages_encoded"] else f"{info['compression']}, {info['pages_encoded']} pages encoded again"
+    size = f"{info['bytes'] / 1e6:,.1f} MB" if info["bytes"] >= 1e5 else f"{info['bytes'] / 1e3:,.1f} kB"
+    wins = info["windows"]
     print(
         f"wrote {a.output}: {info['contigs']} contig{'s' if info['contigs'] != 1 else ''} ({', '.join(info['names'][:6])}"
-        f"{', …' if info['contigs'] > 6 else ''}), {info['bases']:,} bases, planes {','.join(info['planes'])};"
-        f" {info['bytes'] / 1e6:,.1f} MB in {info['seconds']}s ({how})",
+        f"{', …' if info['contigs'] > 6 else ''}){f', {wins} of them windows' if wins > 1 else ', a window' if wins else ''},"
+        f" {info['bases']:,} bases, planes {','.join(info['planes'])}; {size} in {info['seconds']}s ({how})",
         file=sys.stderr,
     )
     return 0
@@ -167,7 +191,7 @@ def cmd_stats(a) -> int:
     from .stats import format_stats, stats
 
     with _open(a) as g:
-        res = stats(g, a.regions or None)
+        res = stats(g, _in(g, a.regions) or None)
     print(json.dumps(res, indent=2) if a.json else format_stats(res))
     return 0
 
@@ -188,10 +212,11 @@ def cmd_compare(a) -> int:
         for path in [a.files[0], a.father, a.mother] if trio else a.files:
             files.append(GpxilFile(path, reference=a.reference))
         kw = {"gap": a.gap, "all_calls": a.all_calls}
-        res = compare_trio(*files, a.region, **kw) if trio else compare_pair(*files, a.region, **kw)
+        regions = _in(files[0], a.region)
+        res = compare_trio(*files, regions, **kw) if trio else compare_pair(*files, regions, **kw)
         if a.output:
             first = res["regions"][0]
-            name, start, end = a.draw or (first["contig"], first["start"] - 1, first["end"])
+            name, start, end = files[0].region_of(a.draw) if a.draw else (first["contig"], first["start"] - 1, first["end"])
             pic = picture(files, name, start, end, bases_per_row=a.width, palette=a.palette, **kw)
             pic = pic.scaled(a.scale)
             if a.output.lower().endswith((".tif", ".tiff")):
@@ -213,16 +238,16 @@ def cmd_render(a) -> int:
     from .layout import hilbert_image
     from .render import render
 
-    name, start, end = a.region
     with _open(a) as g:
-        c = g[name]
+        # (read through the windows that overlap or touch the one that holds it, as every command reads a region)
+        c, start, end = g.view(*g.locate(*g.region_of(a.region), join=True))
         r = render(c, mode=a.mode, palette=a.palette, start=start, end=end, bases_per_row=a.width, mark_insertions=a.mark_insertions)
         if a.layout == "hilbert":
             import numpy as np
 
             if r.rows_per_line != 1:
                 raise SystemExit("--layout hilbert works with the reference, genotype and variants modes")
-            flat = r.index.reshape(-1)[: (end or c.length) - start]
+            flat = r.index.reshape(-1)[: end - start]
             img, order = hilbert_image(flat.astype(np.uint8))
             r.index = img
         r = r.scaled(a.scale)
@@ -246,7 +271,7 @@ def cmd_book(a) -> int:
         info = make_book(
             g,
             a.output,
-            contigs=a.contigs.split(",") if a.contigs else None,
+            contigs=_names(a.contigs) if a.contigs else None,
             mode=a.mode,
             palette=a.palette,
             colorspace="rgb" if a.rgb else "cmyk",
@@ -267,14 +292,13 @@ def cmd_fasta(a) -> int:
         with _open(a) as g:
             if a.which != "ref" and not g.sample_id:
                 raise SystemExit(f"gpxil: error: {a.file} has no sample, so only --which ref can be exported")
-            regions = [a.region] if a.region else [(n, 0, None) for n in g.contigs]
+            regions = [g.region_of(a.region)] if a.region else [(n, None, None) for n in g.contigs]
             for name, s, e in regions:
-                c = g[name]
-                e = c.length if e is None else e
-                if not (0 <= s < e <= c.length):
-                    raise SystemExit(f"gpxil: error: {name}:{s + 1}-{e} is outside {c.name} (length {c.length:,})")
+                # (read through the windows that overlap or touch the one that holds it: an event that one cuts is
+                # whole, and a window without the sample's planes, or the reference, reads them from another)
+                c, s, e = g.view(*g.locate(name, s, e, join=True))
                 if a.which != "ref" and not c.has("gt"):
-                    print(f"note: {c.name} has no genotype plane (no calls); skipped", file=sys.stderr)
+                    print(f"note: {c.region(s, e)} has no genotype plane (no calls); skipped", file=sys.stderr)
                     continue
                 if a.which == "ref":
                     pieces = iter_reference(c, s, e)
@@ -282,7 +306,8 @@ def cmd_fasta(a) -> int:
                     pieces = iter_genotype_iupac(c, s, e)
                 else:
                     pieces = iter_haplotype(c, int(a.which), s, e)
-                label = c.name if (s, e) == (0, c.length) else f"{c.name}:{s + 1}-{e}"
+                # (a stretch, or a window, named by the region it is of its sequence: spec 3.1)
+                label = c.name if (s, e) == (0, c.length) and c.window is None else c.region(s, e, commas=False)
                 suffix = "" if a.which == "ref" else f"_{'iupac' if a.which == 'iupac' else 'hap' + a.which}"
                 write_fasta_stream(out, label + suffix, pieces)
     finally:
@@ -299,7 +324,7 @@ def cmd_vcf(a) -> int:
     out = open(a.output, "w") if a.output else sys.stdout
     try:
         with _open(a) as g:
-            n = write_vcf(g, out, a.contigs.split(",") if a.contigs else None, nocall_blocks=not a.no_nocall_blocks, regions=a.region)
+            n = write_vcf(g, out, _names(a.contigs) if a.contigs else None, nocall_blocks=not a.no_nocall_blocks, regions=_in(g, a.region))
     finally:
         if a.output:
             out.close()
@@ -334,6 +359,13 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--haploid-contig", action="append", metavar="NAME", help="whole contig haploid (repeatable)")
     e.add_argument("--sex", choices=["XX", "XY"], help="XY: treat GRCh38 chrX/chrY outside the PARs as haploid")
     e.add_argument("--contigs", help="comma-separated subset of contigs")
+    e.add_argument(
+        "--region",
+        type=_region,
+        action="append",
+        metavar="REGION",
+        help="CONTIG:START-END (1-based, inclusive): a window of the contig, which keeps its positions (repeatable)",
+    )
     e.add_argument("--ucsc-names", action="store_true", help="rename 1..22,X,Y,MT to chr1..chr22,chrX,chrY,chrM")
     e.add_argument("--no-ref", action="store_true", help="omit the ref plane (reference identified by digests)")
     e.add_argument("--planes", help="variant planes to write (default: gt,flags + gq/dp/ps when present)")
@@ -356,9 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--no-digests", action="store_true", help="skip recomputing sequence digests")
     v.set_defaults(fn=cmd_validate)
 
-    s = sub.add_parser("subset", help="copy some contigs (and planes) into a new gpxil file: a working copy, without encoding again")
+    s = sub.add_parser(
+        "subset", help="copy some contigs (and planes) into a new gpxil file, or windows of them: a working copy, without encoding again"
+    )
     s.add_argument("file", help="a gpxil file: a path or a URL")
-    s.add_argument("contigs", nargs="*", metavar="CONTIG", help="contigs to copy, by name or alias (default: all)")
+    s.add_argument(
+        "contigs",
+        nargs="*",
+        metavar="CONTIG",
+        help="contigs to copy, by name or alias, or regions (CONTIG:START-END, 1-based) to cut out as windows (default: all)",
+    )
     s.add_argument("-o", "--output", required=True, help="the new gpxil file")
     s.add_argument("--planes", help="planes to copy, comma-separated, e.g. ref,gt,flags (default: all each contig has)")
     s.add_argument("--no-ref", action="store_true", help="leave out the ref plane (the contigs keep their reference's digests)")

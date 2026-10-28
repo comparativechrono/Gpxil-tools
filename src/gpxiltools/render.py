@@ -230,13 +230,13 @@ def render(
 ) -> Rendering:
     """Render a :class:`~gpxiltools.container.Contig` (or an interval of it)."""
     end = contig.length if end is None else end
-    if not contig.has("ref"):
-        raise ValueError(f"{contig.name} has no ref plane; rendering needs the reference sequence")
+    if not contig.covers("ref", start, end):
+        raise ValueError(f"{contig.region(start, end)} has no ref plane; rendering needs the reference sequence")
     ref = contig.read("ref", start, end)
     gt = contig.read("gt", start, end) if contig.has("gt") else None
     flags = contig.read("flags", start, end) if contig.has("flags") else None
     bpr = bases_per_row or contig.width
-    title = f"{contig.name}:{start + 1:,}-{end:,}"
+    title = contig.region(start, end)  # (on a window, positions in its parent: spec 3.1)
     return render_arrays(
         ref, gt, flags, mode=mode, palette=palette, bases_per_row=bpr, mark_insertions=mark_insertions, start=start, title=title
     )

@@ -9,9 +9,11 @@ multi-page TIFF.
 gpxiltools converts a reference FASTA, and optionally one person's VCF, into a
 `.gpxil.tif` file; reads any genomic interval of any plane as a NumPy array;
 exports reference, haplotype or IUPAC sequences and VCF; checks files against
-the specification; makes working copies of some chromosomes; counts what a
-file holds; and renders pictures for the screen (PNG), for print (CMYK TIFF)
-and as a whole "genome book" PDF with one printed dot per base.
+the specification; makes working copies of some chromosomes, or windows of
+them (a gene and its surroundings in a file of a few kilobytes that keeps the
+chromosome's positions); counts what a file holds; compares genomes; and
+renders pictures for the screen (PNG), for print (CMYK TIFF) and as a whole
+"genome book" PDF with one printed dot per base.
 
 ## Install
 
@@ -47,6 +49,16 @@ gpxil stats HG002.gpxil.tif chr17:7,661,779-7,687,546 chr21
 # --planes keeps only some planes, --compression encodes the strips again
 gpxil subset HG002.gpxil.tif chr17 -o HG002_chr17.gpxil.tif
 gpxil subset HG002.gpxil.tif chr17 chr21 --no-ref -o HG002_17_21.noref.gpxil.tif
+
+# a window (gpxil 0.3): TP53 and 100 kb either side, out of the whole genome, as
+# a contig named chr17:7561779-7787546 that keeps chromosome 17's positions
+# (76 kB; 11 kB with --no-ref); or straight from the VCF, converting only the
+# calls around it, which gives the same planes. Every command takes positions
+# on a window as the chromosome's: chr17:7,661,779-7,687,546 is found in it
+gpxil subset HG002.gpxil.tif chr17:7,561,779-7,787,546 -o HG002_TP53.gpxil.tif
+gpxil encode GRCh38.fa.gz -v HG002.vcf.gz --callable HG002_benchmark.bed \
+    --region chr17:7,561,779-7,787,546 -o HG002_TP53.gpxil.tif
+gpxil vcf HG002_TP53.gpxil.tif --region chr17:7,661,779-7,687,546   # CHROM chr17, POS as on chr17
 
 # two genomes compared base by base (B taken as the truth: precision, recall, F1),
 # indels written at other places in a repeat found the same; or a child with both
@@ -128,6 +140,13 @@ with GpxilFile("HG002.gpxil.tif") as g:
     print(counts["total"]["substitutions"])                # {'heterozygous': 3, 'homozygous': 11, ...}
     print(format_stats(counts))
 subset("HG002.gpxil.tif", "HG002_chr17.gpxil.tif", ["chr17"], planes=["ref", "gt", "flags"])
+subset("HG002.gpxil.tif", "HG002_TP53.gpxil.tif", ["chr17:7,561,779-7,787,546"])   # a window
+
+with GpxilFile("HG002_TP53.gpxil.tif") as g:
+    w = g["chr17:7561779-7787546"]                       # w.window: {"of": "chr17", "start": 7561778, ...}
+    w.parent, w.start, w.end                               # ("chr17", 7561778, 7787546): offset i is chr17's w.start + i
+    c, s, e = g.locate("chr17", 7_661_778, 7_687_546)      # the window holding them, and its offsets (100000, 125768)
+    gt = c.read("gt", s, e)
 ```
 
 Genomes compared:
@@ -238,6 +257,14 @@ agree with bcftools on every non-overlapping record; where records overlap
   written, both to haplotype 2: two overlapping deletions that the VCF has on
   different haplotypes became one, which `gpxil compare` sees as one. Encode
   such a VCF again for version 0.2's rule (spec section 6.5).
+- A window holds only its stretch: a deletion that begins before it is seen
+  from its first base, an insertion after the base before it isn't in it,
+  and a COMPLEX allele that starts before it and runs into it is held as a
+  copy at its first base; its VCF records at its ends say only what it holds
+  (windows of a chromosome that overlap or touch are read together, as one
+  stretch of it). Readers of version 0.2 and earlier (gpxiltools 0.6, say)
+  read a window as an ordinary contig, with positions counted from its first
+  base.
 
 A gpxil file of a person, and every faithful rendering or book of it, is that
 person's genome: handle it like the VCF it came from.

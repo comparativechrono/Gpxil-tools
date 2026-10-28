@@ -1,5 +1,107 @@
 # Changes
 
+## 0.7.0 (28 October 2026)
+
+Version 0.3 of the specification: windows.
+
+- **Windows** (specification section 3.1): a contig can hold a stretch of a
+  longer sequence, its parent, and say where in it the stretch lies, so that
+  a gene and its surroundings travel in a file of a few kilobytes and keep
+  the chromosome's positions. TP53 and 100 kb either side, out of HG002's
+  chromosome 17, is 76 kB (12 kB without the reference plane), against
+  24.6 MB for the chromosome. A window holds what the whole chromosome's
+  planes hold over its stretch; it is named after the region it holds
+  (`chr17:7561779-7787546`), and its metadata entry's `window` key names the
+  parent, where the window starts in it, and the parent's length, digests
+  and other names.
+- **`gpxil subset FILE chr17:7,561,779-7,787,546`** cuts a window out of a
+  whole contig, or out of another window, reading and encoding again a strip
+  at a time, so it works on a whole genome on the web in a second or two. A
+  contig or a window named whole is copied as it is stored, as before; the
+  name of a sequence that a file holds windows of copies them all. A file
+  with windows is gpxil 0.3, and its `subset` record gives the version of the
+  file it copied, whose rules its planes follow.
+- **`gpxil encode --region chr17:7,561,779-7,787,546`** (repeatable) makes
+  windows straight from a VCF, converting only the calls that join up with
+  the window through overlapping spans, over the stretch they cover: which
+  gives what converting the whole chromosome would. Checked against cutting
+  the same windows out of whole chromosomes, on 116 windows of HG002's
+  chromosome 17 whose edges cut deletions and insertions, and on dense
+  simulated calls of every kind (overlapping indels, symbolic deletions and
+  inversions, breakends, reference blocks, `*` alleles, haploid and missing
+  genotypes, phase sets): the planes and sidecars are the same, base for
+  base, phase sets too. Only the contigs asked for (with `--contigs` too)
+  are taken out of the VCF. A gpxil file of windows can't be the reference
+  (it holds stretches of its sequences): encode says so.
+- **Phase-set identifiers that aren't numbers** (VCF `PS` should be one) are
+  numbered, as the specification now requires (section 5.5), from all the
+  phased calls of the contig, whichever are converted, so that a window's
+  values are its whole parent's, and every window's of one parent alike. A
+  number is written in the digits 0 to 9, and compared by value (`077` is
+  77): `+77` or `²` is an identifier like any other.
+- **Positions on a window are its parent's, in every command**:
+  `GpxilFile.locate(name, start, end)` finds a region of a sequence in the
+  contig that holds it (a window of just that stretch, or the first that
+  holds it all), so `stats`, `render`, `fasta`, `vcf` and `compare` take
+  `chr17:7,661,779-7,687,546` on a window file. Names are found as
+  gpxil-read.js finds them (`GpxilFile.find`): as written, else a whole
+  contig ignoring case, with or without `chr`; a window by its name as
+  written, so `17` isn't a window `chr17:1-500`. `GpxilFile.region_of()`
+  reads a region given as text as the CLI and gpxil-read.js do, and
+  `locate()` takes one. `gpxil info`, `render`, `book` and `stats` label
+  windows by their parent's positions. `Contig.window`, `.parent`, `.start`,
+  `.end`, `.region()`, and `GpxilFile.windows` and `.windows_of()` say where
+  contigs lie. A name ends at the last colon of a region, so a window's name
+  can carry a region: `chr17:7561779-7787546:7,661,779-7,687,546`.
+- **Windows that overlap or touch are read as one stretch** of their
+  sequence (`Stretch`, `GpxilFile.stretches()`): `gpxil vcf` writes the
+  records of one window of all the stretch, each once, so a deletion that
+  one window cuts and the next holds is written whole (on 116 windows of
+  HG002's chromosome 17, in 41 stretches, the 860 records are those of one
+  window per stretch); `gpxil compare` compares each base once, and `gpxil
+  stats` counts each base once in all. A region is read through the
+  stretch that holds it, in every command (`GpxilFile.view()`), so a
+  region in one window ends as the region of one window of all the stretch
+  would, and a region that windows hold only together is found in them
+  (`locate(..., join=True)`). Windows may have different planes: each base
+  keeps the planes of the windows that hold it, and where none with the
+  sample's planes does, nothing is known of it; so a region found first in
+  a window of the reference only still has the calls of a window beside
+  it. The reference is read from the windows that have it, where they hold
+  the bases (`Stretch.covers()`). A window's copy of a COMPLEX entry at its
+  first base (specification section 3.1) is told from the parent's own
+  entry, and left out. A sequence named alone is all its windows in
+  `stats`, `vcf` and `book`. A deletion at a window's first base is
+  written on the base before the window, as N, so that the window's VCF
+  encodes back to it (specification section 11.4).
+- Regions: `CHROM:POS` is one base; numbers are the digits 0 to 9, with
+  commas or spaces, and don't begin with 0, so a name with colons in it
+  (`HLA-A*01:01:01:01`) stays a name; a region from position 0 is an error.
+  A file's contig named like a region (`HLA-A*01:14`, or even `HLA:0-5`),
+  or given with spaces around it, is that contig, and lists of names
+  (`--contigs`, `subset`) split at commas but those that group a region's
+  digits. Positions go up to 2^53 − 1. gpxil-read.js reads regions the
+  same way.
+- A window without its reference plane reads its bases from its parent in
+  the reference given (a FASTA, a gpxil file of the chromosome, or of a
+  window that holds it), checked against its own digests or its parent's.
+- `gpxil validate` checks windows: their `window` key, the file's version,
+  that a window holds less than all of its parent, that windows of one
+  parent agree where they overlap, and, where the file holds the parent
+  too, that a window holds what the parent does. The schema of version 0.3
+  is bundled. A whole number in a `window` key may be written `2.0`, as
+  JSON Schema allows.
+- A copy of a copy keeps, in its `subset` record, the version whose rules
+  made its planes. A window without the sample's planes doesn't name the
+  VCF contig. Windows without their reference plane that give only their
+  parent's digests check a FASTA's chromosome once for all of them.
+- Files are written as gpxil 0.3. Readers of 0.2 read them, and a window as
+  an ordinary contig. Files of 0.1 and 0.2 read as before.
+- `js/gpxil-read.js` implements 0.3: a contig's `window`, `parent`, `start`
+  and `end`; `locate()` finds regions as gpxiltools does (the tests check it
+  against gpxiltools' answers); `parseRegion()` and `regionText()`; windows
+  whose metadata says wrong things of where they are are refused.
+
 ## 0.6.0 (28 October 2026)
 
 Version 0.2 of the specification, and a reader in JavaScript.

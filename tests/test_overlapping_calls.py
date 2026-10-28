@@ -194,14 +194,14 @@ def test_files_are_gpxil_0_2_and_say_what_was_reassigned(tmp_path, capsys):
     from gpxiltools.cli import main
 
     assert main(["encode", str(fa), "-v", str(vcf), "-o", str(out), "--width", "20"]) == 0
-    assert "1 unphased call overlaps another, so its alleles were put the other way round (gpxil 0.2" in capsys.readouterr().err
+    assert "1 unphased call overlaps another, so its alleles were put the other way round (gpxil 0.3" in capsys.readouterr().err
     with GpxilFile(out) as g:
-        assert FORMAT_VERSION == "0.2" and g.metadata["gpxil"] == "0.2"
+        assert FORMAT_VERSION == "0.3" and g.metadata["gpxil"] == "0.3"
         assert g["c1"].entry["encoding"]["overlapping_calls_reassigned"] == 1
         assert g.metadata["summary"]["overlapping_calls_reassigned"] == 1
         assert haplotype_sequence(g["c1"], 1) == b"ACGTCGTACGTACGTACGT" and haplotype_sequence(g["c1"], 2) == b"ACACGTACGTACGTACGT"
     with tifffile.TiffFile(out) as t:
-        assert all(json.loads(p.description)["gpxil"] == "0.2" for p in t.pages)
+        assert all(json.loads(p.description)["gpxil"] == "0.3" for p in t.pages)
     assert validate(out).ok and not validate(out).warnings
 
 
@@ -217,11 +217,11 @@ def test_a_copy_keeps_the_version_of_its_source(tmp_path):
     subset(old, tmp_path / "copy.gpxil.tif", ["c2"], log=lambda m: None)
     with GpxilFile(tmp_path / "copy.gpxil.tif") as g:
         assert g.metadata["gpxil"] == "0.1" and g.contigs == ["c2"]
-    # a file of a newer 0.x is read, and checked as 0.2; its copy is still of that version
+    # a file of a newer 0.x is read, and checked as 0.3; its copy is still of that version
     new = tmp_path / "new.gpxil.tif"
-    with GpxilWriter(new, width=20, version="0.3") as w:
+    with GpxilWriter(new, width=20, version="0.4") as w:
         w.add_contig("c1", {"ref": REF.copy()})
-    assert any("declares gpxil 0.3, newer than this validator" in m for m in validate(new).warnings)
-    subset(new, tmp_path / "copy3.gpxil.tif", ["c1"], log=lambda m: None)
-    with GpxilFile(tmp_path / "copy3.gpxil.tif") as g:
-        assert g.metadata["gpxil"] == "0.3"
+    assert any("declares gpxil 0.4, newer than this validator" in m for m in validate(new).warnings)
+    subset(new, tmp_path / "copy4.gpxil.tif", ["c1"], log=lambda m: None)
+    with GpxilFile(tmp_path / "copy4.gpxil.tif") as g:
+        assert g.metadata["gpxil"] == "0.4"

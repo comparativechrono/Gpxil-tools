@@ -219,7 +219,7 @@ def region_tally(contig, start: int = 0, end: int | None = None, *, chunk: int =
     end = contig.length if end is None else end
     if not (0 <= start < end <= contig.length):
         raise IndexError(f"{contig.name}:{start + 1}-{end} is outside {contig.name} (length {contig.length:,})")
-    t = Tally(regions=1, bases=end - start, has_ref=contig.has("ref"), has_gt=contig.has("gt"))
+    t = Tally(regions=1, bases=end - start, has_ref=contig.covers("ref", start, end), has_gt=contig.has("gt"))
     if not t.has_gt:
         if t.has_ref:
             for s in range(start, end, chunk):
@@ -286,7 +286,7 @@ def region_tally(contig, start: int = 0, end: int | None = None, *, chunk: int =
                 lo, hi = s + int(pos[f]), s + int(pos[lst])
                 b = blocks.setdefault(v, [lo, hi])
                 b[0], b[1] = min(b[0], lo), max(b[1], hi)
-    # deletions that begin in the region and go on past it: followed to their ends
+    # deletions that begin in the region and go on past it: followed to their ends, or to the end of the contig
     s = end
     while any(r.following for r in runs) and s < contig.length:
         e = min(contig.length, s + chunk)
@@ -295,6 +295,9 @@ def region_tally(contig, start: int = 0, end: int | None = None, *, chunk: int =
             if r.following:
                 r.follow(C.normalize_states(f(gt)) == C.HAP_DEL, s, contig.length)
         s = e
+    for r in runs:
+        if r.following:
+            r._close(contig.length)  # (a deletion to the end of what the contig holds)
     # deletions: homozygous when both haplotypes have the same run, or there is one copy
     same = {(a, b) for a, b, _ in runs[0].runs} & {(a, b) for a, b, _ in runs[1].runs}
     for k, r in enumerate(runs):
@@ -336,32 +339,83 @@ def _one_copy_at(contig, offset: int) -> bool:
     return bool(C.hap2(contig.read("gt", offset, offset + 1))[0] == C.HAP_ABSENT)
 
 
-def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple[str, int, int, Tally]]:
-    """Tallies of ``regions``: ``(contig, start, end)``, 0-based, end None for the rest (default: every contig)."""
-    if not regions:
-        regions = [(n, 0, None) for n in gfile.contigs]
+def _wanted(gfile, regions) -> list[tuple]:
+    """The regions asked for, each ``(contig, start, end)`` at the contig's own offsets: a sequence named that only
+    windows hold (spec 3.1) is each of them; a region that windows hold together, their stretch."""
     out = []
-    for name, s, e in regions:
-        c = gfile[name]
-        e = c.length if e is None else e
-        out.append((c.name, s, e, region_tally(c, s, e, chunk=chunk)))
+    for name, s, e in regions or [(n, None, None) for n in gfile.contigs]:
+        if s is None and e is None and gfile.find(name) is None and len(gfile.windows_of(name)) > 1:
+            out += [(w, 0, w.length) for w in gfile.windows_of(name)]
+        else:
+            out.append(gfile.locate(name, s, e, join=True))
     return out
 
 
+def _through(gfile, c, s: int, e: int) -> tuple:
+    """A region read through the file's join of the contigs of its sequence that holds it (a Stretch of windows that
+    overlap or touch), so that an event cut by the end of one window is counted whole: (view, start, end)."""
+    return gfile.view(c, s, e)
+
+
+def tally(gfile, regions=None, *, chunk: int = CHUNK) -> list[tuple]:
+    """Tallies of ``regions``: ``(contig, start, end)``, 0-based, start and end None for the whole contig, end None
+    for the rest of it (default: every contig). On a window (spec 3.1) they are positions in its parent, and a
+    sequence named that only windows hold is each of its windows. A region is read through the file's windows that
+    overlap or touch the one that holds it, so an event that one cuts is counted whole, in the region it begins in.
+    Returns ``(contig, start, end, Tally)`` with the :class:`~gpxiltools.container.Contig` (or the
+    :class:`~gpxiltools.container.Stretch` of windows that hold it together) and its own offsets."""
+    return [(c, s, e, region_tally(*_through(gfile, c, s, e), chunk=chunk)) for c, s, e in _wanted(gfile, regions)]
+
+
+def _in_all(gfile, parts, chunk: int) -> Tally:
+    """The tally of all the regions together, each base once: where regions of a sequence overlap (windows that
+    overlap, say, or the sequence and a window of it), their union is counted, read as one stretch."""
+    total = None
+    seqs: dict[str, list] = {}
+    for c, s, e, t in parts:
+        seqs.setdefault(c.parent, []).append((c, s, e, t))
+    for name, ps in seqs.items():
+        spans = sorted((c.start + s, c.start + e) for c, s, e, _ in ps)
+        if all(a[1] < b[0] for a, b in zip(spans, spans[1:])):
+            got = [t for *_, t in ps]  # (no two overlap or touch: the sum of them)
+        else:
+            union: list[list[int]] = []
+            for a, b in spans:
+                if union and a <= union[-1][1]:
+                    union[-1][1] = max(union[-1][1], b)
+                else:
+                    union.append([a, b])
+            views = gfile.stretches(name)  # (the file's contigs of the sequence, joined where they overlap or touch)
+            got = []
+            for a, b in union:
+                v = next(v for v in views if v.start <= a and b <= v.end)
+                got.append(region_tally(v, a - v.start, b - v.start, chunk=chunk))
+        for t in got:
+            total = t if total is None else total + t
+    return total
+
+
 def stats(gfile, regions=None, *, chunk: int = CHUNK) -> dict:
-    """What the file holds, counted per region and in all, as plain data (:func:`format_stats` makes a table of it)."""
+    """What the file holds, counted per region and in all, as plain data (:func:`format_stats` makes a table of it).
+    In all, each base is counted once, where regions overlap."""
     parts = tally(gfile, regions, chunk=chunk)
-    total = parts[0][3]
-    for *_, t in parts[1:]:
-        total = total + t
+    total = _in_all(gfile, parts, chunk)
     meta = gfile.metadata
     return {
         "file": str(gfile.path).rstrip("/").rsplit("/", 1)[-1],
         "sample": gfile.sample_id,
         "reference": (meta.get("reference") or {}).get("name"),
-        "regions": [{"contig": n, "start": s + 1, "end": e, **t.as_dict()} for n, s, e, t in parts],
+        "regions": [_where(c, s, e) | t.as_dict() for c, s, e, t in parts],
         "total": {"regions": len(parts), **total.as_dict()},
     }
+
+
+def _where(c, s: int, e: int) -> dict:
+    """A region in its sequence's coordinates (a window's: its parent's), and the window it is in."""
+    out = {"contig": c.parent, "start": c.start + s + 1, "end": c.start + e}
+    if c.window is not None:
+        out["window"] = c.name
+    return out
 
 
 # ----------------------------------------------------------------- as a table

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import __version__
+from .container import parse_region
 from .palettes import DEFAULT_PALETTE, get_palette
 from .render import class_counts, render
 
@@ -182,6 +183,36 @@ def _palette_cs(rgb: np.ndarray, cmyk: np.ndarray, colorspace: str) -> bytes:
     return b"[/Indexed /DeviceRGB 255 <" + rgb.astype(np.uint8).tobytes().hex().encode() + b">]"
 
 
+def _book_contigs(gfile, contigs) -> list[str]:
+    """The contigs to print: by name or other name, a sequence's windows by its name (spec 3.1); by default every
+    contig with its reference."""
+    if not contigs:
+        return [c for c in gfile.contigs if gfile[c].has("ref")]
+    out: list[str] = []
+    for n in contigs:
+        c = gfile.find(n)
+        if c is not None:
+            out.append(c.name)
+        elif gfile.windows_of(n):
+            out += [w.name for w in gfile.windows_of(n)]
+        elif parse_region(n)[1] is not None:
+            raise ValueError(
+                f"{n} is a region: a book prints contigs, or windows, whole. Cut it out as a window first (gpxil subset FILE {n} -o …)"
+            )
+        else:
+            raise KeyError(f"no contig {n!r} in {gfile.path}")
+    return list(dict.fromkeys(out))
+
+
+def _cover_label(contig) -> str:
+    """A contig's short name on the cover: a window's parent, and where in it it starts."""
+    if contig.window is None:
+        return contig.name[:12]
+    p = contig.start + 1
+    at = f"{p / 1e6:.2f}M" if p >= 1e6 else f"{p / 1e3:.1f}k" if p >= 1e3 else str(p)
+    return f"{contig.parent[:8]}:{at}"
+
+
 def make_book(
     gfile,
     out_path,
@@ -201,7 +232,7 @@ def make_book(
     log = log or (lambda m: None)
     if colorspace not in ("cmyk", "rgb"):
         raise ValueError("colorspace must be 'cmyk' or 'rgb'")
-    names = contigs or [c for c in gfile.contigs if gfile[c].has("ref")]
+    names = _book_contigs(gfile, contigs)
     pal = get_palette(palette)
     sample = gfile.sample_id
     ref_name = (gfile.metadata.get("reference") or {}).get("name", "")
@@ -247,7 +278,7 @@ def make_book(
         images[key] = pdf.image(stripe, cs_name)
         y = top - i * (bar_h + gap)
         bw = bar_w_max * contig.length / longest
-        c.text(m, y + bar_h * 0.2, name[:12], min(8, bar_h * 0.8), grey=0.25)
+        c.text(m, y + bar_h * 0.2, _cover_label(contig), min(8, bar_h * 0.8), grey=0.25)
         c.image(key, m + 50, y, bw, bar_h)
     c.text_centre(W / 2, m + 12, f"gpxil {gfile.metadata.get('gpxil')} · gpxiltools {__version__}", 7, grey=0.5)
     footer(c)
@@ -298,8 +329,12 @@ def make_book(
     for name in names:
         contig = gfile[name]
         c = _Content()
-        c.text_centre(W / 2, H / 2 + 20, name, 40, bold=True)
-        c.text_centre(W / 2, H / 2 - 10, f"{contig.length:,} bases", 12, grey=0.3)
+        # (a window, spec 3.1: titled by its parent, with the stretch it holds; positions are the parent's)
+        c.text_centre(W / 2, H / 2 + 20, contig.parent, 40, bold=True)
+        if contig.window is not None:
+            c.text_centre(W / 2, H / 2 - 10, f"{contig.start + 1:,} – {contig.end:,}: {contig.length:,} bases", 12, grey=0.3)
+        else:
+            c.text_centre(W / 2, H / 2 - 10, f"{contig.length:,} bases", 12, grey=0.3)
         n_pages = math.ceil(contig.length / per_page)
         c.text_centre(W / 2, H / 2 - 28, f"{n_pages} page{'s' if n_pages != 1 else ''}", 10, grey=0.4)
         footer(c)
@@ -319,8 +354,8 @@ def make_book(
             iw = bpr * dot
             ih = rows_px * dot
             c = _Content()
-            c.text(m, H - m - 10, f"{name}", 9, bold=True)
-            label = f"{s + 1:,} – {e:,}"
+            c.text(m, H - m - 10, contig.parent, 9, bold=True)
+            label = f"{contig.start + s + 1:,} – {contig.start + e:,}"
             c.text(W - m - text_width(label, 9), H - m - 10, label, 9, grey=0.25)
             c.image("Im", m, H - m - layout.header_pt - ih, iw, ih)
             footer(c)

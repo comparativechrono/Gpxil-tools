@@ -1,0 +1,63 @@
+{
+ "description": "Expected decoded content of worked-example-window.gpxil.tif (gpxil SPEC.md appendix B): the window chrT:5-10 of the worked example, which holds offsets 4-9 of chrT. Offsets are the window's, 0-based; offset i is offset 4 + i of chrT, position 5 + i.",
+ "contig": "chrT:5-10",
+ "length": 6,
+ "width": 4,
+ "window": {
+  "of": "chrT",
+  "start": 4,
+  "length": 10,
+  "md5": "45aff2fecf7615d56bc0567dffab9fa8",
+  "refget": "SQ.5qtCMY5Xfy7qDQObgJp-F4dWcXwvTij7",
+  "aliases": [
+   "T"
+  ]
+ },
+ "planes": {
+  "ref": [
+   "0x01",
+   "0x02",
+   "0x04",
+   "0x08",
+   "0x11",
+   "0x12"
+  ],
+  "gt": [
+   "0xd0",
+   "0xd0",
+   "0x00",
+   "0x00",
+   "0xf4",
+   "0x00"
+  ],
+  "flags": [
+   "0x11",
+   "0x11",
+   "0x00",
+   "0x17",
+   "0x18",
+   "0x00"
+  ]
+ },
+ "sidecar": [
+  {
+   "offset": 3,
+   "hap": 1,
+   "kind": "INS",
+   "data": "GG"
+  },
+  {
+   "offset": 3,
+   "hap": 2,
+   "kind": "INS",
+   "data": "GG"
+  }
+ ],
+ "haplotype_1": "GTGGnc",
+ "haplotype_2": "ACGTGGgc",
+ "vcf_records": [
+  "chrT\t4\t.\tNAC\tN\t.\tPASS\t.\tGT\t1|0",
+  "chrT\t8\t.\tT\tTGG\t.\tPASS\t.\tGT\t1|1",
+  "chrT\t9\t.\tA\tG\t.\tgpxil_filtered\t.\tGT\t./1"
+ ]
+}

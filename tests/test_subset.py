@@ -147,8 +147,8 @@ def test_phase_sets_and_extension_planes(tmp_path):
 def test_what_subset_refuses(genome, tmp_path):
     _, src = genome
     out = tmp_path / "o.gpxil.tif"
-    with pytest.raises(ValueError, match="is a region"):
-        subset(src, out, ["chr1:1-1000"], log=lambda m: None)
+    with pytest.raises(IndexError, match="outside chr1"):
+        subset(src, out, ["chr1:29,001-31,000"], log=lambda m: None)  # (chr1 has 30,000 bases)
     with pytest.raises(KeyError, match="no contig 'chr9'"):
         subset(src, out, ["chr9"], log=lambda m: None)
     with pytest.raises(ValueError, match="the input file"):
@@ -182,5 +182,10 @@ def test_subset_on_the_command_line(genome, tmp_path, capsys):
     assert main(["subset", str(src), "chr1", "-o", str(out), "--no-ref"]) == 0
     err = capsys.readouterr().err
     assert "wrote" in err and "1 contig (chr1)" in err and "planes gt,flags,gq" in err and "strips copied as stored" in err
-    assert main(["subset", str(src), "chr1:5-10", "-o", str(out)]) == 1
-    assert "is a region" in capsys.readouterr().err
+    assert main(["subset", str(src), "chr1:5-10", "-o", str(out)]) == 0
+    err = capsys.readouterr().err
+    assert "1 contig (chr1:5-10), a window, 6 bases" in err and "4 pages encoded again" in err
+    assert main(["subset", str(src), "chr1:9-8", "-o", str(out)]) == 1
+    assert "bad interval in 'chr1:9-8'" in capsys.readouterr().err
+    assert main(["subset", str(src), "chr1:31,000-31,001", "-o", str(out)]) == 1
+    assert "is outside chr1 (length 30,000)" in capsys.readouterr().err

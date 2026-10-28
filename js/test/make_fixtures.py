@@ -6,10 +6,11 @@ back from each: its metadata, every plane (as little-endian bytes in a .bin file
 The files differ in what a reader must cope with: Deflate or none; many strips of a few rows, or tiles, in classic
 TIFF, BigTIFF or big-endian TIFF; 8-, 16- and 32-bit planes, signed and float, with the predictors extension planes
 may have; a sidecar with insertions and a COMPLEX allele; a contig without a sample; the specification's worked
-example; names that differ only in case. Others must be refused, each with the code the reader gives: another major
-version, a page compressed with LZW, a TIFF that isn't gpxil, not a TIFF, and files made to hurt a reader (section 13):
-directories that loop, a strip that inflates to 200 MB, strips shorter than their rows, a strip of no bytes, a tag
-or a strip larger than a reader takes.
+example; names that differ only in case; windows (section 3.1), with and without their reference plane, and where
+gpxiltools finds regions in them. Others must be refused, each with the code the reader gives: another major version,
+a page compressed with LZW, a TIFF that isn't gpxil, not a TIFF, windows that say wrong things of where they are, and
+files made to hurt a reader (section 13): directories that loop, a strip that inflates to 200 MB, strips shorter than
+their rows, a strip of no bytes, a tag or a strip larger than a reader takes.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from simulate import fasta_text, simulate  # noqa: E402
 
 from gpxiltools.container import GpxilFile, GpxilWriter  # noqa: E402
 from gpxiltools.encode import encode  # noqa: E402
+from gpxiltools.subset import subset  # noqa: E402
 
 
 def base_file(out_dir: str) -> str:
@@ -266,6 +268,23 @@ def hand_files(out_dir: str) -> dict:
             {"gpxil": "0.2", "layout": {"type": "raster", "width": 10}, "contigs": contigs, "contig": "c", "plane": "ref", "length": 20}
         )
         put(name, hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": desc}]), code="format", at="open")
+    # windows that say wrong things of where they are (section 3.1)
+    for name, window in (
+        ("window-named-as-parent", {"of": "c", "start": 0}),
+        ("window-negative", {"of": "x", "start": -3}),
+        ("window-past-end", {"of": "x", "start": 90, "length": 100}),
+        ("window-text", {"of": "x", "start": "10"}),
+        ("window-list", [1, 2]),
+        ("window-no-parent", {"start": 3}),
+        ("window-length-null", {"of": "x", "start": 3, "length": None}),
+        ("window-md5-null", {"of": "x", "start": 3, "md5": None}),
+        ("window-refget-number", {"of": "x", "start": 3, "refget": 7}),
+    ):
+        contigs = [{"name": "c", "length": 20, "pages": {"ref": 0}, "window": window}]
+        desc = json.dumps(
+            {"gpxil": "0.3", "layout": {"type": "raster", "width": 10}, "contigs": contigs, "contig": "c", "plane": "ref", "length": 20}
+        )
+        put(name, hand_tiff([{"W": 10, "H": 2, "rps": 2, "strips": [acgt], "desc": desc}]), code="format", at="open")
     # TIFFs that aren't gpxil, with pages this reader couldn't read either: told by their metadata, before their layout
     for name, kw in (("rgb", dict(data=np.zeros((8, 8, 3), np.uint8), photometric="rgb")), ("bilevel", dict(data=np.zeros((8, 8), bool)))):
         tifffile.imwrite(os.path.join(out_dir, name + ".tif"), metadata=None, **kw)
@@ -373,6 +392,78 @@ def odd_files(out_dir: str) -> dict:
     return files
 
 
+def locate_cases(path: str) -> list[dict]:
+    """Regions, and where gpxiltools finds them in a file of windows: the contig and its offsets, or the kind of
+    error ("contig": no such contig; "region": not one the file holds, or not which)."""
+    asked = [
+        ["chr1", 30000, 30010],
+        ["chr1", 33500, 33600],  # (in both windows that overlap: the first)
+        ["chr1", 33000, 40000],  # (just the second)
+        ["chr1", 100, 200],
+        ["chr1", 600, 700],
+        ["chr1", None, None],  # (three windows: which?)
+        ["chr2", None, None],
+        ["2", 600, 610],  # (by another name of the sequence)
+        ["chrM", None, None],
+        ["chrM", 10, 20],
+        ["chr1:30001-34000", None, None],
+        ["chr1:30001-34000", 30005, 30010],
+        ["chr1:30001-34000", 10, 20],
+        ["chr9", None, None],
+        ["chr1", 39990, 40010],  # (past the end of the window)
+        ["CHR1", 33500, 33600],  # (names ignoring case, with or without "chr", as contig() takes them)
+        ["1", 30000, 30010],
+        ["Chr2", 600, 610],
+        ["chr1", 33600, 33500],  # (a stretch of no bases, or less)
+        ["chr1", 33500, 33500],
+        ["chr1", 0, None],  # (from position 0 on: not "the whole contig")
+        ["chr1", 30005, None],
+        ["chrM", 0, None],
+    ]
+    out = []
+    with GpxilFile(path) as g:
+        for name, s, e in asked:
+            try:
+                c, a, b = g.locate(name, s, e)
+                out.append({"ask": [name, s, e], "contig": c.name, "start": a, "end": b})
+            except (KeyError, IndexError) as exc:
+                msg = exc.args[0] if exc.args else ""
+                out.append({"ask": [name, s, e], "error": "contig" if str(msg).startswith("no contig") else "region"})
+    return out
+
+
+def locate_text_cases(path: str) -> list[dict]:
+    """Regions given as text, and where gpxiltools finds them (``GpxilFile.locate(text)``, as gpxil-read.js's
+    ``locate(text)``): a contig's name is that contig, else the text is read as a region."""
+    asked = [
+        "chr1:33,501-33,600",
+        "chr1:30001-34000",  # (a window's name)
+        "CHR1:30001-34000",  # (not a name as written: a region, found in the window of just that stretch)
+        "chr1:30001-34000:30,006-30,010",
+        "chr2:601",
+        "chr2: 601 - 610",
+        "2:601-610",
+        "chrM",
+        "chrm",
+        "chr1:10-5",
+        "chr1:0-5",
+        "chr9:1-10",
+        "chr1:01-5",
+        " chrM ",  # (a name with spaces around it: the name)
+        " chr2:601-610 ",
+    ]
+    out = []
+    with GpxilFile(path) as g:
+        for text in asked:
+            try:
+                c, a, b = g.locate(text)
+                out.append({"ask": text, "contig": c.name, "start": a, "end": b})
+            except (KeyError, IndexError, ValueError) as exc:
+                msg = exc.args[0] if exc.args else ""
+                out.append({"ask": text, "error": "contig" if str(msg).startswith("no contig") else "region"})
+    return out
+
+
 def expected_of(path: str, name: str, out_dir: str) -> dict:
     with GpxilFile(path) as g, tifffile.TiffFile(path) as t:
         offsets = [p.offset for p in t.pages]
@@ -393,6 +484,9 @@ def expected_of(path: str, name: str, out_dir: str) -> dict:
                     "length": c.length,
                     "width": c.width,
                     "aliases": list(c.entry.get("aliases", [])),
+                    "window": c.window,
+                    "parent": c.parent,
+                    "start": c.start,
                     "planes": planes,
                     "sidecar": side,
                 }
@@ -426,9 +520,16 @@ def main(out_dir: str) -> None:
     shutil.copy(os.path.join(ROOT, "tests", "data", "worked-example.gpxil.tif"), good["example"])
     newer = os.path.join(out_dir, "newer.gpxil.tif")  # (a later 0.x: read as it is)
     ref = np.frombuffer(b"\x01\x02\x04\x08" * 50, dtype=np.uint8)
-    with GpxilWriter(newer, width=16, version="0.3") as w:
+    with GpxilWriter(newer, width=16, version="0.4") as w:
         w.add_contig("c1", {"ref": ref.copy()})
     good["newer"] = newer
+    # windows (section 3.1), cut out of the whole contigs: two that overlap, one that starts at a COMPLEX allele
+    # (chr2's, at 501), a whole contig beside them; and windows without their reference plane
+    good["windows"] = os.path.join(out_dir, "windows.gpxil.tif")
+    cuts = ["chr1:1-500", "chr1:30,001-34,000", "chr1:33,001-40,000", "chr2:501-2,000", "chrM"]
+    subset(good["strips"], good["windows"], cuts, log=lambda m: None)
+    good["windows-noref"] = os.path.join(out_dir, "windows-noref.gpxil.tif")
+    subset(good["strips"], good["windows-noref"], ["chr1:30,001-34,000", "chr2:401-600"], include_ref=False, log=lambda m: None)
 
     bad = {}
     path = os.path.join(out_dir, "major1.gpxil.tif")
@@ -460,7 +561,13 @@ def main(out_dir: str) -> None:
     bad["noise"] = {"file": os.path.basename(path), "code": "not-tiff", "at": "open"}
 
     bad.update(hand_files(out_dir))
-    expected = {"good": {name: expected_of(path, name, out_dir) for name, path in good.items()}, "bad": bad, "odd": odd_files(out_dir)}
+    expected = {
+        "good": {name: expected_of(path, name, out_dir) for name, path in good.items()},
+        "bad": bad,
+        "odd": odd_files(out_dir),
+        "locate": locate_cases(good["windows"]),
+        "locate_text": locate_text_cases(good["windows"]),
+    }
     with open(os.path.join(out_dir, "expected.json"), "w") as fh:
         json.dump(expected, fh, indent=1)
     shutil.rmtree(work)

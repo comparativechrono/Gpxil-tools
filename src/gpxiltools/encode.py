@@ -9,10 +9,10 @@ from collections.abc import Callable, Iterable
 
 import numpy as np
 
-from .container import DEFAULT_COMPRESSION, DEFAULT_WIDTH, BigTiffNeeded, GpxilWriter, check_contig_name
+from .container import DEFAULT_COMPRESSION, DEFAULT_WIDTH, BigTiffNeeded, GpxilWriter, check_contig_name, parse_region, region_text
 from .fasta import FastaRecord, iter_fasta, sequence_digests
 from .palettes import DEFAULT_PALETTE
-from .vcf import TempSplit, encode_calls, load_bed, read_header
+from .vcf import TempSplit, encode_calls, load_bed, phased_ps, ps_numbering, read_header, record_span, window_entries, window_stretch
 
 # GRCh38 pseudoautosomal regions, 0-based half-open (GRC definitions).
 GRCH38_PAR = {
@@ -68,6 +68,30 @@ def male_haploid_mask(name: str, length: int) -> np.ndarray | None:
     return mask
 
 
+def _region_names(r) -> list[str]:
+    """The names a region asked for may be of: its contig's; for one given as text, also all of the text (a contig
+    may be named 'HLA-A*01:14')."""
+    if not isinstance(r, str):
+        return [r[0]]
+    try:
+        return list(dict.fromkeys([r.strip(), parse_region(r)[0]]))
+    except ValueError:  # (not a region: a contig's name, 'HLA:0-5', or else an error once the names are known)
+        return [r.strip()]
+
+
+def _region_of(r, known_as: set[str]) -> tuple[str, int | None, int | None]:
+    """A region asked for, on a contig known by ``known_as``: given as text, the whole contig if the text is its name
+    (as gpxil-read.js reads it), else the region it reads as."""
+    if not isinstance(r, str):
+        return tuple(r)
+    if r.strip() in known_as:
+        return (r.strip(), None, None)
+    try:
+        return parse_region(r)
+    except ValueError:  # (not a region, nor this contig's name: another contig's, else an error once all are read)
+        return (r.strip(), None, None)
+
+
 def reference_records(path, *, invalid: str = "error", wanted: Callable[[str], bool] | None = None):
     """The reference's sequences, one :class:`FastaRecord` per contig.
 
@@ -82,6 +106,14 @@ def reference_records(path, *, invalid: str = "error", wanted: Callable[[str], b
         return
     with GpxilFile(path) as g:
         for c in g:
+            if c.window is not None:
+                # (a window holds a stretch of its sequence: a VCF's calls on the sequence can't all be placed on it)
+                if wanted is None or any(wanted(n) for n in (c.parent, *c.parent_aliases)):
+                    raise GpxilFormatError(
+                        f"{path}: {c.name} is a window of {c.parent} (a stretch of it), so it can't be the reference:"
+                        f" give all of {c.parent} (a FASTA file, or a gpxil file of it), with --region for a stretch"
+                    )
+                continue
             names = [c.name, *c.entry.get("aliases", [])]
             if wanted is not None and not any(wanted(n) for n in names):
                 continue
@@ -113,6 +145,7 @@ def encode(
     haploid_contigs: Iterable[str] = (),
     sex: str | None = None,
     contigs: Iterable[str] | None = None,
+    regions: Iterable[tuple[str, int | None, int | None] | str] | None = None,
     ucsc_names: bool = False,
     include_ref: bool = True,
     planes: Iterable[str] | None = None,
@@ -128,7 +161,18 @@ def encode(
     """Encode a reference FASTA, optionally with one sample's VCF, into a gpxil file.
 
     The reference can also be a gpxil file (a path or URL) with the
-    reference plane, such as the Gpxil browser's GRCh38 files. Returns a summary dict (also stored in the file's metadata). With
+    reference plane, such as the Gpxil browser's GRCh38 files.
+
+    ``regions``, ``(contig, start, end)`` with 0-based positions and the end
+    excluded (None and None: the whole contig), or text
+    (``chr17:7,561,779-7,787,546``; the name of a contig of the reference is
+    that contig), replace ``contigs``: each stretch becomes a window (spec
+    3.1), a contig named for it (``chr17:7561779-7787546``) that keeps the
+    chromosome's positions and holds what the whole chromosome's planes would
+    hold there. Only the calls that join up with it through overlapping spans
+    are converted.
+
+    Returns a summary dict (also stored in the file's metadata). With
     ``bigtiff=None`` the file is classic TIFF unless it would pass 4 GiB, in
     which case the encode restarts as BigTIFF. On any error the partial
     output is removed.
@@ -137,6 +181,8 @@ def encode(
     haploid_contigs = set(haploid_contigs)
     if sex not in (None, "XX", "XY"):
         raise ValueError("sex must be 'XX' or 'XY'")
+    if contigs is not None and regions is not None:
+        raise ValueError("give contigs or regions, not both")
     split = None
     sample_index = None
     if vcf is not None:
@@ -151,7 +197,21 @@ def encode(
             raise ValueError(f"sample {sample!r} not in {vcf} (samples: {', '.join(hdr.samples[:10])})")
         sample = hdr.samples[sample_index]
         log(f"splitting {os.path.basename(str(vcf))} by contig for sample {sample} ...")
-        split = TempSplit(vcf, sample_index).__enter__()
+        asked = (
+            None
+            if contigs is None and regions is None
+            else {n for r in regions for n in _region_names(r)}
+            if regions is not None
+            else set(contigs)
+        )
+        if asked is not None:
+            # (only the contigs asked for are kept, under any of their names)
+            asked = {x for n in asked for x in (n, ucsc_name(n), *contig_aliases(n), *contig_aliases(ucsc_name(n)))}
+
+        def keep(chrom: str) -> bool:
+            return asked is None or bool({chrom, ucsc_name(chrom), *contig_aliases(chrom)} & asked)
+
+        split = TempSplit(vcf, sample_index, keep=keep).__enter__()
     try:
         args = dict(
             vcf=vcf,
@@ -162,6 +222,7 @@ def encode(
             haploid_contigs=haploid_contigs,
             sex=sex,
             contigs=None if contigs is None else set(contigs),
+            regions=None if regions is None else [r if isinstance(r, str) else tuple(r) for r in regions],
             ucsc_names=ucsc_names,
             include_ref=include_ref,
             planes=None if planes is None else list(planes),
@@ -207,6 +268,7 @@ def _encode_once(
     haploid_contigs,
     sex,
     contigs,
+    regions,
     ucsc_names,
     include_ref,
     planes,
@@ -244,20 +306,42 @@ def _encode_once(
         "skipped": 0,
         "overlapping_calls_reassigned": 0,
     }
+    if regions is not None:
+        totals["windows"] = 0
     used_vcf: set[str] = set()
+    found: set[int] = set()  # (the regions whose contig the reference has)
     t0 = time.time()
     writer = GpxilWriter(
         out, width=width, compression=compression, level=level, palette=palette, reference=ref_meta, sample=sample_meta, bigtiff=bigtiff
     )
     try:
 
-        def wanted(n: str) -> bool:
+        def names_of(n: str) -> set[str]:
             u = ucsc_name(n) if ucsc_names else n
-            return contigs is None or bool({n, u, *contig_aliases(u)} & contigs)
+            return {n, u, *contig_aliases(u)}
+
+        def wanted(n: str) -> bool:
+            if regions is not None:
+                return any(x in names_of(n) for r in regions for x in _region_names(r))
+            return contigs is None or bool(names_of(n) & contigs)
 
         for rec in reference_records(fasta, invalid=invalid, wanted=wanted):
             name = ucsc_name(rec.name) if ucsc_names else rec.name
-            if contigs is not None and not (name in contigs or rec.name in contigs or any(a in contigs for a in contig_aliases(name))):
+            known_as = names_of(rec.name) | {name}
+            if regions is not None:
+                # (whole contigs, and windows: their [start, end), in order)
+                targets = []
+                for k, r in enumerate(regions):
+                    n, s, e = _region_of(r, known_as)
+                    if n in known_as:
+                        found.add(k)
+                        targets.append(None if e is None and not s else (s or 0, rec.length if e is None else e))
+                targets = list(dict.fromkeys(targets))
+            elif contigs is None or known_as & contigs:
+                targets = [None]
+            else:
+                targets = []
+            if not targets:
                 continue
             if rec.length == 0:
                 totals.setdefault("skipped_empty_contigs", []).append(name)
@@ -265,74 +349,125 @@ def _encode_once(
                 continue
             check_contig_name(name)
             aliases = [a for a in dict.fromkeys([rec.name, *contig_aliases(name)]) if a != name]
-            entry: dict = {"aliases": aliases, **sequence_digests(rec.codes)}
-            if rec.converted:
-                entry["invalid_characters_converted_to_N"] = rec.converted
-            data = {"ref": rec.codes} if include_ref else {}
-            side = None
+            digests = sequence_digests(rec.codes)
+            for target in targets:
+                if target is not None and not (0 <= target[0] < target[1] <= rec.length):
+                    raise ValueError(f"{name}:{target[0] + 1:,}-{target[1]:,} is outside {name} ({rec.length:,} bases)")
+            if any(target in (None, (0, rec.length)) for target in targets):
+                targets = [None, *(x for x in targets if x not in (None, (0, rec.length)))]
+            # what the VCF and the regions files say of this contig, for the contig and its windows alike
+            calls = None
             if split is not None:
                 vname = _match(name, vcf_contigs) or _match(rec.name, vcf_contigs)
                 callable_mask = load_bed(callable_bed, name, rec.length, [rec.name, *aliases]) if callable_bed else None
                 if vname is None and (callable_mask is None or not callable_mask.any()):
                     # no calls and no callable interval: nothing is known about the sample here (spec 6.1)
-                    if data:
-                        writer.add_contig(name, data, length=rec.length, **entry)
-                        totals["contigs"] += 1
-                        totals["bases"] += rec.length
-                        log(f"  {name}: {rec.length:,} bp, no calls (reference only)  [{time.time() - t0:.0f}s]")
-                    else:
-                        totals.setdefault("contigs_without_data", []).append(name)
-                        log(f"  {name}: no calls, and --no-ref leaves nothing to store: skipped")
+                    calls = False
+                else:
+                    if callable_bed and callable_mask is None:
+                        log(f"  note: {os.path.basename(str(callable_bed))} has no intervals on {name}; bases without calls are UNKNOWN")
+                        callable_mask = np.zeros(rec.length, dtype=bool)
+                    haploid_mask = load_bed(haploid_bed, name, rec.length, [rec.name, *aliases]) if haploid_bed else None
+                    if name in haploid_contigs or rec.name in haploid_contigs or any(a in haploid_contigs for a in aliases):
+                        haploid_mask = np.ones(rec.length, dtype=bool)
+                    if sex == "XY" and haploid_mask is None:
+                        haploid_mask = male_haploid_mask(name, rec.length)
+                    if vname:
+                        used_vcf.add(vname)
+                    calls = (vname, callable_mask, haploid_mask)
+                    got: list = []
+
+                    def scan(vname=vname, n=rec.length, got=got):
+                        """the spans of the contig's calls, and the values of its phase-set identifiers (spec 5.5):
+                        worked out once, for all its windows"""
+                        if not got:
+                            spans, keys = [], []
+                            for c in split.calls(vname):
+                                spans.append(record_span(c, n))
+                                k = phased_ps(c, n)
+                                if k is not None:
+                                    keys.append(k)
+                            got.append((spans, ps_numbering(keys)))
+                        return got[0]
+
+            for target in targets:
+                if target is None:
+                    label, length = name, rec.length
+                    entry: dict = {"aliases": aliases, **digests}
+                    data = {"ref": rec.codes} if include_ref else {}
+                else:
+                    s, e = target
+                    label, length = region_text(name, s, e), e - s
+                    window = {"of": name, "start": s, "length": rec.length, **digests}
+                    if aliases:
+                        window["aliases"] = aliases
+                    entry = {"window": window, **sequence_digests(rec.codes[s:e])}
+                    data = {"ref": rec.codes[s:e]} if include_ref else {}
+                if rec.converted:
+                    entry["invalid_characters_converted_to_N"] = rec.converted
+                side = None
+                if calls is False and not data:
+                    totals.setdefault("contigs_without_data", []).append(label)
+                    log(f"  {label}: no calls, and --no-ref leaves nothing to store: skipped")
                     continue
-                if callable_bed and callable_mask is None:
-                    log(f"  note: {os.path.basename(str(callable_bed))} has no intervals on {name}; bases without calls are UNKNOWN")
-                    callable_mask = np.zeros(rec.length, dtype=bool)
-                haploid_mask = load_bed(haploid_bed, name, rec.length, [rec.name, *aliases]) if haploid_bed else None
-                if name in haploid_contigs or rec.name in haploid_contigs or any(a in haploid_contigs for a in aliases):
-                    haploid_mask = np.ones(rec.length, dtype=bool)
-                if sex == "XY" and haploid_mask is None:
-                    haploid_mask = male_haploid_mask(name, rec.length)
-                calls = split.calls(vname) if vname else iter(())
-                if vname:
-                    used_vcf.add(vname)
-                var_planes, side, stats, ps_ids = encode_calls(
-                    rec.codes,
-                    calls,
-                    contig=name,
-                    callable_mask=callable_mask,
-                    haploid_mask=haploid_mask,
-                    planes=[p for p in plane_set if p != "ref"],
+                if calls:
+                    vname, callable_mask, haploid_mask = calls
+                    var_planes, side, stats, ps_ids = _convert(
+                        split, vname, rec, name, target, callable_mask, haploid_mask, [p for p in plane_set if p != "ref"], scan
+                    )
+                    data.update(var_planes)
+                    entry["vcf_contig"] = vname
+                    gt = var_planes["gt"]
+                    absent2 = int(np.count_nonzero((gt & 0x0F) == 0x0A))
+                    entry["ploidy"] = 1 if absent2 == length else 2 if absent2 == 0 else "mixed"
+                    entry["encoding"] = stats.as_dict()
+                    if callable_mask is not None:
+                        a, b = (0, rec.length) if target is None else target
+                        entry["callable_bases"] = int(np.count_nonzero(callable_mask[a:b]))
+                    if "ps" in var_planes:
+                        # (the phase sets on the bases: of a contig, every one used; of a window, those in it)
+                        here = set(ps_ids.values()) if target is None else {int(v) for v in np.unique(var_planes["ps"]) if v}
+                        if here:
+                            entry["phase_sets"] = len(here)
+                        synthetic = {str(v): k for k, v in ps_ids.items() if str(v) != k and v in here}
+                        if synthetic:
+                            entry["phase_set_ids"] = synthetic  # ps value -> original VCF PS
+                    totals["records"] += stats.records
+                    totals["conflicts"] += stats.conflicts
+                    totals["overlapping_calls_reassigned"] += stats.overlapping_calls_reassigned
+                    totals["ref_mismatches"] += stats.ref_mismatches
+                    totals["skipped"] += stats.skipped_out_of_range + stats.polyploid_skipped
+                    if stats.examples:
+                        entry["encoding"]["examples"] = stats.examples[:5]
+                if not data:
+                    continue  # --no-ref and nothing else for this contig
+                writer.add_contig(label, data, length=length, sidecar=side, **entry)
+                totals["contigs"] += 1
+                totals["bases"] += length
+                if target is not None:
+                    totals["windows"] += 1
+                log(
+                    f"  {label}: {length:,} bp"
+                    + (f", a window of {name}" if target is not None else "")
+                    + (
+                        f", {entry['encoding']['records']:,} records"
+                        if "encoding" in entry
+                        else ", no calls (reference only)"
+                        if calls is False
+                        else ""
+                    )
+                    + f"  [{time.time() - t0:.0f}s]"
                 )
-                n_callable = None if callable_mask is None else int(callable_mask.sum())
-                del callable_mask, haploid_mask  # free before the planes are written
-                data.update(var_planes)
-                entry["vcf_contig"] = vname
-                entry["ploidy"] = stats.ploidy
-                entry["encoding"] = stats.as_dict()
-                if n_callable is not None:
-                    entry["callable_bases"] = n_callable
-                if ps_ids:
-                    entry["phase_sets"] = len(ps_ids)
-                    synthetic = {str(v): k for k, v in ps_ids.items() if str(v) != k}
-                    if synthetic:
-                        entry["phase_set_ids"] = synthetic  # ps value -> original VCF PS
-                totals["records"] += stats.records
-                totals["conflicts"] += stats.conflicts
-                totals["overlapping_calls_reassigned"] += stats.overlapping_calls_reassigned
-                totals["ref_mismatches"] += stats.ref_mismatches
-                totals["skipped"] += stats.skipped_out_of_range + stats.polyploid_skipped
-                if stats.examples:
-                    entry["encoding"]["examples"] = stats.examples[:5]
-            if not data:
-                continue  # --no-ref and nothing else for this contig
-            writer.add_contig(name, data, length=rec.length, sidecar=side, **entry)
-            totals["contigs"] += 1
-            totals["bases"] += rec.length
-            log(
-                f"  {name}: {rec.length:,} bp"
-                + (f", {entry['encoding']['records']:,} records" if "encoding" in entry else "")
-                + f"  [{time.time() - t0:.0f}s]"
-            )
+            calls = None  # (free the masks before the next contig)
+        if regions is not None:
+            for k, r in enumerate(regions):
+                if k not in found and isinstance(r, str):
+                    parse_region(r)  # (neither a contig's name nor a region: says what is wrong with it)
+            missing = [_region_names(regions[k])[-1] for k in range(len(regions)) if k not in found]
+            if missing:
+                raise ValueError(
+                    f"the reference has no contig {missing[0]!r}" + (f" (nor {', '.join(missing[1:4])})" if len(missing) > 1 else "")
+                )
         if split is not None:
             unused = [c for c in vcf_contigs if c not in used_vcf and wanted(c)]  # contigs left out by --contigs are not news
             if unused:
@@ -350,3 +485,33 @@ def _encode_once(
     totals["seconds"] = round(time.time() - t0, 1)
     totals["bytes"] = os.path.getsize(out)
     return totals
+
+
+def _convert(split, vname, rec, name, target, callable_mask, haploid_mask, planes, scan):
+    """The sample's planes, sidecar, counts and phase sets of a contig, or of a window ``target`` = (start, end) of it
+    (spec 3.1): converted from the calls that join up with the window through overlapping spans, alone, over the
+    stretch they cover, and cut to the window, which gives what converting the whole contig would. ``scan()`` gives
+    the spans of the contig's calls (:func:`record_span`) and the values of its phase-set identifiers
+    (:func:`ps_numbering`), worked out once for all its windows."""
+    n = rec.length
+    if target is None:
+        calls = split.calls(vname) if vname else iter(())
+        return encode_calls(rec.codes, calls, contig=name, callable_mask=callable_mask, haploid_mask=haploid_mask, planes=planes)
+    s, e = target
+    spans, ps_values = scan() if vname else ((), {})
+    a, b, keep = window_stretch(spans, s, e)
+    calls = split.calls(vname, keep) if vname else iter(())
+    var_planes, side, stats, ps_ids = encode_calls(
+        rec.codes[a:b],
+        calls,
+        contig=name,
+        callable_mask=None if callable_mask is None else callable_mask[a:b],
+        haploid_mask=None if haploid_mask is None else haploid_mask[a:b],
+        planes=planes,
+        origin=a,
+        contig_length=n,
+        ps_values=ps_values,
+    )
+    cut = {p: np.ascontiguousarray(v[s - a : e - a]) for p, v in var_planes.items()}
+    side = window_entries(side, s - a, e - a, int(var_planes["gt"][s - a])) if side else side
+    return cut, side, stats, ps_ids
