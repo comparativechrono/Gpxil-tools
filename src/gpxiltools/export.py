@@ -6,6 +6,7 @@ longest chromosome.
 
 from __future__ import annotations
 
+import bisect
 import heapq
 import io
 from collections.abc import Iterator
@@ -456,11 +457,13 @@ def _view_pieces(pieces: list[tuple], views: list) -> list[tuple]:
     view's offsets, in order along the sequence, those of one view joined where they overlap or touch. A piece of a
     contig without the sample's planes gives none."""
     got: dict[int, list] = {}
+    starts = [v.start for v in views]  # (the views are apart, in order along the sequence)
     for c, s, e in pieces:
         if not c.has("gt"):
             continue
         a, b = c.start + s, c.start + e
-        for k, v in enumerate(views):
+        for k in range(max(0, bisect.bisect_right(starts, a) - 1), bisect.bisect_left(starts, b)):
+            v = views[k]
             lo, hi = max(a, v.start), min(b, v.end)
             if lo < hi:
                 got.setdefault(k, []).append((lo - v.start, hi - v.start))

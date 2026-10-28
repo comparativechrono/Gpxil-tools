@@ -872,6 +872,7 @@ class Contig:
         self.width: int = int(entry.get("width") or gfile.metadata["layout"]["width"])
         self.rows: int = rows_for(self.length, self.width)
         self.pages: dict[str, int] = {k: int(v) for k, v in entry["pages"].items()}
+        self._page_of: dict = {}  # (the TIFF pages read: tifffile parses a page again each time it is asked for one)
         #: for a window (spec 3.1), its ``window`` key: the parent, and where the window starts in it; else None
         self.window: dict | None = (
             check_window(self.name, self.length, entry["window"], entry.get("aliases", ())) if "window" in entry else None
@@ -1030,7 +1031,10 @@ class Contig:
                     "(GpxilFile(path, reference=...), or --reference on the command line)"
                 )
             raise MissingPlaneError(f"contig {self.name} has no {plane!r} plane (has {', '.join(self.pages)})")
-        return self._g._tf.pages[self.pages[plane]]
+        page = self._page_of.get(plane)
+        if page is None:
+            page = self._page_of[plane] = self._g._tf.pages[self.pages[plane]]
+        return page
 
     def image(self, plane: str) -> np.ndarray:
         """The plane as stored: a 2-D (rows, width) raster including padding."""
@@ -1122,7 +1126,7 @@ class Stretch:
         self.name = "+".join(c.name for c in self.parts)
         #: (where it lies, as a window's key says)
         self.window = {"of": self.parent, "start": self.start}
-        self.planes = sort_planes({p for c in self.parts for p in c.planes if self.has(p)})
+        self.planes = sort_planes({p for p in {p for c in self.parts for p in c.planes} if self.has(p)})
         self._segments_of: dict[str, tuple[list, list]] = {}
         self._sidecar: list[SidecarEntry] | None = None
 
@@ -1219,31 +1223,39 @@ class Stretch:
         return bool(before) and max(before, key=lambda x: x.offset).data == e.data
 
 
-def join_contigs(contigs: Iterable[Contig], need: str | None = None) -> list[Contig | Stretch]:
+def join_contigs(contigs: Iterable[Contig], need: str | None = None, *, cache: dict | None = None) -> list[Contig | Stretch]:
     """Contigs of one sequence joined where they overlap or touch, in order along it: each join as the contig of it
     that holds all the others, or as a :class:`Stretch` of them. With ``need``, only the contigs that have that
-    plane."""
+    plane. ``cache`` keeps the joins made, by the names of the contigs they join, so that each is made once (and a
+    stretch's sidecar merged once)."""
     out: list[Contig | Stretch] = []
     group: list[Contig] = []
     hi = -1
     for c in sorted((c for c in contigs if need is None or c.has(need)), key=lambda c: (c.start, -c.end)):
         if group and c.start > hi:
-            out.append(_joined(group))
+            out.append(_joined(group, cache))
             group = []
         group.append(c)
         hi = max(hi, c.end) if len(group) > 1 else c.end
     if group:
-        out.append(_joined(group))
+        out.append(_joined(group, cache))
     return out
 
 
-def _joined(group: list[Contig]) -> Contig | Stretch:
+def _joined(group: list[Contig], cache: dict | None = None) -> Contig | Stretch:
+    key = tuple(c.name for c in group) if cache is not None else None
+    if key is not None and key in cache:
+        return cache[key]
     lo, hi = min(c.start for c in group), max(c.end for c in group)
     whole = next((c for c in group if c.start == lo and c.end == hi), None)
     # (one contig that holds all the others, with every plane they have: itself)
     if whole is not None and all(set(c.planes) <= set(whole.planes) for c in group):
-        return whole
-    return Stretch(group)
+        got: Contig | Stretch = whole
+    else:
+        got = Stretch(group)
+    if key is not None:
+        cache[key] = got
+    return got
 
 
 class GpxilFile:
@@ -1259,6 +1271,8 @@ class GpxilFile:
 
     def __init__(self, path, reference=None):
         self._fh = None
+        self._joins: dict = {}  # (stretches() and stretch_of() answers, made once: a file doesn't change while open)
+        self._join_cache: dict = {}  # (each join of contigs, by their names: see join_contigs)
         if hasattr(path, "read") and hasattr(path, "seek"):
             self.path = str(getattr(path, "name", None) or "<file object>")
             source = path
@@ -1348,6 +1362,7 @@ class GpxilFile:
         self._ref_cache = None
         self._ref_checked = set()
         self._ref_digests = None
+        self._joins, self._join_cache = {}, {}  # (which contigs have a reference plane has changed)
 
     def _reference_gpxil(self) -> GpxilFile:
         if self._ref_file is None:
@@ -1411,21 +1426,37 @@ class GpxilFile:
         """The contigs of a sequence (by default, of every sequence, each in the order the file first holds it),
         joined where they overlap or touch: along each sequence in order, each join as the contig of it that holds
         all the others, or as a :class:`Stretch` of them. With ``need``, only the contigs that have that plane."""
-        if name is not None:
-            return join_contigs(self.sequence_contigs(name), need)
-        seqs: dict[str, list[Contig]] = {}
-        for c in self:
-            seqs.setdefault(c.parent, []).append(c)
-        return [s for cs in seqs.values() for s in join_contigs(cs, need)]
+        key = ("name", name, need)
+        if key not in self._joins:
+            if name is not None:
+                got = join_contigs(self.sequence_contigs(name), need, cache=self._join_cache)
+            else:
+                got = [s for cs in self._by_parent().values() for s in join_contigs(cs, need, cache=self._join_cache)]
+            self._joins[key] = got
+        return list(self._joins[key])
+
+    def _by_parent(self) -> dict[str, list[Contig]]:
+        """The file's contigs by the sequence they hold bases of, each sequence in the order the file first holds it."""
+        if "by parent" not in self._joins:
+            seqs: dict[str, list[Contig]] = {}
+            for c in self:
+                seqs.setdefault(c.parent, []).append(c)
+            self._joins["by parent"] = seqs
+        return self._joins["by parent"]
 
     def stretch_of(self, contig: Contig | Stretch, need: str | None = None) -> Contig | Stretch:
         """The join of the file's contigs of a contig's sequence that holds it (see :meth:`stretches`); the contig
         itself if it has no ``need`` plane, or is a stretch already."""
         if isinstance(contig, Stretch):
             return contig
-        for s in join_contigs([c for c in self if c.parent == contig.parent], need):
-            if s.start <= contig.start and contig.end <= s.end:
-                return s
+        key = ("parent", contig.parent, need)
+        if key not in self._joins:
+            joins = join_contigs(self._by_parent().get(contig.parent, []), need, cache=self._join_cache)
+            self._joins[key] = (joins, [s.start for s in joins])
+        joins, starts = self._joins[key]
+        k = bisect.bisect_right(starts, contig.start) - 1  # (joins are apart, in order: the one that may hold it)
+        if k >= 0 and joins[k].start <= contig.start and contig.end <= joins[k].end:
+            return joins[k]
         return contig
 
     def region_of(self, text: str) -> tuple[str, int | None, int | None]:

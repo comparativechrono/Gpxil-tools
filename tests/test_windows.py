@@ -910,3 +910,38 @@ def test_phase_sets_written_in_other_digits(tmp_path):
     ref, fa, whole = _small(tmp_path, recs, n=100)
     with GpxilFile(whole) as g:
         assert g["c1"].entry["phase_set_ids"] == {"4294967295": "²"} and set(np.unique(g["c1"].read("ps")).tolist()) == {0, 77, 4294967295}
+
+
+def test_many_windows_that_touch(tmp_path):
+    """Hundreds of windows in one stretch: read as the window of all of it, each join made once per file."""
+    recs = [
+        _rec(p, lambda r, p=p: r[p - 1], lambda r, p=p: _other_base(r, p), "0|1" if p % 3 else "1|1", PS=5) for p in range(13, 2990, 37)
+    ]
+    recs.append(_rec(1500, lambda r: r[1499:1530], lambda r: r[1499], "1|0", PS=5))
+    ref, fa, whole = _small(tmp_path, recs, n=3000, seed=11)
+    tiles, union = tmp_path / "tiles.gpxil.tif", tmp_path / "union.gpxil.tif"
+    with GpxilFile(whole) as g:
+        with GpxilWriter(tiles, width=16, sample=g.metadata["sample"], reference=g.metadata["reference"], version="0.3") as w:
+            for a in range(100, 2900, 10):
+                w.cut_contig(g["c1"], a, a + 10)
+    subset(whole, union, ["c1:101-2900"], **QUIET)
+    assert _body(tiles) == _body(union)
+    with GpxilFile(tiles) as t, GpxilFile(union) as u:
+        (one,) = t.stretches()
+        assert len(one.parts) == 280 and all(t.stretch_of(c) is one for c in t)
+        assert stats(t)["total"] | {"regions": 1} == stats(u)["total"]
+        assert stats(t, [("c1", 1490, 1540)])["total"] == stats(u, [("c1", 1490, 1540)])["total"]
+        r = compare_pair(t, u)["total"]
+        assert r["variant_bases"]["agreement"] == 1.0 and r["called"] == compare_pair(u, u)["total"]["called"]
+
+
+def test_joins_follow_the_reference_given(tmp_path):
+    """Which windows have a reference plane changes when a reference is given: the joins are made again."""
+    ref, fa, whole = _small(tmp_path, [_rec(50, lambda r: r[49], lambda r: _other_base(r, 50), "0|1")], n=300)
+    noref = tmp_path / "noref.gpxil.tif"
+    subset(whole, noref, ["c1:11-100", "c1:101-200"], planes=["gt", "flags"], **QUIET)
+    with GpxilFile(noref) as g:
+        assert g.stretches(need="ref") == []
+        g.attach_reference(fa)
+        (s,) = g.stretches(need="ref")
+        assert s.read("ref", 0, 190).tobytes() == encode_sequence(ref[10:200].encode()).tobytes()

@@ -388,15 +388,15 @@ def _common_regions(gfiles, regions):
                 raise ValueError(f"the files hold no stretch of {name} in common")
             out.append(([_Seq(g.stretch_of(c)) for g, (c, _, _) in zip(gfiles, got)], lo, hi))
         return out
-    joined = [g.stretches() for g in gfiles]
-    for c0 in joined[0]:
+    joined = [[(c, _names(c)) for c in g.stretches()] for g in gfiles]
+    for c0, names0 in joined[0]:
         combos = [[c0]]
         for js in joined[1:]:
             combos = [
                 cs + [c]
                 for cs in combos
-                for c in js
-                if _names(c) & _names(c0) and max(c.start, *(x.start for x in cs)) < min(c.end, *(x.end for x in cs))
+                for c, names in js
+                if names & names0 and max(c.start, *(x.start for x in cs)) < min(c.end, *(x.end for x in cs))
             ]
         for cs in combos:
             out.append(([_Seq(c) for c in cs], max(c.start for c in cs), min(c.end for c in cs)))
