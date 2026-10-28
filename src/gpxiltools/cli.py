@@ -135,6 +135,38 @@ def cmd_validate(a) -> int:
     return 0 if rep.ok else 1
 
 
+def cmd_subset(a) -> int:
+    from .subset import subset
+
+    info = subset(
+        a.file,
+        a.output,
+        a.contigs,
+        planes=a.planes.split(",") if a.planes else None,
+        include_ref=not a.no_ref,
+        reference=a.reference,
+        compression=a.compression,
+        level=a.level,
+    )
+    how = "strips copied as stored" if not info["pages_encoded"] else f"{info['compression']}, {info['pages_encoded']} pages encoded again"
+    print(
+        f"wrote {a.output}: {info['contigs']} contig{'s' if info['contigs'] != 1 else ''} ({', '.join(info['names'][:6])}"
+        f"{', …' if info['contigs'] > 6 else ''}), {info['bases']:,} bases, planes {','.join(info['planes'])};"
+        f" {info['bytes'] / 1e6:,.1f} MB in {info['seconds']}s ({how})",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_stats(a) -> int:
+    from .stats import format_stats, stats
+
+    with _open(a) as g:
+        res = stats(g, a.regions or None)
+    print(json.dumps(res, indent=2) if a.json else format_stats(res))
+    return 0
+
+
 def cmd_render(a) -> int:
     from .layout import hilbert_image
     from .render import render
@@ -281,6 +313,28 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("file")
     v.add_argument("--no-digests", action="store_true", help="skip recomputing sequence digests")
     v.set_defaults(fn=cmd_validate)
+
+    s = sub.add_parser("subset", help="copy some contigs (and planes) into a new gpxil file: a working copy, without encoding again")
+    s.add_argument("file", help="a gpxil file: a path or a URL")
+    s.add_argument("contigs", nargs="*", metavar="CONTIG", help="contigs to copy, by name or alias (default: all)")
+    s.add_argument("-o", "--output", required=True, help="the new gpxil file")
+    s.add_argument("--planes", help="planes to copy, comma-separated, e.g. ref,gt,flags (default: all each contig has)")
+    s.add_argument("--no-ref", action="store_true", help="leave out the ref plane (the contigs keep their reference's digests)")
+    s.add_argument(
+        "--reference", metavar="FASTA", help="reference FASTA or gpxil file, to write the ref plane of contigs stored without one"
+    )
+    s.add_argument("--compression", choices=list(COMPRESSIONS), help="default: the input's, copying its strips without decoding them")
+    s.add_argument("--level", type=int, help="compression level (encodes the strips again)")
+    s.set_defaults(fn=cmd_subset)
+
+    st = sub.add_parser("stats", help="count what a file holds: calls, variants, phasing, quality")
+    st.add_argument("file", help="a gpxil file: a path or a URL")
+    st.add_argument(
+        "regions", nargs="*", type=_region, metavar="REGION", help="CONTIG or CONTIG:START-END (1-based, inclusive); default: every contig"
+    )
+    st.add_argument("--json", action="store_true", help="the counts as JSON")
+    st.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
+    st.set_defaults(fn=cmd_stats)
 
     r = sub.add_parser("render", help="draw a contig or interval as PNG (screen) or TIFF (RGB or CMYK)")
     r.add_argument("file")
