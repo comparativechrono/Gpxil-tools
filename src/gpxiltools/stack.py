@@ -201,6 +201,10 @@ def stack(
         raise ValueError("a row needs bases: give up and down, 0 or more, not both 0")
     if sort == "run" and down < 1:
         raise ValueError("--sort run measures the run from the anchor: give --down 1 or more")
+    if max_rows is not None and max_rows < 1:
+        raise ValueError("--max-rows takes 1 or more")
+    if tolerance < 0:
+        raise ValueError("--tolerance takes 0 or more")
     base_set(run_of)  # (says what's wrong with the letters)
     width = up + down
     names: dict[str, str | None] = {}

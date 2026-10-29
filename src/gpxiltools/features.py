@@ -50,6 +50,18 @@ def _open_text(path):
     return gzip.open(path, "rt") if magic == b"\x1f\x8b" else open(path)
 
 
+def _lines(path):
+    """The lines of a text file, plain or gzipped, numbered from 1; a damaged or cut-short gzip file, or one that
+    isn't text, is a ValueError that says so."""
+    import zlib
+
+    try:
+        with _open_text(path) as fh:
+            yield from enumerate(fh, 1)
+    except (EOFError, zlib.error, gzip.BadGzipFile, UnicodeDecodeError) as exc:
+        raise ValueError(f"{path}: can't be read as text ({exc}): is it damaged, or cut short?") from None
+
+
 class _Keep:
     """Which features to keep as a file is read (a name matching ``match``, a length of ``min_length`` or more),
     and one copy of each name and contig, which many features share."""
@@ -89,30 +101,29 @@ def read_bed(path, *, match: str | None = None, min_length: int = 0) -> list[Fea
     file is read."""
     keep = _Keep(match, min_length)
     out = []
-    with _open_text(path) as fh:
-        for n, line in enumerate(fh, 1):
-            if _skip(line):
-                continue
-            f = line.rstrip("\r\n").split("\t")
-            if len(f) < 3:
-                f = line.split()
+    for n, line in _lines(path):
+        if _skip(line):
+            continue
+        f = line.rstrip("\r\n").split("\t")
+        if len(f) < 3:
+            f = line.split()
+        try:
+            contig, start, end = f[0], int(f[1]), int(f[2])
+        except (IndexError, ValueError):
+            raise ValueError(f"{path}, line {n}: not a BED interval ({line.strip()[:60]!r})") from None
+        if start < 0 or end < start:
+            raise ValueError(f"{path}, line {n}: start {start} and end {end} are not an interval")
+        name = f[3] if len(f) > 3 else ""
+        if not keep(name, end - start):
+            continue
+        score = None
+        if len(f) > 4:
             try:
-                contig, start, end = f[0], int(f[1]), int(f[2])
-            except (IndexError, ValueError):
-                raise ValueError(f"{path}, line {n}: not a BED interval ({line.strip()[:60]!r})") from None
-            if start < 0 or end < start:
-                raise ValueError(f"{path}, line {n}: start {start} and end {end} are not an interval")
-            name = f[3] if len(f) > 3 else ""
-            if not keep(name, end - start):
-                continue
-            score = None
-            if len(f) > 4:
-                try:
-                    score = float(f[4])
-                except ValueError:
-                    score = None
-            strand = f[5] if len(f) > 5 and f[5] in ("+", "-") else "."
-            out.append(Feature(keep.one(contig), start, end, keep.one(name), score, strand, tuple(f[6:])))
+                score = float(f[4])
+            except ValueError:
+                score = None
+        strand = f[5] if len(f) > 5 and f[5] in ("+", "-") else "."
+        out.append(Feature(keep.one(contig), start, end, keep.one(name), score, strand, tuple(f[6:])))
     return out
 
 
@@ -165,41 +176,43 @@ def read_repeats(path, *, match: str | None = None, min_length: int = 0) -> list
     names: dict[tuple, str] = {}
     out = []
     kind = None
-    with _open_text(path) as fh:
-        for n, line in enumerate(fh, 1):
-            if _skip(line):
-                continue
+    for n, line in _lines(path):
+        if _skip(line):
+            continue
+        if kind is None:
+            kind = _rmsk_kind(line)
             if kind is None:
-                kind = _rmsk_kind(line)
-                if kind is None:
-                    if n <= 3 and not line.split()[0].isdigit():
-                        continue  # (a .out file begins with three lines of headings)
-                    raise ValueError(f"{path}, line {n}: not a RepeatMasker line ({line.strip()[:60]!r})")
-            try:
-                contig, start, end, strand, rep, cls, family, div = _rmsk_line(kind, line)
-            except (IndexError, KeyError, ValueError):
-                raise ValueError(f"{path}, line {n}: not a RepeatMasker line like those before it ({line.strip()[:60]!r})") from None
-            if start < 0 or end < start:
-                raise ValueError(f"{path}, line {n}: start {start} and end {end} are not an interval")
-            key = (cls, family, rep)
-            name = names.get(key)
-            if name is None:
-                name = names[key] = _repeat_name(cls, family, rep)
-            if keep(name, end - start):
-                out.append(Feature(keep.one(contig), start, end, name, div, strand))
+                if n <= 3 and not line.split()[0].isdigit():
+                    continue  # (a .out file begins with three lines of headings)
+                raise ValueError(f"{path}, line {n}: not a RepeatMasker line ({line.strip()[:60]!r})")
+        try:
+            contig, start, end, strand, rep, cls, family, div = _rmsk_line(kind, line)
+        except (IndexError, KeyError, ValueError):
+            raise ValueError(f"{path}, line {n}: not a RepeatMasker line like those before it ({line.strip()[:60]!r})") from None
+        if start < 0 or end < start:
+            raise ValueError(f"{path}, line {n}: start {start} and end {end} are not an interval")
+        key = (cls, family, rep)
+        name = names.get(key)
+        if name is None:
+            name = names[key] = _repeat_name(cls, family, rep)
+        if keep(name, end - start):
+            out.append(Feature(keep.one(contig), start, end, name, div, strand))
     return out
 
 
 def layout_of(path) -> str:
     """Whether a file of features is a RepeatMasker table (``'rmsk'``) or BED (``'bed'``), by its first lines."""
-    with _open_text(path) as fh:
-        for n, line in enumerate(fh, 1):
+    lines = _lines(path)
+    try:
+        for n, line in lines:
             if _skip(line):
                 continue
             if _rmsk_kind(line) is not None:
                 return "rmsk"
             if n > 3 or line.split()[0].isdigit() or len(line.split("\t")) >= 3:
                 break  # (a BED line; a .out file's headings come first, then its lines)
+    finally:
+        lines.close()  # (closes the file)
     return "bed"
 
 
@@ -223,19 +236,37 @@ def chosen(features: list[Feature], *, match: str | None = None, min_length: int
 
 
 def targets(gfile, regions=None) -> list[tuple]:
-    """What to scan: ``(view, start, end)`` at the view's offsets. ``regions``, ``(name, start, end)`` as
-    ``GpxilFile.region_of`` gives them (start and end None for a whole contig), are read as ``gpxil stats`` reads
-    them: a sequence named that only windows hold is each of its windows, and a region is read through the windows
-    that overlap or touch the one that holds it. Without regions, every sequence of the file, each base once."""
+    """What to scan, each base once: ``(view, start, end)`` at the view's offsets, along each sequence in order.
+
+    Without ``regions``, every sequence of the file (its contigs joined where they overlap or touch: spec 3.1).
+    ``regions``, ``(name, start, end)`` as ``GpxilFile.region_of`` gives them (start and end None for a whole
+    contig), are read as ``gpxil stats`` reads them: a sequence named that only windows hold is all of them, and a
+    region is read through the windows that overlap or touch the one that holds it; where regions of a sequence
+    overlap or touch, their union is scanned, once, as ``gpxil stats`` counts its total."""
     if not regions:
         return [(v, 0, v.length) for v in gfile.stretches()]
-    out = []
+    spans: dict[str, list[tuple[int, int]]] = {}
     for name, s, e in regions:
-        if s is None and e is None and gfile.find(name) is None and len(gfile.windows_of(name)) > 1:
-            parts = [(w, 0, w.length) for w in gfile.windows_of(name)]
+        if s is None and e is None and gfile.find(name) is None and gfile.windows_of(name):
+            parts = [(v, 0, v.length) for v in gfile.stretches(name)]  # (all of a sequence that windows hold)
         else:
-            parts = [gfile.locate(name, s, e, join=True)]
-        out += [gfile.view(c, a, b) for c, a, b in parts]
+            parts = [gfile.view(*gfile.locate(name, s, e, join=True))]
+        for v, a, b in parts:
+            spans.setdefault(v.parent, []).append((v.start + a, v.start + b))
+    out = []
+    for seq, got in spans.items():
+        union: list[list[int]] = []
+        for a, b in sorted(got):
+            if union and a <= union[-1][1]:
+                union[-1][1] = max(union[-1][1], b)
+            else:
+                union.append([a, b])
+        views = gfile.stretches(seq)  # (joined where they overlap or touch: a union lies in one of them)
+        for a, b in union:
+            v = next((v for v in views if v.start <= a and b <= v.end), None)
+            if v is None:
+                raise ValueError(f"{seq}:{a + 1:,}-{b:,} is not all held by the file")
+            out.append((v, a - v.start, b - v.start))
     return out
 
 

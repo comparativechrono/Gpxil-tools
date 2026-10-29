@@ -357,13 +357,15 @@ def cmd_runs(a) -> int:
 def cmd_period(a) -> int:
     from .period import best_period, panels, picture, text
 
+    if (a.period is not None and a.period < 1) or a.max_period < 1 or a.scale < 1:
+        raise ValueError("--period, --max-period and --scale take 1 or more")
     with _open(a) as g:
         c, s, e = g.view(*g.locate(*g.region_of(a.region), join=True))
         if not c.covers("ref", s, e):
             raise ValueError(f"{c.region(s, e)} has no reference: give it with --reference")
         found, share, shares = best_period(c.read("ref", s, e), a.max_period)
-        period = a.period or found
-        if a.period:
+        period = a.period if a.period is not None else found
+        if a.period is not None:
             share = shares.get(period)
         elif share < 0.6:
             print(f"note: no clear period (the best, {period}, has {share:.2f} of bases equal a unit on)", file=sys.stderr)
@@ -395,6 +397,8 @@ def cmd_stack(a) -> int:
     from .features import layout_of, read_features
     from .stack import binned, labelled, legend_of, rendering, save_pixels, stack, write_profile, write_rows
 
+    if a.bin < 1 or a.scale < 1:
+        raise ValueError("--bin and --scale take 1 or more")
     layout = layout_of(a.features) if a.layout == "auto" else a.layout
     feats = read_features(a.features, layout, match=a.match, min_length=a.min_length)
     with _open(a) as g:
@@ -412,7 +416,7 @@ def cmd_stack(a) -> int:
             tolerance=a.tolerance,
             reverse=a.reverse,
             max_rows=a.max_rows,
-            sample=a.mode != "reference" or bool(a.profile and g.sample_id),
+            sample=a.mode != "reference" or bool((a.profile or not a.output) and g.sample_id),  # (a profile has the variants)
         )
     left_out = [
         f"{st.unplaced:,} on no sequence of the file" if st.unplaced else "",
@@ -557,7 +561,7 @@ def cmd_skew(a) -> int:
     if a.picture:
         if not kept:
             raise ValueError("no windows with bases to draw")
-        cols = max(r["end"] // a.window for r in kept)
+        cols = max(r["start"] // a.window + 1 for r in kept)
         if cols > 20000:
             raise ValueError(f"the picture would be {cols:,} windows wide: give a larger --window")
         img = picture(kept, show, window=a.window, title=f"{os.path.basename(str(a.file))}: windows of {a.window:,} bases")

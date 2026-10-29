@@ -231,6 +231,41 @@ def test_calls_outside_the_confident_regions(made, tmp_path):
         assert int(c.background.subs.sum()) == sum(subs["bg"].values()) and int(c.inside.subs.sum()) == sum(subs["in"].values())
         kept = count_spectrum(g, FEATS, all_calls=True)
         assert int(kept.background.subs.sum()) > int(c.background.subs.sum())  # (the islands' substitutions)
+        # (where chunks end doesn't matter: an island, or a confident region, is judged whole)
+        for chunk in (97, 101, 1000):
+            small = count_spectrum(g, FEATS, chunk=chunk)
+            for x, y in ((small.inside, c.inside), (small.background, c.background)):
+                assert (x.bases == y.bases).all() and (x.subs == y.subs).all() and (x.called, x.indels) == (y.called, y.indels)
+
+
+def test_a_confident_region_that_begins_with_a_call(tmp_path):
+    """Calls cover the first bases of a region called with confidence: where a chunk ends among them, they are
+    still the start of that region, not an island outside it."""
+    rng = random.Random(3)
+    seq = "".join(rng.choice("ACGT") for _ in range(600))
+    other = {"A": "C", "C": "G", "G": "T", "T": "A"}
+    fa = tmp_path / "ref.fa"
+    fa.write_text(fasta_text({"chr1": seq}))
+    lines = [
+        "##fileformat=VCFv4.2",
+        "##contig=<ID=chr1,length=600>",
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1",
+        f"chr1\t101\t.\t{seq[100:103]}\t{''.join(other[b] for b in seq[100:103])}\t.\tPASS\t.\tGT\t0|1",
+        f"chr1\t301\t.\t{seq[300]}\t{other[seq[300]]}\t.\tPASS\t.\tGT\t0|1",
+    ]
+    vcf = tmp_path / "s.vcf"
+    vcf.write_text("\n".join(lines) + "\n")
+    bed = tmp_path / "conf.bed"
+    bed.write_text("chr1\t100\t600\n")
+    out = tmp_path / "s.gpxil.tif"
+    encode(str(fa), str(out), vcf=str(vcf), callable_bed=str(bed), width=64)
+    with GpxilFile(out) as g:
+        want = count_spectrum(g, [Feature("chr1", 250, 350)])
+        assert int(want.background.subs.sum()) == 3 and want.background.called == 400
+        for chunk in (98, 99, 100, 101, 102, 103, 104):
+            got = count_spectrum(g, [Feature("chr1", 250, 350)], chunk=chunk)
+            assert int(got.background.subs.sum()) == 3 and got.background.called == 400, chunk
 
 
 def test_exact_tests():
@@ -242,6 +277,8 @@ def test_exact_tests():
     assert lo == pytest.approx(0.000939001, rel=1e-5) and hi == pytest.approx(0.00106392, rel=1e-5)
     assert binom_test(500_000, 1_000_000, 0.505) == pytest.approx(1.53e-23, rel=1e-2)
     assert binom_test(3, 10, 0.3) == 1.0
+    assert rate_ratio(120, 880, 0.05 / 0.95)["p"] == pytest.approx(5.30296e-18, rel=1e-4)  # (a small upper tail, kept)
+    assert binom_test(990, 1000, 0.5) == pytest.approx(2 * 2.48334e-278, rel=1e-4)  # (scipy: binom.sf(989, 1000, 0.5))
     r = rate_ratio(30, 1000, 0.01)  # (30 where the background predicts 10)
     assert r["ratio"] == pytest.approx(3.0) and r["interval"][0] > 1.9 and r["interval"][1] < 4.6 and r["p"] < 1e-6
     assert rate_ratio(5, 0, 1.0)["ratio"] is None

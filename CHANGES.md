@@ -66,6 +66,11 @@ Albrecht-Buehler's GA-sequences in
   extension planes while copying a contig, in the specification's page
   order; `render.variant_classes()` gives each base's class as the
   variants mode draws it.
+- `gpxil validate` takes NaN as the same as NaN where it compares the planes
+  of windows that overlap (a float32 plane's "no value").
+- The new commands read regions as `gpxil stats` reads them, each base once:
+  a sequence named that only windows hold is all of them, joined where they
+  overlap or touch, and regions that overlap are scanned as their union.
 
 ## 0.7.0 (28 October 2026)
 

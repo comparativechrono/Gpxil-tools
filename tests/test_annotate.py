@@ -155,6 +155,12 @@ def test_scores_values_presence_and_windows(files, tmp_path):
     with GpxilFile(tmp_path / "again.gpxil.tif") as g:
         assert np.flatnonzero(g["chr1"].read("x-a")).tolist() == list(range(30, 40))
         assert [a["plane"] for a in g.metadata["annotations"]] == ["x-divergence", "x-timing", "x-a"]
+    # (windows that overlap hold the same float plane, NaN where there's no feature: the file is valid)
+    over = tmp_path / "over.gpxil.tif"
+    subset(str(path), str(over), ["chr1:1,001-3,000", "chr1:2,001-4,000"], log=lambda m: None)
+    over_scored = tmp_path / "over_s.gpxil.tif"
+    annotate(over, over_scored, rm, plane="x-divergence", kind="score", log=lambda m: None)
+    assert validate(str(over_scored)).ok
     # (windows: positions are the sequence's)
     win = tmp_path / "w.gpxil.tif"
     subset(str(path), str(win), ["chr1:1,001-3,000", "chr1:5,001-6,000"], log=lambda m: None)

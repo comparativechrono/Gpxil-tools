@@ -100,6 +100,15 @@ def test_regions_and_windows_keep_the_sequences_positions(ref_file, tmp_path):
     with GpxilFile(win) as g:
         got = [(r.sequence, r.start, r.end) for r in RunFinder(g, of="AG", min_length=30).runs()]
     assert got == [("chr1", a, b) for a, b in want]
+    # (a sequence that windows hold, named: all of them, each base once, overlapping and touching windows joined;
+    # and regions that overlap, their union)
+    wins = tmp_path / "wins.gpxil.tif"
+    subset(str(path), str(wins), ["chr1:10,001-14,000", "chr1:12,001-16,000", "chr1:16,001-20,000"])
+    with GpxilFile(wins) as g:
+        named = [(r.start, r.end) for r in RunFinder(g, [g.region_of("chr1")], of="AG", min_length=30).runs()]
+        regions = [g.region_of("chr1:10,001-15,000"), g.region_of("chr1:14,001-20,000")]
+        both = [(r.start, r.end) for r in RunFinder(g, regions, of="AG", min_length=30).runs()]
+    assert named == both == want
 
 
 def test_bed_summary_and_command_line(ref_file, tmp_path, capsys):

@@ -138,11 +138,12 @@ def binom_interval(k: int, n: int, level: float = 0.95) -> tuple[float, float]:
 
 
 def binom_test(k: int, n: int, p: float) -> float:
-    """The two-sided p-value of k of n against p: twice the smaller tail (at most 1)."""
+    """The two-sided p-value of k of n against p: twice the smaller tail (at most 1). Each tail is computed as itself,
+    P(X <= k) = I_{1-p}(n - k, k + 1) and P(X >= k) = I_p(k, n - k + 1), so a small one isn't lost to rounding."""
     if n == 0:
         return 1.0
     low = binom_cdf(k, n, p)
-    high = 1.0 - binom_cdf(k - 1, n, p)
+    high = betainc(k, n - k + 1, p) if k > 0 else 1.0
     return min(1.0, 2.0 * min(low, high))
 
 
@@ -235,10 +236,12 @@ class SpectrumCounter:
         self.on_strands = _Counts(k) if stranded else None
         self.notes: dict = {}  #: what was counted where (set by :func:`count_spectrum`)
 
-    def add_chunk(self, ref, gt, flags, called, inside, background, plus=None, minus=None) -> None:
+    def add_chunk(self, ref, gt, flags, called, inside, background, plus=None, minus=None, *, unknown_before: bool = False) -> None:
         """Counts over the middle of padded arrays (``self.margin`` bases more either side, which give contexts and
         neighbours): ``called`` the bases that count, ``inside`` and ``background`` the regions' and background's
-        bases (over the middle only); ``plus`` and ``minus``, with ``stranded``, the regions' bases on each strand."""
+        bases (over the middle only); ``plus`` and ``minus``, with ``stranded``, the regions' bases on each strand.
+        ``unknown_before``: the base before the middle isn't known (a window's first base), so a deletion there
+        isn't counted as beginning there."""
         m, k, h = self.margin, self.k, self.h
         n = ref.size - 2 * m
         mid = slice(m, m + n)
@@ -258,6 +261,8 @@ class SpectrumCounter:
         acgt = r4[mid] >= 0
         d1, d2 = h1 == C.HAP_DEL, h2 == C.HAP_DEL
         indel = (d1[mid] & ~d1[m - 1 : m - 1 + n]) | (d2[mid] & ~d2[m - 1 : m - 1 + n]) | ((flags[mid] & _INS) != 0)
+        if unknown_before and n:
+            indel[0] = (flags[m] & _INS) != 0
         # (the substitution sites, which are few: their alleles)
         x1, x2 = h1[mid], h2[mid]
         site = np.flatnonzero(_IS_SUB[x1] | _IS_SUB[x2])
@@ -421,6 +426,59 @@ def _islands_dropped(gfile, all_calls: bool) -> bool:
     return not all_calls and bool(isinstance(s, dict) and s.get("callable_regions"))
 
 
+def called_bases(view, a: int, b: int, gt: np.ndarray, flags: np.ndarray, drop: bool, block: int = 1 << 16) -> np.ndarray:
+    """Whether each base of ``[a, b)`` of a view (whose gt and flags there are given) is called: known on both
+    haplotypes; and, with ``drop``, not in an island, a run of called bases that calls cover entirely, outside the
+    regions called with confidence (spec 6.1). A run is judged whole, read past ``a`` and ``b`` as far as it
+    reaches (or until a base that no call covers shows it isn't an island), so where chunks end doesn't matter."""
+    from .compare import _drop_islands
+
+    def known(g, fl):
+        g = _NORMAL_GT[g]
+        return ((g >> 4) != C.HAP_UNKNOWN) & ((g & 0x0F) != C.HAP_UNKNOWN), (fl & C.FLAG_VARIANT_SITE) != 0
+
+    called, site = known(gt, flags)
+    if not drop or not called.size:
+        return called
+    has_flags = view.has("flags")
+
+    def piece(x, y):
+        fl = view.read("flags", x, y) if has_flags else np.zeros(y - x, dtype=np.uint8)
+        return known(view.read("gt", x, y), fl)
+
+    left, right = [], []
+    if called[0]:  # (the run goes on before a: to its start, or to a base no call covers)
+        x = a
+        while x > 0:
+            y, x = x, max(0, x - block)
+            c, st = piece(x, y)
+            stop = np.flatnonzero(~c | ~st)
+            if stop.size:
+                k = int(stop[-1])
+                left.insert(0, (c[k:], st[k:]))
+                break
+            left.insert(0, (c, st))
+    if called[-1]:  # (and after b)
+        y = b
+        while y < view.length:
+            x, y = y, min(view.length, y + block)
+            c, st = piece(x, y)
+            stop = np.flatnonzero(~c | ~st)
+            if stop.size:
+                k = int(stop[0])
+                right.append((c[: k + 1], st[: k + 1]))
+                break
+            right.append((c, st))
+    if not left and not right:
+        _drop_islands(called, site)
+        return called
+    n = sum(c.size for c, _ in left)
+    every = np.concatenate([c for c, _ in left] + [called] + [c for c, _ in right])
+    sites = np.concatenate([x for _, x in left] + [site] + [x for _, x in right])
+    _drop_islands(every, sites)
+    return every[n : n + called.size]
+
+
 def count_spectrum(
     gfile,
     features,
@@ -441,8 +499,6 @@ def count_spectrum(
     ``GpxilFile.region_of`` gives them; default every sequence of the file); ``background``: features whose bases
     (outside the regions) are the background (default: every base outside the regions); ``callable``: features
     whose bases alone count."""
-    from .compare import _drop_islands
-
     if gfile.sample_id is None:
         raise ValueError(f"{gfile.path} has no sample: a spectrum is of a sample's substitutions")
     counter = SpectrumCounter(k, centre=centre, isolated=isolated, stranded=stranded)
@@ -472,12 +528,12 @@ def count_spectrum(
             def padded(x, fill, pad_l=pad_l, pad_r=pad_r):
                 return np.concatenate((np.full(pad_l, fill, dtype=x.dtype), x, np.full(pad_r, fill, dtype=x.dtype)))
 
+            gt0 = view.read("gt", a, b)
+            fl0 = view.read("flags", a, b) if view.has("flags") else np.zeros(b - a, dtype=np.uint8)
             ref = padded(view.read("ref", a, b), 0)
-            gt = padded(view.read("gt", a, b), C.GT_UNKNOWN)
-            flags = padded(view.read("flags", a, b) if view.has("flags") else np.zeros(b - a, dtype=np.uint8), 0)
-            called = (C.normalize_states(gt >> 4) != C.HAP_UNKNOWN) & (C.normalize_states(gt & 0x0F) != C.HAP_UNKNOWN)
-            if drop:
-                _drop_islands(called, (flags & C.FLAG_VARIANT_SITE) != 0)
+            gt = padded(gt0, C.GT_UNKNOWN)
+            flags = padded(fl0, 0)
+            called = padded(called_bases(view, a, b, gt0, fl0, drop), False)
             if ok is not None:
                 called &= ok.get(seq, none).mask(off + lo - m, off + hi + m)
             inside = reg.mask(off + lo, off + hi)
@@ -486,7 +542,8 @@ def count_spectrum(
             if stranded:
                 pl = plus.get(seq, none).mask(off + lo, off + hi)
                 mi = minus.get(seq, none).mask(off + lo, off + hi)
-            counter.add_chunk(ref, gt, flags, called, inside, back, pl, mi)
+            # (a window's first base: whether a deletion begins there or before it, the file can't say)
+            counter.add_chunk(ref, gt, flags, called, inside, back, pl, mi, unknown_before=lo == 0 and off > 0)
             scanned += hi - lo
     counter.notes = {
         "features": {"given": len(features), "on_no_sequence": unplaced, "region_bases": sum(r.bases for r in regions.values())},

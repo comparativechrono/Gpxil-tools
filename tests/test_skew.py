@@ -133,8 +133,9 @@ def test_regions_windows_and_features(ref_file, tmp_path):
     with GpxilFile(path) as g:
         rows = list(iter_skew(g, [g.region_of("chr1:2,501-7,000")], window=1000, ks=ks, chunk=1700))
     _check(rows, _oracle(seq, 1000, ks, lo=2500, hi=7000))
-    with GpxilFile(path) as g, pytest.raises(ValueError, match="overlap"):
-        list(iter_skew(g, [g.region_of("chr1:1-5,000"), g.region_of("chr1:4,001-6,000")], window=1000))
+    with GpxilFile(path) as g:  # (regions that overlap: their union, each base once)
+        rows = list(iter_skew(g, [g.region_of("chr1:4,001-6,000"), g.region_of("chr1:1-5,000")], window=1000, ks=ks))
+    _check(rows, _oracle(seq, 1000, ks, lo=0, hi=6000))
     win = tmp_path / "w.gpxil.tif"
     subset(str(path), str(win), ["chr1:1,001-2,500", "chr1:2,301-4,000", "chr1:6,001-6,500"], log=lambda m: None)
     held = "".join(ch if 1000 <= i < 4000 or 6000 <= i < 6500 else "-" for i, ch in enumerate(seq))
@@ -184,6 +185,8 @@ def test_command_line(ref_file, tmp_path, capsys):
     assert "17 windows of 1,000 bases" in err and "asymmetry k 1" in err  # (13 of chr1, 4 of chr2)
     lines = tsv.read_text().splitlines()
     assert lines[0].split("\t")[:4] == ["sequence", "start", "end", "bases"] and len(lines) == 18
+    last = lines[-1].split("\t")
+    assert last[:3] == ["chr2", "3000", "3001"]  # (the last window ends where its sequence does)
     from PIL import Image
 
     im = Image.open(png)

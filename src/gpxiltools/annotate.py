@@ -10,7 +10,8 @@ file or a RepeatMasker table:
   the labels' names (0: no feature), the labels kept in the plane's
   metadata (``labels``); a repeat's label is its class, its family (the
   default: ``SINE/Alu``) or its name (``SINE/Alu/AluY``), as ``level`` says;
-  a BED feature's, its name. uint8 for up to 255 labels, else uint16.
+  a BED feature's, its name. uint8 for up to 255 labels, uint16 for up to
+  65,535, else uint32.
 - ``presence``: 1 where a feature is, 0 elsewhere (uint8).
 - ``score``: the feature's score (BED's fifth column; a repeat's divergence
   from its consensus, %), float32, NaN where there is no feature.
@@ -38,7 +39,7 @@ from collections.abc import Callable
 import numpy as np
 
 from . import __version__
-from .container import GpxilFile, GpxilWriter, path_name
+from .container import BigTiffNeeded, GpxilFile, GpxilWriter, path_name
 from .features import Feature, layout_of, read_features, sequence_name
 
 KINDS = ("auto", "category", "presence", "score", "value")
@@ -211,21 +212,6 @@ def annotate(
         if any(plane in g[n].pages for n in g.contigs) and not replace:
             raise ValueError(f"{path_name(g.path)} has a {plane} plane already: give --replace to make it again")
         made = plane_from(g, features, kind=kind, level=level, rmsk=layout == "rmsk")
-        meta = g.metadata
-        from .subset import _OWN_KEYS
-
-        writer = GpxilWriter(
-            out,
-            width=int((meta.get("layout") or {}).get("width") or g[g.contigs[0]].width),
-            compression=_compression(g),
-            palette=meta.get("palette") or "classic",
-            reference=meta.get("reference") or {},
-            sample=meta.get("sample"),
-            metadata={k: v for k, v in meta.items() if k not in _OWN_KEYS},
-            require_codec=False,
-            version=str(meta["gpxil"]),  # (an extension plane is in every version: the planes copied keep theirs)
-        )
-        writer.plane_info = {p: {k: v for k, v in (d or {}).items() if k != "dtype"} for p, d in (meta.get("planes") or {}).items()}
         what = {
             "category": "the features' labels, by number (labels)",
             "presence": "1 where a feature is, 0 elsewhere",
@@ -246,53 +232,83 @@ def annotate(
             info["missing_means"] = "NaN: no feature"
         if layout == "rmsk" and made["kind"] == "category":
             info["level"] = level
-        writer.plane_info[plane] = info
-        before = [a for a in meta.get("annotations") or [] if isinstance(a, dict) and a.get("plane") != plane]
-        writer.extra_metadata["annotations"] = before + [
-            {
-                "plane": plane,
-                "from": info["from"],
-                "kind": made["kind"],
-                "features": len(features),
-                "generator": f"gpxiltools {__version__}",
-            }
-        ]
-        dt = made["dtype"]
+        record = {
+            "plane": plane,
+            "from": info["from"],
+            "kind": made["kind"],
+            "features": len(features),
+            "generator": f"gpxiltools {__version__}",
+        }
         try:
-            for name in g.contigs:
-                c = g[name]
-                painter = made["painters"].get(c.parent)
-                if painter is None:
-                    none = made["none"]
-
-                    def values(a, b, none=none):
-                        return np.full(b - a, none, dtype=dt)
-
-                else:
-
-                    def values(a, b, painter=painter, off=c.start):
-                        return painter(off + a, off + b)
-
-                keep = [p for p in c.planes if p != plane]
-                got = writer.copy_contig(c, keep, add={plane: (dt, values)})
-                log(f"  {got.name}: {','.join(got.pages)}  [{time.time() - t0:.0f}s]")
-            writer.close()
-        except BaseException:
-            writer.abort()
-            raise
-    painted = sum(int((p.ends - p.starts).sum()) for p in made["painters"].values())
+            written, counted = _write(g, out, plane, made, info, record, None, log, t0)
+        except BigTiffNeeded:
+            log("  the file will be larger than 4 GiB: starting again as BigTIFF")
+            written, counted = _write(g, out, plane, made, info, record, True, log, t0)
     return {
         "plane": plane,
         "kind": made["kind"],
-        "dtype": dt.name,
+        "dtype": made["dtype"].name,
         "labels": len(made["labels"]),
         "features": len(features),
         "unplaced": made["unplaced"],
-        "bases_with_a_feature": painted,
-        "contigs": len(writer.contigs),
+        "bases_with_a_feature": counted,
+        "contigs": written,
         "seconds": round(time.time() - t0, 1),
         "bytes": os.path.getsize(out),
     }
+
+
+def _write(g: GpxilFile, out, plane: str, made: dict, info: dict, record: dict, bigtiff, log, t0: float) -> tuple[int, int]:
+    """The copy with the plane: how many contigs it has, and how many of its bases have a feature."""
+    from .subset import _OWN_KEYS
+
+    meta = g.metadata
+    writer = GpxilWriter(
+        out,
+        width=int((meta.get("layout") or {}).get("width") or g[g.contigs[0]].width),
+        compression=_compression(g),
+        bigtiff=bigtiff,
+        palette=meta.get("palette") or "classic",
+        reference=meta.get("reference") or {},
+        sample=meta.get("sample"),
+        metadata={k: v for k, v in meta.items() if k not in _OWN_KEYS},
+        require_codec=False,
+        version=str(meta["gpxil"]),  # (an extension plane is in every version: the planes copied keep theirs)
+    )
+    writer.plane_info = {p: {k: v for k, v in (d or {}).items() if k != "dtype"} for p, d in (meta.get("planes") or {}).items()}
+    writer.plane_info[plane] = info
+    before = [a for a in meta.get("annotations") or [] if isinstance(a, dict) and a.get("plane") != plane]
+    writer.extra_metadata["annotations"] = before + [record]
+    dt = made["dtype"]
+    counted = [0]
+
+    def tally(vals):
+        counted[0] += int(np.count_nonzero(~np.isnan(vals) if vals.dtype.kind == "f" else vals))
+        return vals
+
+    try:
+        for name in g.contigs:
+            c = g[name]
+            painter = made["painters"].get(c.parent)
+            if painter is None:
+                none = made["none"]
+
+                def values(a, b, none=none):
+                    return np.full(b - a, none, dtype=dt)
+
+            else:
+
+                def values(a, b, painter=painter, off=c.start):
+                    return tally(painter(off + a, off + b))
+
+            keep = [p for p in c.planes if p != plane]
+            got = writer.copy_contig(c, keep, add={plane: (dt, values)})
+            log(f"  {got.name}: {','.join(got.pages)}  [{time.time() - t0:.0f}s]")
+        writer.close()
+    except BaseException:
+        writer.abort()
+        raise
+    return len(writer.contigs), counted[0]
 
 
 def _compression(g: GpxilFile) -> str:

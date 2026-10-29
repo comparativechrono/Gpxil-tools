@@ -102,3 +102,6 @@ def test_picture_and_command_line(tr_file, tmp_path, capsys):
     assert out.splitlines()[0].endswith("% of bases equal to the base a unit on") and "period 4" in out
     assert main(["period", str(path), f"chr1:1-{len(seq)}", "--period", "7"]) == 0
     assert "period 7" in capsys.readouterr().out
+    for bad in (["--period", "0"], ["--period", "-3"], ["--max-period", "0"], ["--scale", "0"]):
+        assert main(["period", str(path), region, *bad]) == 1
+        assert "1 or more" in capsys.readouterr().err

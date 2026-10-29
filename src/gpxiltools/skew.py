@@ -77,6 +77,7 @@ class SkewCounter:
         self.rc = {k: _rc_table(k) for k in self.counted}
         self.pending: dict[tuple[str, int], _Window] = {}  #: windows that may still be added to
         self.sums: dict[str, _Window] = {}  #: each sequence's counts, over all its windows
+        self.lengths: dict[str, int] = {}  #: each sequence's length, where known (its last window ends there)
         self._cum: dict[str, float] = {}
 
     def _new(self) -> _Window:
@@ -154,7 +155,8 @@ class SkewCounter:
         for key in keys:
             win = self.pending.pop(key)
             name, w = key
-            d = {"sequence": name, "start": w * self.window, "end": (w + 1) * self.window}
+            end = (w + 1) * self.window
+            d = {"sequence": name, "start": w * self.window, "end": min(end, self.lengths.get(name, end))}
             d.update(measures(win.acgt, win.kmers, self.rc))
             d["other"], d["soft_masked"] = win.other, win.masked
             cum = self._cum.get(name, 0.0) + (d["gc_skew"] or 0.0)
@@ -227,13 +229,9 @@ def iter_skew(
             plus, _ = by_sequence(gfile, features)
             minus = {}
     none = Intervals()
-    # (what to scan, along each sequence in order, each base once: so that a window is done once the scan is past it)
+    # (what to scan, along each sequence in order, each base once, regions that overlap joined: so that a window is
+    # done once the scan is past it)
     jobs = [(v.parent, v.start + s, v.start + e, v, s, e) for v, s, e in targets(gfile, regions)]
-    seqs = list(dict.fromkeys(j[0] for j in jobs))
-    jobs.sort(key=lambda j: (seqs.index(j[0]), j[1]))
-    for x, y in zip(jobs, jobs[1:]):
-        if x[0] == y[0] and y[1] < x[2]:
-            raise ValueError(f"{x[3].region(x[4], x[5])} and {y[3].region(y[4], y[5])} overlap: give regions apart")
     # (chunks end at windows' ends; and hold few enough windows that their k-mers' counts stay small)
     step = max(window, min(chunk // window, max(1, (1 << 22) // 4**counter.kmax)) * window)
     last = None
@@ -244,6 +242,8 @@ def iter_skew(
         last = seq
         if not view.covers("ref", s, e):
             raise ValueError(f"{view.region(s, e)} has no reference: give it with --reference")
+        if view.parent_length is not None:
+            counter.lengths[seq] = int(view.parent_length)
         off = view.start
         lo = s
         while lo < e:
@@ -304,7 +304,7 @@ def picture(rows: list[dict], names, *, window: int, track: int = 12, title: str
 
     seqs = list(dict.fromkeys(r["sequence"] for r in rows))
     sc = scales(rows, names)
-    ncol = max((r["end"] // window for r in rows), default=1)
+    ncol = max((r["start"] // window + 1 for r in rows), default=1)
     left, top, gap = 12 + 7 * max([len(s) for s in seqs] + [4]), 30, 6
     label_w = 7 * max(len(m) for m in names) + 16
     width = left + ncol + label_w + 12

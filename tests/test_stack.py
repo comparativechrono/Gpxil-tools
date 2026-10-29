@@ -284,6 +284,11 @@ def test_reading_bed_and_repeatmasker(tmp_path):
         chosen(got, match="(")
     with pytest.raises(ValueError, match="RepeatMasker"):
         read_features(bed, "rmsk")
+    data = rm.read_bytes()
+    cut = tmp_path / "cut.txt.gz"
+    cut.write_bytes(data[: len(data) // 2])  # (a gzip file cut short, as a download that stopped)
+    with pytest.raises(ValueError, match="cut short"):
+        read_features(cut)
 
 
 def test_command_line(run_file, sample_file, tmp_path, capsys):
@@ -323,3 +328,9 @@ def test_command_line(run_file, sample_file, tmp_path, capsys):
     assert main(["stack", str(spath), str(sbed), "--profile", str(sprof), "--up", "20", "--down", "20"]) == 0
     head = sprof.read_text().splitlines()[0].split("\t")
     assert head[-6:] == ["heterozygous", "homozygous_alternate", "deletion", "insertion_after_base", "no_call", "complex"]
+    capsys.readouterr()
+    assert main(["stack", str(spath), str(sbed), "--up", "20", "--down", "20"]) == 0  # (the profile to standard output)
+    assert capsys.readouterr().out.splitlines()[0].split("\t") == head
+    for bad in (["--max-rows", "0"], ["--bin", "0"], ["--scale", "0"], ["--tolerance", "-1"]):
+        assert main(["stack", str(path), str(bed), "-o", str(png), *bad]) == 1
+        assert "or more" in capsys.readouterr().err
