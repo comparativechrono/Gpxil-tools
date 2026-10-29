@@ -332,6 +332,53 @@ def cmd_vcf(a) -> int:
     return 0
 
 
+def cmd_runs(a) -> int:
+    from .runs import RunFinder, Summary, format_summary, write_bed
+
+    with _open(a) as g:
+        finder = RunFinder(g, _in(g, a.regions) or None, of=a.of, min_length=a.min, both_strands=a.both_strands)
+        summary = Summary()
+        if a.output:
+            with open(a.output, "w") as out:
+                write_bed(out, finder.runs(), summary, of=a.of)
+        elif a.json:
+            for r in finder.runs():
+                summary.add(r)
+        else:
+            write_bed(sys.stdout, finder.runs(), summary, of=a.of)
+        d = summary.as_dict(a.of, a.min, finder.acgt)
+    if a.json:
+        print(json.dumps(d, indent=2))
+    else:
+        print(format_summary(d) + (f"; wrote {a.output}" if a.output else ""), file=sys.stderr)
+    return 0
+
+
+def cmd_period(a) -> int:
+    from .period import best_period, panels, picture, text
+
+    with _open(a) as g:
+        c, s, e = g.view(*g.locate(*g.region_of(a.region), join=True))
+        if not c.covers("ref", s, e):
+            raise ValueError(f"{c.region(s, e)} has no reference: give it with --reference")
+        found, share, shares = best_period(c.read("ref", s, e), a.max_period)
+        period = a.period or found
+        if a.period:
+            share = shares.get(period)
+        elif share < 0.6:
+            print(f"note: no clear period (the best, {period}, has {share:.2f} of bases equal a unit on)", file=sys.stderr)
+        ps = panels(c, s, e, layout=a.layout)
+        title = f"{c.region(s, e)}: period {period}" + (f", {100 * share:.0f} % of bases equal to the base a unit on" if share else "")
+        if a.output:
+            img = picture(ps, period, scale=a.scale, palette=a.palette, title=title)
+            img.save(a.output)
+            print(f"wrote {a.output}: {img.width} x {img.height} px; {title}", file=sys.stderr)
+        else:
+            print(title)
+            print(text(ps, period))
+    return 0
+
+
 def cmd_palettes(a) -> int:
     from .palettes import describe
 
@@ -493,6 +540,33 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--no-nocall-blocks", action="store_true", help="omit no-call blocks (ALT=<*>)")
     x.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file (path or URL), for files written with --no-ref")
     x.set_defaults(fn=cmd_vcf)
+
+    ru = sub.add_parser("runs", help="runs of a composition: the longest stretches whose bases all belong to a set (AG: GA-sequences)")
+    ru.add_argument("file", help="a gpxil file: a path or a URL")
+    ru.add_argument(
+        "regions", nargs="*", type=_region, metavar="REGION", help="CONTIG or CONTIG:START-END (1-based, inclusive); default: every contig"
+    )
+    ru.add_argument("--of", required=True, metavar="BASES", help="the set, in IUPAC letters: AG (or R) for purines, CT, A, AT, GC ...")
+    ru.add_argument("--min", type=int, default=51, metavar="N", help="the shortest run to give (default 51: more than 50 bases)")
+    ru.add_argument("--both-strands", action="store_true", help="the set's runs on the other strand too (strand -)")
+    ru.add_argument("-o", "--output", help="the runs as BED (default: to standard output)")
+    ru.add_argument("--json", action="store_true", help="a summary as JSON (give -o for the runs)")
+    ru.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
+    ru.set_defaults(fn=cmd_runs)
+
+    pe = sub.add_parser("period", help="a stretch wrapped at its repeat period, a unit a row: reference and haplotypes")
+    pe.add_argument("file", help="a gpxil file: a path or a URL")
+    pe.add_argument("region", type=_region, help="CONTIG:START-END (1-based, inclusive)")
+    pe.add_argument("--period", type=int, help="bases a unit (default: found, the shortest that fits)")
+    pe.add_argument("--max-period", type=int, default=50, help="the longest period to look for (default 50)")
+    pe.add_argument(
+        "--layout", choices=["aligned", "sequence"], default="aligned", help="haplotypes at the reference's positions, or as sequences"
+    )
+    pe.add_argument("-o", "--output", help="a picture (.png); default: the units as text")
+    pe.add_argument("--scale", type=int, default=8, help="pixels a base, each way (default 8)")
+    pe.add_argument("--palette", choices=list(PALETTES), default="classic")
+    pe.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
+    pe.set_defaults(fn=cmd_period)
 
     pl = sub.add_parser("palettes", help="list the built-in palettes")
     pl.set_defaults(fn=cmd_palettes)
