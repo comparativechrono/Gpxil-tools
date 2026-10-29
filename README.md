@@ -11,9 +11,12 @@ gpxiltools converts a reference FASTA, and optionally one person's VCF, into a
 exports reference, haplotype or IUPAC sequences and VCF; checks files against
 the specification; makes working copies of some chromosomes, or windows of
 them (a gene and its surroundings in a file of a few kilobytes that keeps the
-chromosome's positions); counts what a file holds; compares genomes; and
-renders pictures for the screen (PNG), for print (CMYK TIFF) and as a whole
-"genome book" PDF with one printed dot per base.
+chromosome's positions); counts what a file holds; compares genomes; renders pictures for the screen
+(PNG), for print (CMYK TIFF) and as a whole "genome book" PDF with one
+printed dot per base; and has tools for discovery: runs of a composition,
+features stacked and lined up, substitution spectra matched by context,
+annotation planes, strand-symmetry maps, and repeats wrapped at their
+period.
 
 ## Install
 
@@ -106,6 +109,75 @@ alleles' colours), `haplotypes` (two pixel rows per row of bases) and
 grey levels), `okabe-ito` (colour-blind safe) and `process` (one printing ink
 per base). Each palette is defined in both sRGB and CMYK, so print output is
 never converted from screen colours.
+
+## Discovery
+
+Tools for looking for things, made for (and checked against) the analyses of
+Albrecht-Buehler's GA-sequences in
+[Gpxil-scratchpad](https://github.com/comparativechrono/Gpxil-scratchpad):
+
+```sh
+# runs of a composition (IUPAC letters): Albrecht-Buehler's pure GA-sequences, more
+# than 50 bases of nothing but G and A, on both strands (TC runs are GA runs of the
+# other strand: strand -), as BED, with a summary. GRCh38's chr1: 1,766 and 1,848
+gpxil runs GRCh38.gpxil.tif --of AG --both-strands --min 51 -o ga.bed
+
+# features stacked, one a row, lined up at their starts, ends or centres, each read
+# 5' to 3' on its own strand: his GA-complex image, 400 bases before each run and 200
+# from it, sorted by the poly(A) it begins with (Alu elements line up upstream)
+gpxil stack GRCh38.gpxil.tif ga.bed --sort run -o ga-stack.png --labelled
+# Alu elements' 3' ends, the most diverged (oldest) at the top, 200 to a pixel row,
+# straight from UCSC's RepeatMasker table (a repeat's name is class/family/name, its
+# score its divergence); --profile writes each column's bases as a table
+gpxil stack GRCh38.gpxil.tif rmsk.txt.gz --match '^SINE/Alu/' --min-length 250 --anchor end \
+    --up 80 --down 40 --sort score --bin 200 --labelled --scale 4 -o alu-by-age.png --profile alu.tsv
+gpxil stack HG002.gpxil.tif ga.bed --mode variants -o ga-variants.png   # the person's variants
+
+# a person's substitutions in the regions against the rest of the genome, matched by
+# context: each region base's expected count from the rest's rate of each substitution
+# in its trinucleotide (96 kinds; --centre purine reads A or G in the middle); observed
+# over expected with an exact interval and test; by kind; Ti/Tv; insertions and deletions.
+# HG002 (v5.0q) in GA-sequences: isolated substitutions 1.11 times the expected
+# (transversions about half), insertions and deletions 24.9 times as many a base
+gpxil spectrum HG002.gpxil.tif ga.bed --isolated 20 --centre purine -o by-context.tsv
+gpxil spectrum HG002.gpxil.tif genes.bed --stranded --json     # on the genes' own strands too
+
+# annotation planes: a copy of a file, its strips copied as stored, with a plane
+# x-NAME a value a base: RepeatMasker's families (1.8 MB more for chr1), a BED's
+# names, scores, or a bedGraph's values (replication timing, Hi-C eigenvectors)
+gpxil annotate GRCh38.gpxil.tif rmsk.txt.gz --plane x-repeats -o GRCh38.repeats.gpxil.tif
+gpxil annotate GRCh38.gpxil.tif timing.bedGraph --plane x-timing --units "log2 E/L" -o GRCh38.rt.gpxil.tif
+
+# strand symmetry in windows: GC content, GC, AT, purine and keto skews, the cumulative
+# GC skew, and how far k-mers are from their reverse complements (Chargaff's second
+# rule), as a table and a map; --unmasked leaves out repeats; --features genes.bed
+# --stranded reads the genes on their coding strands
+gpxil skew GRCh38.gpxil.tif chr1 -o chr1-skew.tsv --picture chr1-skew.png --show gc,gc_skew,at_skew,asymmetry_4
+
+# a tandem repeat wrapped at its period (found: the shortest that fits), a unit a row,
+# the reference beside the person's two haplotypes, aligned or as sequences; as text,
+# or a picture with -o
+gpxil period HG002.gpxil.tif chr17:6,793,028-6,793,302
+gpxil period HG002.gpxil.tif chr17:6,793,028-6,793,302 --layout sequence -o repeat.png
+```
+
+The same in Python:
+
+```python
+from gpxiltools import GpxilFile
+from gpxiltools.features import read_features
+from gpxiltools.runs import iter_runs
+from gpxiltools.spectrum import spectrum
+from gpxiltools.stack import rendering, stack
+
+with GpxilFile("HG002.gpxil.tif") as g:
+    runs = list(iter_runs(g, of="AG", min_length=51, both_strands=True))   # Run(sequence, start, end, strand)
+    ga = read_features("ga.bed")
+    st = stack(g, ga, up=400, down=200, sort="run")       # st.ref: (rows, 600) codes, each 5' to 3'
+    rendering(st, mode="reference").save_png("stack.png")
+    r = spectrum(g, ga, isolated=20, centre="purine")
+    print(r["substitutions"]["ratio"], r["substitutions"]["interval"], r["types"]["G>A"])
+```
 
 ## Python
 
@@ -242,6 +314,16 @@ VCF and re-encoding gives back the same haplotypes, and pin down each rule of
 the conversion with small hand-made cases. On HG002 chr21 the haplotypes
 agree with bcftools on every non-overlapping record; where records overlap
 (`*` alleles), gpxiltools applies both records and bcftools skips one.
+
+The discovery tools are tested against the same counts made from the
+sequence as text, base by base: runs against regular expressions; stacks
+against rows cut out and reverse-complemented; spectra against
+substitutions, contexts and expectations counted from simulated sites;
+annotation planes against features painted base by base; skews against
+windows counted by hand; on windows, regions and chunk sizes down to a
+few bases. On GRCh38 and HG002 they give experiment 04's numbers: 1,766 and
+1,848 GA-sequences on chr1, the same stack, pixel for pixel, and the same
+isolated substitutions in GA-sequences, kind by kind.
 
 ## Limits
 

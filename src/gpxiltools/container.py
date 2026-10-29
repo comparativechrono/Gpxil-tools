@@ -603,7 +603,9 @@ class GpxilWriter:
             return False
         return len(page.dataoffsets) == math.ceil(page.shape[0] / page.rowsperstrip)
 
-    def copy_contig(self, src: Contig, planes: Iterable[str] | None = None, *, recompress: bool = False) -> ContigInfo:
+    def copy_contig(
+        self, src: Contig, planes: Iterable[str] | None = None, *, recompress: bool = False, add: dict | None = None
+    ) -> ContigInfo:
         """Copy a contig of an open gpxil file, with all or some of its planes, strip by strip.
 
         Strips are copied as they are stored when the compression is the
@@ -614,6 +616,11 @@ class GpxilWriter:
         contig's own planes; ``ref`` can also come from a reference attached
         to the source file. The contig keeps its metadata entry, without the
         keys that describe planes left out.
+
+        ``add``: extension planes to add, ``{name: (dtype, values)}``, where
+        ``values(a, b)`` gives the plane's values at the contig's offsets
+        ``[a, b)``, asked for a strip at a time; they take their places in
+        the page order (spec 8.2).
         """
         if self._closed:
             raise RuntimeError("writer is closed")
@@ -623,7 +630,11 @@ class GpxilWriter:
             raise GpxilFormatError(f"duplicate contig name {name!r}")
         if src.window is not None:
             self._check_window(name, length, src.window, src.entry.get("aliases", ()))
-        want = self._planes_wanted(src, planes, name)
+        add = dict(add or {})
+        for p in add:
+            if not _EXT_NAME.match(p):
+                raise GpxilFormatError(f"{p!r}: an added plane is an extension plane, named x-[A-Za-z0-9_-]+")
+        want = [p for p in self._planes_wanted(src, planes, name) if p not in add]
         if "ref" not in want and not _identified(src.entry):
             raise GpxilFormatError(
                 f"contig {name!r}: without its ref plane a contig needs the md5 or refget digest of its reference (section 3)"
@@ -636,6 +647,14 @@ class GpxilWriter:
         side = src.sidecar() if "gt" in want else []
         plan: dict[str, tuple[np.dtype, object | None]] = {}
         size = 0
+        for p, (dt, _) in add.items():
+            dt = np.dtype(dt)
+            if dt.name not in EXTENSION_DTYPES:
+                raise GpxilFormatError(f"extension plane {p!r} has unsupported dtype {dt}")
+            if not codec_available(self.compression):
+                raise GpxilFormatError(_no_codec_message(self.compression))
+            plan[p] = (dt, None)
+            size += rows * w * dt.itemsize
         for p in want:
             stored = p in src.pages
             page = src._page(p) if stored else None
@@ -654,11 +673,14 @@ class GpxilWriter:
             "stored": sum(raw is not None for _, raw in plan.values()),
             "encoded": sum(raw is None for _, raw in plan.values()),
         }
-        for p in want:
+        for p in sort_planes(plan):
             dt, raw = plan[p]
             self._check_dtype(p, dt)
             if raw is not None:
                 rps, strips = raw.rowsperstrip, _stored_strip_bytes(raw)
+            elif p in add:
+                rps = self._rows_per_strip(rows, w, dt)
+                strips = self._strips(add[p][1], dt, rps, length, w)
             else:
                 rps = self._rows_per_strip(rows, w, dt)
                 strips = self._encoded_strips(src, p, dt, rps)
@@ -802,9 +824,13 @@ class GpxilWriter:
     def _window_strips(self, src: Contig, plane: str, dt: np.dtype, rps: int, start: int, end: int, w: int, watch=None):
         """The strips of a plane over ``[start, end)`` of a contig, in rows of ``w``, read a strip's worth at a time
         and encoded; ``watch`` sees each piece of values."""
+        return self._strips(lambda a, b: src.read(plane, start + a, start + b), dt, rps, end - start, w, watch)
+
+    def _strips(self, read, dt: np.dtype, rps: int, n: int, w: int, watch=None):
+        """The strips of ``n`` values in rows of ``w``, ``read(a, b)`` giving values ``[a, b)`` a strip's worth at a
+        time, encoded; ``watch`` sees each piece of values."""
         from tifffile import TIFF
 
-        n = end - start
         rows = rows_for(n, w)
         order = self._tw.tiff.byteorder
         code = COMPRESSION_TAGS[self.compression][0]
@@ -812,7 +838,9 @@ class GpxilWriter:
         for r0 in range(0, rows, rps):
             r1 = min(rows, r0 + rps)
             a, b = r0 * w, min(n, r1 * w)
-            vals = src.read(plane, start + a, start + b)
+            vals = np.asarray(read(a, b))
+            if vals.shape != (b - a,):
+                raise GpxilFormatError(f"values for {a}-{b} came as {vals.shape}, not ({b - a},)")
             if watch is not None:
                 watch(vals)
             buf = np.zeros((r1 - r0) * w, dtype=dt.newbyteorder(order))

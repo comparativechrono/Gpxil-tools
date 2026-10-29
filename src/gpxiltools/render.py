@@ -108,6 +108,29 @@ class Rendering:
             raise ValueError("colorspace must be 'rgb' or 'cmyk'")
 
 
+#: the classes of :func:`variant_classes`, by number (0: none)
+VARIANT_CLASSES = ("none", "heterozygous", "homozygous alternate", "deletion", "insertion after base", "no call", "complex")
+
+
+def variant_classes(gt: np.ndarray, flags: np.ndarray | None = None) -> np.ndarray:
+    """Each base's class as the ``variants`` mode draws it (of any shape, as ``gt``): 0 none, 1 heterozygous,
+    2 homozygous alternate (or haploid), 3 deleted, 4 an insertion follows, 5 no call, 6 complex (one class a base:
+    the later of these wins, but a no call doesn't hide a variant on the other haplotype)."""
+    h1, h2 = C.hap1(gt), C.hap2(gt)
+    sub1, sub2 = np.isin(h1, C.HAP_SUB_CODES), np.isin(h2, C.HAP_SUB_CODES)
+    cls = np.zeros(np.shape(gt), dtype=np.uint8)
+    het = (sub1 & (h2 == C.HAP_REF)) | (sub2 & (h1 == C.HAP_REF)) | (sub1 & sub2 & (h1 != h2))
+    hom = (sub1 & sub2 & (h1 == h2)) | (sub1 & (h2 == C.HAP_ABSENT)) | (sub2 & (h1 == C.HAP_ABSENT))  # incl. haploid
+    cls[het] = 1
+    cls[hom] = 2
+    cls[(h1 == C.HAP_DEL) | (h2 == C.HAP_DEL)] = 3
+    if flags is not None:
+        cls[(flags & (C.FLAG_INS1 | C.FLAG_INS2)) != 0] = 4
+    cls[((h1 == C.HAP_UNKNOWN) | (h2 == C.HAP_UNKNOWN)) & (cls == 0)] = 5
+    cls[(h1 == C.HAP_COMPLEX) | (h2 == C.HAP_COMPLEX)] = 6
+    return cls
+
+
 def _lut_from_classes(classes: list[tuple[tuple, tuple]]) -> tuple[np.ndarray, np.ndarray]:
     rgb = np.full((256, 3), 255, dtype=np.uint8)
     cmyk = np.zeros((256, 4), dtype=np.uint8)
@@ -191,18 +214,7 @@ def render_arrays(
     faded_rgb = rgb_lut.astype(float)
     faded_rgb = (faded_rgb + (255 - faded_rgb) * 0.8).astype(np.uint8)
     faded_cmyk = (cmyk_lut.astype(float) * 0.2).astype(np.uint8)
-    h1, h2 = C.hap1(gt), C.hap2(gt)
-    sub1, sub2 = np.isin(h1, C.HAP_SUB_CODES), np.isin(h2, C.HAP_SUB_CODES)
-    cls = np.zeros(n, dtype=np.uint8)  # 0 = faded reference, encoded separately below
-    het = (sub1 & (h2 == C.HAP_REF)) | (sub2 & (h1 == C.HAP_REF)) | (sub1 & sub2 & (h1 != h2))
-    hom = (sub1 & sub2 & (h1 == h2)) | (sub1 & (h2 == C.HAP_ABSENT)) | (sub2 & (h1 == C.HAP_ABSENT))  # incl. haploid
-    cls[het] = 1
-    cls[hom] = 2
-    cls[(h1 == C.HAP_DEL) | (h2 == C.HAP_DEL)] = 3
-    if flags is not None:
-        cls[(flags & (C.FLAG_INS1 | C.FLAG_INS2)) != 0] = 4
-    cls[((h1 == C.HAP_UNKNOWN) | (h2 == C.HAP_UNKNOWN)) & (cls == 0)] = 5
-    cls[(h1 == C.HAP_COMPLEX) | (h2 == C.HAP_COMPLEX)] = 6
+    cls = variant_classes(gt, flags)  # 0 = faded reference, encoded separately below
     # indices: 0..31 faded reference codes, 0xF0+k variant classes
     out = np.where(cls == 0, ref, 0xF0 + cls).astype(np.uint8)
     rgb = faded_rgb.copy()

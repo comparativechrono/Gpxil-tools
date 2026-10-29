@@ -398,7 +398,7 @@ def _check_windows(g: GpxilFile, rep: Report, chunk: int) -> None:
         for plane in sorted(set(w.pages) & set(p.pages)):
             for s in range(0, w.length, chunk):
                 e = min(w.length, s + chunk)
-                if not np.array_equal(w.read(plane, s, e), p.read(plane, w.start + s, w.start + e)):
+                if not _same(w.read(plane, s, e), p.read(plane, w.start + s, w.start + e)):
                     rep.error(f"window {w.name}: its {plane} plane differs from that of {p.name} over the same bases (section 3.1)")
                     break
         if "gt" in w.pages and "gt" in p.pages:
@@ -408,6 +408,11 @@ def _check_windows(g: GpxilFile, rep: Report, chunk: int) -> None:
             theirs = {x for x in theirs if not (x[0] == 0 and x[2] == "COMPLEX")}
             if mine != theirs:
                 rep.error(f"window {w.name}: its sidecar differs from that of {p.name} over the same bases (section 3.1)")
+
+
+def _same(x: np.ndarray, y: np.ndarray) -> bool:
+    """Whether two pieces of a plane hold the same values (NaN, a float plane's "no value", the same as NaN)."""
+    return bool(np.array_equal(x, y, equal_nan=x.dtype.kind == "f" and y.dtype.kind == "f"))
 
 
 def _check_overlapping_windows(g: GpxilFile, wins, rep: Report, chunk: int) -> None:
@@ -427,7 +432,7 @@ def _check_overlapping_windows(g: GpxilFile, wins, rep: Report, chunk: int) -> N
                 for plane in sorted(set(a.pages) & set(b.pages)):
                     for s in range(lo, hi, chunk):
                         e = min(hi, s + chunk)
-                        if not np.array_equal(a.read(plane, s - a.start, e - a.start), b.read(plane, s - b.start, e - b.start)):
+                        if not _same(a.read(plane, s - a.start, e - a.start), b.read(plane, s - b.start, e - b.start)):
                             rep.error(f"windows {a.name} and {b.name}: their {plane} planes differ over the bases they share (section 3.1)")
                             break
                 if "gt" in a.pages and "gt" in b.pages and _shared(a, lo, hi) != _shared(b, lo, hi):
