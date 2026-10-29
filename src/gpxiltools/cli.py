@@ -496,6 +496,87 @@ def cmd_spectrum(a) -> int:
     return 0
 
 
+def cmd_annotate(a) -> int:
+    from .annotate import annotate
+
+    info = annotate(
+        a.file,
+        a.output,
+        a.features,
+        plane=a.plane,
+        kind=getattr(a, "as"),
+        level=a.level,
+        layout=a.layout,
+        match=a.match,
+        min_length=a.min_length,
+        description=a.description,
+        units=a.units,
+        replace=a.replace,
+        log=(lambda m: None) if a.quiet else (lambda m: print(m, file=sys.stderr)),
+    )
+    labels = f", {info['labels']:,} labels" if info["kind"] == "category" else ""
+    placed = f" ({info['unplaced']:,} on no sequence of the file)" if info["unplaced"] else ""
+    print(
+        f"wrote {a.output}: {info['contigs']} contigs with a {info['plane']} plane ({info['kind']}, {info['dtype']}{labels}) from"
+        f" {info['features']:,} features{placed}, over {info['bases_with_a_feature']:,} bases; {info['bytes'] / 1e6:.1f} MB in {info['seconds']} s",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_skew(a) -> int:
+    from .features import read_features
+    from .skew import SKEWS, SkewCounter, iter_skew, picture
+
+    ks = sorted({int(x) for x in a.k.split(",") if x.strip()}) if a.k else [1, 2, 3, 4]
+    show = [x.strip() for x in a.show.split(",") if x.strip()] if a.show else ["gc_skew", "at_skew"]
+    known = [*SKEWS, "cumulative_gc_skew", *(f"asymmetry_{k}" for k in ks)]
+    bad = [x for x in show if x not in known]
+    if bad:
+        raise ValueError(f"--show {bad[0]}: choose from {', '.join(known)}")
+    feats = read_features(a.features, a.layout, match=a.match, min_length=a.min_length) if a.features else None
+    if a.stranded and feats is None:
+        raise ValueError("--stranded reads features on their strands: give --features")
+    counter = SkewCounter(a.window, ks, unmasked=a.unmasked)
+    out = open(a.output, "w") if a.output else (None if a.json else sys.stdout)
+    kept, n = [], 0
+    try:
+        with _open(a) as g:
+            for row in iter_skew(g, _in(g, a.regions) or None, features=feats, stranded=a.stranded, counter=counter):
+                if out is not None:
+                    if n == 0:
+                        out.write("\t".join(row) + "\n")
+                    out.write("\t".join("" if v is None else str(v) for v in row.values()) + "\n")
+                if a.picture:
+                    kept.append({k: row[k] for k in ("sequence", "start", "end", *show)})
+                n += 1
+    finally:
+        if a.output and out is not None:
+            out.close()
+    totals = counter.totals()
+    if a.picture:
+        if not kept:
+            raise ValueError("no windows with bases to draw")
+        cols = max(r["end"] // a.window for r in kept)
+        if cols > 20000:
+            raise ValueError(f"the picture would be {cols:,} windows wide: give a larger --window")
+        img = picture(kept, show, window=a.window, title=f"{os.path.basename(str(a.file))}: windows of {a.window:,} bases")
+        img.save(a.picture)
+    if a.json:
+        print(json.dumps({"window": a.window, "k": ks, "windows": n, "totals": totals}, indent=2))
+    t = totals.get("all") or {}
+    if t:
+        asym = ", ".join(f"k {k} {t[f'asymmetry_{k}']}" for k in ks)
+        print(
+            f"{n:,} windows of {a.window:,} bases; over all {t['bases']:,} bases: GC {t['gc']}, GC skew {t['gc_skew']},"
+            f" AT skew {t['at_skew']}; asymmetry {asym}"
+            + (f"; wrote {a.output}" if a.output else "")
+            + (f"; drew {a.picture}" if a.picture else ""),
+            file=sys.stderr,
+        )
+    return 0
+
+
 def cmd_palettes(a) -> int:
     from .palettes import describe
 
@@ -751,6 +832,51 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true", help="the results as JSON")
     sp.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
     sp.set_defaults(fn=cmd_spectrum)
+
+    an = sub.add_parser("annotate", help="a copy of a file with an annotation plane (x-NAME) from a BED file or a RepeatMasker table")
+    an.add_argument("file", help="a gpxil file: a path or a URL")
+    an.add_argument("features", help="a BED or bedGraph file, or a RepeatMasker table (UCSC rmsk or .out); plain or gzipped")
+    an.add_argument("-o", "--output", required=True, help="the copy, with the new plane")
+    an.add_argument("--plane", required=True, metavar="x-NAME", help="the new plane's name: x- and letters, digits, - or _")
+    an.add_argument(
+        "--as",
+        choices=["auto", "category", "presence", "score", "value"],
+        default="auto",
+        help="labels as numbers, 1 where a feature is, scores, or a bedGraph's values (default: told by the file)",
+    )
+    an.add_argument("--level", choices=["class", "family", "name"], default="family", help="a repeat's label (default family: SINE/Alu)")
+    an.add_argument("--layout", choices=["auto", "bed", "rmsk"], default="auto", help="the features' file (default: told by its lines)")
+    an.add_argument("--match", metavar="REGEX", help="features whose name matches ('/Alu/'; a repeat's name is class/family/name)")
+    an.add_argument("--min-length", type=int, default=0, metavar="N", help="features of N bases or more")
+    an.add_argument("--description", help="what the plane holds, for its metadata (default: said from the features)")
+    an.add_argument("--units", help="the values' units, for the plane's metadata")
+    an.add_argument("--replace", action="store_true", help="make the plane again if the file has it")
+    an.add_argument("-q", "--quiet", action="store_true", help="no progress")
+    an.set_defaults(fn=cmd_annotate)
+
+    sw = sub.add_parser("skew", help="strand symmetry in windows: composition, GC and AT skews, k-mer asymmetry (Chargaff's second rule)")
+    sw.add_argument("file", help="a gpxil file: a path or a URL")
+    sw.add_argument(
+        "regions", nargs="*", type=_region, metavar="REGION", help="CONTIG or CONTIG:START-END (1-based, inclusive); default: every contig"
+    )
+    sw.add_argument(
+        "--window", type=int, default=100_000, metavar="N", help="bases a window, at multiples of N along each sequence (default 100,000)"
+    )
+    sw.add_argument("--k", metavar="K,...", help="k-mer lengths for the asymmetries, 1 to 6 (default 1,2,3,4)")
+    sw.add_argument("--unmasked", action="store_true", help="leave out soft-masked bases (repeats)")
+    sw.add_argument("--features", metavar="BED", help="count only bases in these features (BED, or a RepeatMasker table)")
+    sw.add_argument("--stranded", action="store_true", help="read each feature on its own strand (genes: their coding strands)")
+    sw.add_argument("--match", metavar="REGEX", help="--features: those whose name matches")
+    sw.add_argument("--min-length", type=int, default=0, metavar="N", help="--features: those of N bases or more")
+    sw.add_argument("--layout", choices=["auto", "bed", "rmsk"], default="auto", help="--features: the file (default: told by its lines)")
+    sw.add_argument("-o", "--output", metavar="TSV", help="the windows as a table (default: to standard output, unless --json)")
+    sw.add_argument("--picture", metavar="PNG", help="a map of the windows: a track a measure for each sequence, a pixel a window")
+    sw.add_argument(
+        "--show", metavar="M,...", help="the picture's measures (default gc_skew,at_skew; also gc, ry_skew, km_skew, asymmetry_K ...)"
+    )
+    sw.add_argument("--json", action="store_true", help="the totals, by sequence and over all, as JSON")
+    sw.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
+    sw.set_defaults(fn=cmd_skew)
 
     pl = sub.add_parser("palettes", help="list the built-in palettes")
     pl.set_defaults(fn=cmd_palettes)

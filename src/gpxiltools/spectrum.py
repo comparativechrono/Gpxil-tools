@@ -37,8 +37,10 @@ count as several. A site with two different alternate bases counts as two
 substitutions.
 
 Also counted: transitions and transversions; heterozygous and homozygous
-(or haploid) alleles; insertions and deletions (events: a deletion at its
-first deleted base, an insertion at the base it follows) per called base.
+(or haploid) alleles; insertions and deletions per called base: a base
+counts once if a deletion begins there on either haplotype (each
+haplotype's own: two different deletions that overlap are two) or an
+insertion follows it.
 """
 
 from __future__ import annotations
