@@ -1,5 +1,72 @@
 # Changes
 
+## 0.8.0 (29 October 2026)
+
+Tools for discovery, made for (and checked against) the analyses of
+Albrecht-Buehler's GA-sequences in
+[Gpxil-scratchpad](https://github.com/comparativechrono/Gpxil-scratchpad)
+(experiments 04 and 05).
+
+- **`gpxil runs FILE --of AG --min 51`**: the runs of a composition, the
+  longest stretches whose bases all belong to a set given in IUPAC letters
+  (AG or R: Albrecht-Buehler's pure GA-sequences; CT, A, AT ...), as BED,
+  with a summary (by strand, lengths, runs a megabase). `--both-strands`
+  finds the set's runs on the other strand too (strand `-`); a set that is its
+  own complement has one set of runs (strand `.`). On GRCh38's chr1: 1,766
+  GA-sequences and 1,848 TC-sequences, as experiment 04 counted them.
+- **`gpxil stack FILE FEATURES`**: features stacked, one a row, lined up at
+  their starts, ends or centres, each read 5' to 3' on its own strand (a
+  sample's substitutions complemented and its insertions moved with it):
+  Albrecht-Buehler's GA-complex image, for any features. Sorted as given, by
+  position, length, score, name, or the run of a set of bases at the anchor
+  (his poly(A)); drawn as `gpxil render` draws bases (any mode), raw or
+  labelled, a pixel row a feature or the mean of many (`--bin`); each
+  column's bases (and the sample's variants) as a table (`--profile`), and
+  the features in the order drawn as BED (`--rows`). The chr1 stack of
+  GA-sequences is experiment 04's, pixel for pixel.
+- **`gpxil spectrum FILE FEATURES`**: a sample's substitutions in regions
+  against the rest of the genome (or a background of its own), with each
+  region base's expected count from the background's rate of each
+  substitution in its context (3 bases by default: the 96 kinds of
+  mutational signatures; 1 to 9), read with a pyrimidine or a purine in the
+  middle; observed over expected with an exact binomial interval and test
+  (the background's counts are a sample too); by kind, and on each feature's
+  own strand with `--stranded` (12 kinds); transitions and transversions;
+  heterozygous and homozygous alleles; insertions and deletions per called
+  base; only isolated substitutions with `--isolated N`. Counts the bases the
+  file calls, leaving out calls outside its confident regions as `gpxil
+  compare` does, narrowed by `--callable`. On HG002 (v5.0q), its isolated
+  substitutions in GA-sequences are experiment 04's, kind by kind.
+- **`gpxil annotate FILE FEATURES --plane x-NAME -o OUT`**: a copy of a file
+  (its strips copied as stored) with an extension plane made from features,
+  a value a base: a RepeatMasker table's repeats as categories (class,
+  family or name, the labels in the plane's metadata), a BED file's names,
+  presence, scores, or a bedGraph's values (replication timing, Hi-C
+  eigenvectors) as float32 (NaN where there are none). Where features
+  overlap, the shorter is drawn. A file's annotations are recorded in its
+  metadata (`annotations`). chr1 with RepeatMasker's families: 37 s, 1.8 MB
+  more.
+- **`gpxil skew FILE`**: strand symmetry in windows at multiples of the
+  window along each sequence: GC content; GC, AT, purine and keto skews; the
+  cumulative GC skew; and for each k how far k-mers are from their reverse
+  complements' counts (Chargaff's second parity rule). `--unmasked` leaves
+  out repeats; `--features` counts only bases in features, `--stranded` on
+  their own strands (genes: transcription's skews). A table, totals as JSON,
+  and a map with a track a measure for each sequence.
+- **`gpxil period FILE REGION`**: a stretch wrapped at its repeat period (the
+  shortest that fits, or `--period`), a unit a row, the reference beside the
+  sample's haplotypes, aligned (substitutions outlined, deletions dashed,
+  insertions marked and listed) or as sequences; as text, or a picture.
+- Features (`gpxiltools.features`): BED and RepeatMasker tables (UCSC's
+  rmsk, with or without its bin column, and RepeatMasker's `.out`), read
+  plain or gzipped and chosen by name and length as they are read, so a
+  genome's 5.6 million repeats need little memory; `Intervals`, merged and
+  cut into masks quickly.
+- `GpxilWriter.copy_contig(..., add={name: (dtype, values)})` adds computed
+  extension planes while copying a contig, in the specification's page
+  order; `render.variant_classes()` gives each base's class as the
+  variants mode draws it.
+
 ## 0.7.0 (28 October 2026)
 
 Version 0.3 of the specification: windows.

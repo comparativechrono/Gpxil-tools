@@ -57,19 +57,20 @@ class _Follow:
         e = s + codes.size
         x = self.member[codes].view(np.int8)
         d = np.diff(np.concatenate(([0], x, [0])))
-        starts = (np.flatnonzero(d == 1) + s).tolist()
-        ends = (np.flatnonzero(d == -1) + s).tolist()
+        starts = np.flatnonzero(d == 1) + s
+        ends = np.flatnonzero(d == -1) + s
         out = []
         if self.open_at is not None:
-            if starts and starts[0] == s:
+            if starts.size and starts[0] == s:
                 starts[0] = self.open_at  # (the run goes on from the chunk before)
             elif s - self.open_at >= self.min_length:
                 out.append((self.open_at, s, self.strand))
             self.open_at = None
-        if ends and ends[-1] == e and not last:
-            self.open_at = starts.pop()  # (it may go on in the next chunk)
-            ends.pop()
-        out += [(a, b, self.strand) for a, b in zip(starts, ends) if b - a >= self.min_length]
+        if ends.size and ends[-1] == e and not last:
+            self.open_at = int(starts[-1])  # (it may go on in the next chunk)
+            starts, ends = starts[:-1], ends[:-1]
+        keep = (ends - starts) >= self.min_length  # (most runs are short: left out before they become Python numbers)
+        out += [(a, b, self.strand) for a, b in zip(starts[keep].tolist(), ends[keep].tolist())]
         return out
 
 

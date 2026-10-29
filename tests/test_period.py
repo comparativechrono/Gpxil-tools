@@ -86,7 +86,13 @@ def test_picture_and_command_line(tr_file, tmp_path, capsys):
         ps = panels(g["chr1"], r0, r0 + len(REPEAT))
     img = picture(ps, 4, scale=6, title="x")
     rows = len(REPEAT) // 4
-    assert img.height == 18 + 14 + 16 + rows * 6 + 8 and img.width >= 3 * 4 * 6
+    assert img.height == 18 + 14 + 16 + rows * 6 + 8 + 14 and img.width >= 3 * 4 * 6
+    # (panels as wide as their labels: 'reference' 58 px, 'haplotype 1' 70; 12 between; cells from y 32)
+    x1, x2, y0 = 8 + 58 + 12, 8 + 58 + 12 + 70 + 12, 32
+    assert img.getpixel((x1 + 6, y0 + 12 + 3)) == (0, 0, 0)  # (haplotype 1's G substituted: outlined in black)
+    assert img.getpixel((x1 + 6 + 2, y0 + 12 + 3)) == (0, 255, 0)
+    assert img.getpixel((x2 + 6 + 3, y0 + 60 + 2)) == (90, 90, 90)  # (haplotype 2's deleted unit: dashes)
+    assert img.getpixel((x2 + 6 + 3, y0 + 60 + 4)) == (255, 255, 255)
     png = tmp_path / "p.png"
     region = f"chr1:{r0 + 1}-{r0 + len(REPEAT)}"
     assert main(["period", str(path), region, "-o", str(png), "--scale", "5"]) == 0

@@ -7,12 +7,14 @@ of ``AAAG`` is period 4, not 8). A stretch with no clear period (a best
 share under 0.6) still gets the best one, with a warning.
 
 The reference is drawn, then, when the file has a sample, its two
-haplotypes, side by side, one pixel square a base:
+haplotypes, side by side, a square a base, in the palette's colours:
 
 - ``aligned`` (default): at the reference's positions, so a haplotype's row
-  is the reference's row; a substituted base is outlined in red, a deleted
-  one pale yellow, an unknown one pale blue, and an insertion after a base
-  is a magenta tick on that base's right edge (its bases are listed);
+  is the reference's row; a substituted base is outlined (in black or
+  white, whichever stands out on its colour), a deleted base is a dash, an
+  unknown one is in the palette's colour for N, a haplotype that is absent
+  (haploid) is left blank, and an insertion after a base is a bar on that
+  base's right edge (the inserted bases are listed in the text);
 - ``sequence``: each haplotype's own sequence, insertions in and deletions
   out, wrapped at the same period, so a unit gained or lost shifts the
   units after it.
@@ -27,8 +29,7 @@ import numpy as np
 from . import codes as C
 from .palettes import ref_colours
 
-DELETED, UNKNOWN, ABSENT = (255, 240, 170), (170, 200, 235), (238, 238, 238)
-OUTLINE, INSERTION, GRID = (220, 0, 0), (255, 0, 255), (215, 215, 215)
+PAPER, DASH, GRID = (255, 255, 255), (90, 90, 90), (215, 215, 215)
 
 
 def best_period(codes: np.ndarray, max_period: int = 50) -> tuple[int, float, dict[int, float]]:
@@ -59,7 +60,10 @@ class Panel:
     ticks: dict[int, str] = field(default_factory=dict)
 
 
-_SPECIAL = {-1: DELETED, -2: UNKNOWN, -3: ABSENT}
+def _contrast(rgb) -> tuple[int, int, int]:
+    """Black or white, whichever stands out on a colour."""
+    r, g, b = rgb
+    return (0, 0, 0) if 0.2126 * r + 0.7152 * g + 0.0722 * b > 110 else (255, 255, 255)
 
 
 def panels(view, start: int, end: int, *, layout: str = "aligned") -> list[Panel]:
@@ -105,26 +109,36 @@ def picture(panels: list[Panel], period: int, *, scale: int = 8, palette: str = 
     rgb, _ = ref_colours(palette)
     px, gap, top, margin = max(2, scale), max(12, 2 * scale), 18, 8
     rows = max(-(-len(p.codes) // period) for p in panels)
-    pw = period * px
-    width = margin * 2 + len(panels) * pw + (len(panels) - 1) * gap
-    height = top + 16 + rows * px + margin + (14 if title else 0)
-    width = max(width, 8 * len(title) + 2 * margin)
-    img = Image.new("RGB", (width, height), (255, 255, 255))
+    widths = [max(period * px, 6 * len(p.label) + 4) for p in panels]
+    width = margin * 2 + sum(widths) + (len(panels) - 1) * gap
+    key = "outlined: substituted; dash: deleted; bar at the right: an insertion follows"
+    height = top + 16 + rows * px + margin + (14 if title else 0) + 14
+    width = max(width, 6 * len(title) + 2 * margin, 6 * len(key) + 2 * margin)
+    img = Image.new("RGB", (width, height), PAPER)
     d = ImageDraw.Draw(img)
     if title:
         d.text((margin, 2), title, fill=(60, 60, 60))
     y0 = top + (14 if title else 0)
-    for k, p in enumerate(panels):
-        x0 = margin + k * (pw + gap)
+    unknown = tuple(int(v) for v in rgb[C.BASE_N])
+    x0 = margin
+    for p, pw in zip(panels, widths):
         d.text((x0, y0 - 14), p.label, fill=(0, 0, 0))
         for i, code in enumerate(p.codes):
             x, y = x0 + (i % period) * px, y0 + (i // period) * px
-            col = _SPECIAL[code] if code < 0 else tuple(int(v) for v in rgb[code])
-            d.rectangle([x, y, x + px - 1, y + px - 1], fill=col, outline=GRID if px >= 6 else None)
+            box = [x, y, x + px - 1, y + px - 1]
+            if code == -3:  # (absent: blank)
+                continue
+            col = PAPER if code == -1 else unknown if code == -2 else tuple(int(v) for v in rgb[code])
+            d.rectangle(box, fill=col, outline=GRID if px >= 6 else None)
+            if code == -1:
+                h = max(1, px // 5)
+                d.rectangle([x + px // 5, y + (px - h) // 2, x + px - 1 - px // 5, y + (px - h) // 2 + h - 1], fill=DASH)
             if i in p.outline:
-                d.rectangle([x, y, x + px - 1, y + px - 1], outline=OUTLINE, width=max(1, px // 5))
+                d.rectangle(box, outline=_contrast(col), width=max(1, px // 5))
             if i in p.ticks:
-                d.rectangle([x + px - max(1, px // 4), y, x + px - 1, y + px - 1], fill=INSERTION)
+                d.rectangle([x + px - max(2, px // 4), y, x + px - 1, y + px - 1], fill=_contrast(col))
+        x0 += pw + gap
+    d.text((margin, height - 14), key, fill=(90, 90, 90))
     return img
 
 
