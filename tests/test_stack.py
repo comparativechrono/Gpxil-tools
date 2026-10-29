@@ -291,7 +291,7 @@ def test_reading_bed_and_repeatmasker(tmp_path):
         read_features(cut)
 
 
-def test_command_line(run_file, sample_file, tmp_path, capsys):
+def test_command_line(run_file, sample_file, tmp_path, capsys, monkeypatch):
     path, seq, feats, bed = run_file
     png = tmp_path / "s.png"
     assert main(["stack", str(path), str(bed), "-o", str(png), "--sort", "run", "--up", "10", "--down", "40"]) == 0
@@ -305,7 +305,18 @@ def test_command_line(run_file, sample_file, tmp_path, capsys):
     prof = tmp_path / "p.tsv"
     rows = tmp_path / "r.bed"
     args = ["stack", str(path), str(bed), "-o", str(lab), "--labelled", "--scale", "3", "--profile", str(prof), "--rows", str(rows)]
+    from PIL import Image as PILImage
+
+    fromarray = PILImage.fromarray
+
+    def without_mode(obj, *a, **k):  # (Pillow 11.3 deprecates giving Image.fromarray a mode: none is given)
+        assert not a and "mode" not in k, "Image.fromarray was given a mode"
+        return fromarray(obj)
+
+    monkeypatch.setattr(PILImage, "fromarray", without_mode)
     assert main(args) == 0
+    assert main(["stack", str(path), str(bed), "-o", str(tmp_path / "binned.png"), "--bin", "2"]) == 0
+    monkeypatch.undo()
     assert Image.open(lab).width > 150 and prof.read_text().startswith("offset\trows\tA\tC\tG\tT")
     assert len(rows.read_text().splitlines()) == 5
     tif = tmp_path / "b.tif"

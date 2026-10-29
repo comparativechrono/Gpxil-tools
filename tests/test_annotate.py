@@ -85,6 +85,39 @@ def _rmsk(d, n1):
     return path, rows
 
 
+def test_repeat_names_with_a_slash(files, tmp_path):
+    """Two repeats of GRCh38 have a / in their own names (ALR/Alpha, BSR/Beta): their family and class are the
+    table's, not read off the name."""
+    d, path, n1, n2 = files
+    rm = tmp_path / "rmsk_slash.txt"
+    rows = [
+        (10, 200, "ALR/Alpha", "Satellite", "centr"),
+        (300, 400, "BSR/Beta", "Satellite", "Satellite"),
+        (500, 600, "AluY", "SINE", "Alu"),
+    ]
+    rm.write_text(
+        "".join(f"585\t1000\t50\t0\t0\tchr1\t{a}\t{b}\t-1\t+\t{name}\t{cls}\t{fam}\t1\t100\t0\t1\n" for a, b, name, cls, fam in rows)
+    )
+    from gpxiltools.features import read_features
+
+    feats = read_features(rm)
+    assert [(f.name, f.fields) for f in feats] == [
+        ("Satellite/centr/ALR/Alpha", ("Satellite", "centr", "ALR/Alpha")),
+        ("Satellite/BSR/Beta", ("Satellite", "Satellite", "BSR/Beta")),
+        ("SINE/Alu/AluY", ("SINE", "Alu", "AluY")),
+    ]
+    want = {
+        "class": ["SINE", "Satellite"],
+        "family": ["SINE/Alu", "Satellite", "Satellite/centr"],
+        "name": ["SINE/Alu/AluY", "Satellite/BSR/Beta", "Satellite/centr/ALR/Alpha"],
+    }
+    for level, labels in want.items():
+        out = tmp_path / f"{level}.gpxil.tif"
+        annotate(path, out, rm, plane="x-repeats", level=level, log=lambda m: None)
+        with GpxilFile(out) as g:
+            assert sorted(g.metadata["planes"]["x-repeats"]["labels"].values()) == labels
+
+
 @pytest.mark.parametrize("level", ["class", "family", "name"])
 def test_repeats_as_categories(files, tmp_path, level):
     d, path, n1, n2 = files

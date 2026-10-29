@@ -1,5 +1,19 @@
 # Changes
 
+## 0.8.1 (29 October 2026)
+
+Two fixes found putting 0.8.0's tools in GpxilStudio.
+
+- **Repeats whose own names hold a /** (GRCh38's ALR/Alpha and BSR/Beta, of
+  the satellites): a repeat's label as a class or family, in `gpxil
+  annotate`, is now its table's class and family, not read off its name, so
+  the 3.9 Mb of alpha satellite at chromosome 17's centromere are
+  `Satellite/centr`, not `Satellite/centr/ALR`. A RepeatMasker table's
+  features keep their class, family and name in `Feature.fields`.
+- **Pictures without Pillow's warning**: `gpxil stack`'s pictures give
+  `Image.fromarray` no mode, which Pillow 11.3 deprecates (and Pillow 13
+  removes), so it no longer warns where warnings are shown.
+
 ## 0.8.0 (29 October 2026)
 
 Tools for discovery, made for (and checked against) the analyses of
