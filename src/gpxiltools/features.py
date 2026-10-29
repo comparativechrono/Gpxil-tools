@@ -279,6 +279,66 @@ def on_views(gfile, features: list[Feature], views: list[tuple]) -> tuple[list[l
     return out, sum(id(f) not in placed for f in features)
 
 
+class Intervals:
+    """Intervals of one sequence, merged where they overlap or touch, in order: ``starts``, ``ends`` (0-based, the
+    ends excluded). :meth:`mask` cuts a piece of them as a boolean array."""
+
+    def __init__(self, pairs=()):
+        pairs = sorted((int(a), int(b)) for a, b in pairs if b > a)
+        starts, ends = [], []
+        for a, b in pairs:
+            if ends and a <= ends[-1]:
+                ends[-1] = max(ends[-1], b)
+            else:
+                starts.append(a)
+                ends.append(b)
+        self.starts = np.array(starts, dtype=np.int64)
+        self.ends = np.array(ends, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(self.starts.size)
+
+    @property
+    def bases(self) -> int:
+        return int((self.ends - self.starts).sum())
+
+    def mask(self, a: int, b: int) -> np.ndarray:
+        """Whether each position of ``[a, b)`` is in an interval."""
+        n = max(0, b - a)
+        i, j = int(np.searchsorted(self.ends, a, side="right")), int(np.searchsorted(self.starts, b, side="left"))
+        if i >= j:
+            return np.zeros(n, dtype=bool)
+        if j - i < 4096:  # (few: a slice each)
+            out = np.zeros(n, dtype=bool)
+            for x, y in zip((self.starts[i:j] - a).tolist(), (self.ends[i:j] - a).tolist()):
+                out[max(0, x) : min(n, y)] = True
+            return out
+        delta = np.zeros(n + 1, dtype=np.int32)
+        np.add.at(delta, np.clip(self.starts[i:j] - a, 0, n), 1)
+        np.add.at(delta, np.clip(self.ends[i:j] - a, 0, n), -1)
+        return np.cumsum(delta[:-1]) > 0
+
+
+def by_sequence(gfile, features, *, strand: str | None = None) -> tuple[dict[str, Intervals], int]:
+    """The features as :class:`Intervals`, by the name of the sequence the file holds them on (as the file finds
+    names: ``1`` is ``chr1``); with ``strand`` ('+' or '-'), only the features on it ('.' counts as '+'). Returns
+    them and how many features are on no sequence of the file."""
+    names: dict[str, str | None] = {}
+    pairs: dict[str, list] = {}
+    unplaced = 0
+    for f in features:
+        if strand is not None and (f.strand == "-") != (strand == "-"):
+            continue
+        if f.contig not in names:
+            names[f.contig] = sequence_name(gfile, f.contig)
+        seq = names[f.contig]
+        if seq is None:
+            unplaced += 1
+            continue
+        pairs.setdefault(seq, []).append((f.start, f.end))
+    return {k: Intervals(v) for k, v in pairs.items()}, unplaced
+
+
 def mask_of(n: int, intervals, offset: int = 0) -> np.ndarray:
     """A boolean array of length ``n``: True on the intervals ``(a, b)`` (shifted by ``-offset``, clipped)."""
     delta = np.zeros(n + 1, dtype=np.int32)

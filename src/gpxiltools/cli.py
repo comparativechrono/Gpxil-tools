@@ -458,6 +458,44 @@ def cmd_stack(a) -> int:
     return 0
 
 
+def cmd_spectrum(a) -> int:
+    from .features import read_features
+    from .spectrum import count_spectrum, format_results, write_table
+
+    feats = read_features(a.features, a.layout, match=a.match, min_length=a.min_length)
+    back = read_features(a.background) if a.background else None
+    called = read_features(a.callable) if a.callable else None
+    with _open(a) as g:
+        counter = count_spectrum(
+            g,
+            feats,
+            _in(g, a.regions) or None,
+            background=back,
+            callable=called,
+            k=a.context,
+            centre=a.centre,
+            isolated=a.isolated,
+            stranded=a.stranded,
+            all_calls=a.all_calls,
+        )
+    d = counter.results()
+    if a.output:
+        with open(a.output, "w") as out:
+            write_table(out, counter.table())
+    if a.json:
+        print(json.dumps(d, indent=2))
+    else:
+        f = d["features"]
+        head = f"{f['given']:,} features" + (f" ({f['on_no_sequence']:,} on no sequence of the file)" if f["on_no_sequence"] else "")
+        print(
+            f"{head}: {f['region_bases']:,} bases; calls outside the regions called with confidence {d['calls_outside_confident_regions']}"
+        )
+        print(format_results(d))
+    if a.output:
+        print(f"wrote {a.output}: by context", file=sys.stderr)
+    return 0
+
+
 def cmd_palettes(a) -> int:
     from .palettes import describe
 
@@ -685,6 +723,34 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--rows", metavar="BED", help="the features in the order drawn, with each one's row and sort key")
     sk.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
     sk.set_defaults(fn=cmd_stack)
+
+    sp = sub.add_parser("spectrum", help="the sample's substitutions in regions against the rest of the genome, context by context")
+    sp.add_argument("file", help="a gpxil file with a sample: a path or a URL")
+    sp.add_argument("features", help="the regions: a BED file, or a RepeatMasker table (UCSC rmsk or .out); plain or gzipped")
+    sp.add_argument(
+        "regions", nargs="*", type=_region, metavar="REGION", help="count only here: CONTIG or CONTIG:START-END (default: every contig)"
+    )
+    sp.add_argument("--background", metavar="BED", help="the background: these bases, outside the regions (default: all outside them)")
+    sp.add_argument("--callable", metavar="BED", help="count only these bases (as well as the bases the file calls)")
+    sp.add_argument(
+        "--all-calls", action="store_true", help="keep the calls outside the regions the file was written to call with confidence"
+    )
+    sp.add_argument("--context", type=int, default=3, metavar="K", help="bases of context: 1, 3 (default), 5 ...")
+    sp.add_argument(
+        "--centre",
+        choices=["pyrimidine", "purine"],
+        default="pyrimidine",
+        help="read contexts with this in the middle (default pyrimidine)",
+    )
+    sp.add_argument("--stranded", action="store_true", help="also the regions' substitutions on each feature's own strand (12 kinds)")
+    sp.add_argument("--isolated", type=int, metavar="N", help="count only substitutions with no other variant within N bases")
+    sp.add_argument("--match", metavar="REGEX", help="features whose name matches ('/Alu/'; a repeat's name is class/family/name)")
+    sp.add_argument("--min-length", type=int, default=0, metavar="N", help="features of N bases or more")
+    sp.add_argument("--layout", choices=["auto", "bed", "rmsk"], default="auto", help="the features' file (default: told by its lines)")
+    sp.add_argument("-o", "--output", metavar="TSV", help="the counts by context and substitution, as a table")
+    sp.add_argument("--json", action="store_true", help="the results as JSON")
+    sp.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
+    sp.set_defaults(fn=cmd_spectrum)
 
     pl = sub.add_parser("palettes", help="list the built-in palettes")
     pl.set_defaults(fn=cmd_palettes)
