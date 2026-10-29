@@ -36,7 +36,7 @@ class Feature:
     name: str = ""
     score: float | None = None
     strand: str = "."
-    fields: tuple = ()  #: a BED line's columns after the sixth
+    fields: tuple = ()  #: a BED line's columns after the sixth; a repeat's class, family and name, as its table gives them
 
     @property
     def length(self) -> int:
@@ -170,10 +170,12 @@ def read_repeats(path, *, match: str | None = None, min_length: int = 0) -> list
     """The repeats of a RepeatMasker table (plain or gzipped): UCSC's rmsk (``rmsk.txt.gz``, or the Table Browser's
     output) or RepeatMasker's own ``.out``. A repeat's name is its class, family and name, ``SINE/Alu/AluSx``
     (``Simple_repeat/(GA)n``: a family named as its class is left out); its score is its divergence from the
-    repeat's consensus, in %, which grows with its age. ``match``, ``min_length``: as :func:`chosen`, as the table
-    is read (a genome's table has millions of lines)."""
+    repeat's consensus, in %, which grows with its age; its ``fields``, its class, family and name as the table gives
+    them (a name can hold a / of its own: Satellite/centr/ALR/Alpha). ``match``, ``min_length``: as :func:`chosen`,
+    as the table is read (a genome's table has millions of lines)."""
     keep = _Keep(match, min_length)
     names: dict[tuple, str] = {}
+    parts: dict[tuple, tuple] = {}  # (one tuple for each kind of repeat, shared by its features)
     out = []
     kind = None
     for n, line in _lines(path):
@@ -195,8 +197,9 @@ def read_repeats(path, *, match: str | None = None, min_length: int = 0) -> list
         name = names.get(key)
         if name is None:
             name = names[key] = _repeat_name(cls, family, rep)
+            parts[key] = tuple(keep.one(x) for x in key)
         if keep(name, end - start):
-            out.append(Feature(keep.one(contig), start, end, name, div, strand))
+            out.append(Feature(keep.one(contig), start, end, name, div, strand, parts[key]))
     return out
 
 

@@ -46,15 +46,20 @@ KINDS = ("auto", "category", "presence", "score", "value")
 LEVELS = ("class", "family", "name")
 
 
-def label_of(name: str, level: str, rmsk: bool) -> str:
+def label_of(name: str, level: str, rmsk: bool, parts: tuple = ()) -> str:
     """A feature's label: a BED feature's name; a repeat's class, family or name (its name is class/family/name, or
-    class/name for a repeat whose family is its class)."""
+    class/name for a repeat whose family is its class). ``parts``: the repeat's class, family and name as its table
+    gives them (``Feature.fields``), which a name with a / of its own needs (ALR/Alpha: Satellite/centr, not
+    Satellite/centr/ALR)."""
     if not rmsk or level == "name":
         return name
-    parts = name.split("/")
+    if len(parts) == 3:
+        cls, family, _ = parts
+        return cls if level == "class" or not family or family == cls else f"{cls}/{family}"
+    split = name.split("/")
     if level == "class":
-        return parts[0]
-    return "/".join(parts[:-1]) or parts[0]
+        return split[0]
+    return "/".join(split[:-1]) or split[0]
 
 
 def _is_number(text: str) -> bool:
@@ -133,7 +138,7 @@ def plane_from(gfile, features: list[Feature], *, kind: str = "auto", level: str
             kind = "presence"
     labels: dict[str, int] = {}
     if kind == "category":
-        names = sorted({label_of(f.name, level, rmsk) for f in features})
+        names = sorted({label_of(f.name, level, rmsk, f.fields) for f in features})
         if "" in names:
             names.remove("")
         labels = {x: i for i, x in enumerate(names, 1)}
@@ -154,7 +159,7 @@ def plane_from(gfile, features: list[Feature], *, kind: str = "auto", level: str
             unplaced += 1
             continue
         if kind == "category":
-            lab = label_of(f.name, level, rmsk)
+            lab = label_of(f.name, level, rmsk, f.fields)
             if not lab:
                 continue
             v = labels[lab]

@@ -323,7 +323,7 @@ def labelled(pixels: np.ndarray, st: Stack, *, scale: int = 1, title: str = "", 
     from PIL import Image, ImageDraw
 
     Image.MAX_IMAGE_PIXELS = None
-    body = Image.fromarray(np.ascontiguousarray(pixels, dtype=np.uint8), "RGB")
+    body = Image.fromarray(np.ascontiguousarray(pixels, dtype=np.uint8))  # (RGB: rows, columns, 3)
     if scale > 1:
         body = body.resize((body.width * scale, body.height * scale), Image.NEAREST)
     left, top, right, bottom = 24, 46, 210, 40
@@ -374,7 +374,7 @@ def save_pixels(pixels: np.ndarray, path, *, scale: int = 1, dpi: int | None = N
         if pixels.shape[2] != 3:
             raise ValueError("CMYK needs a .tif output (PNG has no CMYK)")
         Image.MAX_IMAGE_PIXELS = None
-        Image.fromarray(np.ascontiguousarray(pixels), "RGB").save(path, dpi=(dpi, dpi) if dpi else None)
+        Image.fromarray(np.ascontiguousarray(pixels, dtype=np.uint8)).save(path, dpi=(dpi, dpi) if dpi else None)
     return w, h
 
 
