@@ -379,6 +379,85 @@ def cmd_period(a) -> int:
     return 0
 
 
+def _sorted_by(st, layout: str = "bed") -> str:
+    return {
+        "file": "as the features come",
+        "position": "by position",
+        "length": "by length, longest first",
+        "score": "by divergence from the repeat's consensus, highest first" if layout == "rmsk" else "by score, highest first",
+        "name": "by name",
+        "run": f"by the run of {st.run_of} from the anchor, longest first",
+    }[st.sort] + (" (reversed)" if st.reversed else "")
+
+
+def cmd_stack(a) -> int:
+    from .container import path_name
+    from .features import layout_of, read_features
+    from .stack import binned, labelled, legend_of, rendering, save_pixels, stack, write_profile, write_rows
+
+    layout = layout_of(a.features) if a.layout == "auto" else a.layout
+    feats = read_features(a.features, layout, match=a.match, min_length=a.min_length)
+    with _open(a) as g:
+        if a.mode != "reference" and g.sample_id is None:
+            raise ValueError(f"{a.file} has no sample: draw the reference (--mode reference)")
+        st = stack(
+            g,
+            feats,
+            anchor=a.anchor,
+            up=a.up,
+            down=a.down,
+            stranded=not a.ignore_strand,
+            sort=a.sort,
+            run_of=a.run_of,
+            tolerance=a.tolerance,
+            reverse=a.reverse,
+            max_rows=a.max_rows,
+            sample=a.mode != "reference" or bool(a.profile and g.sample_id),
+        )
+    left_out = [
+        f"{st.unplaced:,} on no sequence of the file" if st.unplaced else "",
+        f"{st.dropped:,} past --max-rows" if st.dropped else "",
+    ]
+    note = f"{len(st.rows):,} rows of {st.features:,} features" + (f" ({'; '.join(x for x in left_out if x)})" if any(left_out) else "")
+    if not st.rows:
+        raise ValueError(f"nothing to stack: {note}")
+    note += f"; {st.up:,} bases before each one's {st.anchor} and {st.down:,} from it; sorted {_sorted_by(st, layout)}"
+    if a.profile:
+        with open(a.profile, "w") as out:
+            write_profile(out, st)
+    if a.rows:
+        with open(a.rows, "w") as out:
+            write_rows(out, st)
+    if a.output:
+        tif = a.output.lower().endswith((".tif", ".tiff"))
+        if a.cmyk and (not tif or a.labelled):
+            raise ValueError("--cmyk needs a .tif output, without --labelled")
+        r = rendering(st, mode=a.mode, palette=a.palette)
+        if a.bin > 1 or a.labelled:
+            space = "cmyk" if a.cmyk else "rgb"
+            pixels = binned(r, a.bin, space) if a.bin > 1 else (r.to_cmyk() if a.cmyk else r.to_rgb())
+            if a.labelled:
+                title = f"{os.path.basename(a.features)} on {path_name(a.file)}: {st.anchor}s lined up ({a.mode})"
+                rows_note = f"{len(st.rows):,} rows, sorted {_sorted_by(st, layout)}" + (f"; {a.bin} a pixel row" if a.bin > 1 else "")
+                img = labelled(pixels, st, scale=a.scale, title=title, legend=legend_of(r), rows_note=rows_note)
+                img.save(a.output)
+                w, h = img.size
+            else:
+                w, h = save_pixels(pixels, a.output, scale=a.scale)
+        else:
+            r = r.scaled(a.scale)
+            if tif:
+                r.save_tiff(a.output, colorspace="cmyk" if a.cmyk else "rgb")
+            else:
+                r.save_png(a.output)
+            h, w = r.shape
+        note += f"; wrote {a.output}: {w} x {h} px"
+    elif not a.profile:
+        write_profile(sys.stdout, st)
+    print(note, file=sys.stderr)
+    return 0
+
+
 def cmd_palettes(a) -> int:
     from .palettes import describe
 
@@ -567,6 +646,45 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--palette", choices=list(PALETTES), default="classic")
     pe.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
     pe.set_defaults(fn=cmd_period)
+
+    sk = sub.add_parser("stack", help="features stacked, one a row, lined up at their starts, ends or centres (the GA-complex image)")
+    sk.add_argument("file", help="a gpxil file: a path or a URL")
+    sk.add_argument("features", help="a BED file, or a RepeatMasker table (UCSC's rmsk, or a .out file); plain or gzipped")
+    sk.add_argument("-o", "--output", help="the picture: .png or .tif (default: none, and the profile to standard output)")
+    sk.add_argument(
+        "--anchor", choices=["start", "end", "centre"], default="start", help="line up each feature's start, end or centre, on its strand"
+    )
+    sk.add_argument("--up", type=int, default=400, metavar="N", help="bases before the anchor (default 400)")
+    sk.add_argument("--down", type=int, default=200, metavar="N", help="bases from the anchor on (default 200)")
+    sk.add_argument("--ignore-strand", action="store_true", help="read every feature on the + strand")
+    sk.add_argument(
+        "--sort",
+        choices=["file", "position", "length", "score", "name", "run"],
+        default="file",
+        help="the rows' order (default: as the features come); run: the run of --run-of bases from the anchor",
+    )
+    sk.add_argument("--run-of", default="A", metavar="BASES", help="--sort run: the run's bases, in IUPAC letters (default A: poly(A))")
+    sk.add_argument("--tolerance", type=int, default=2, metavar="N", help="--sort run: other bases a run may hold (default 2)")
+    sk.add_argument("--reverse", action="store_true", help="sort the other way")
+    sk.add_argument("--max-rows", type=int, metavar="N", help="the first N rows, once sorted")
+    sk.add_argument("--match", metavar="REGEX", help="features whose name matches ('/Alu/'; a repeat's name is class/family/name)")
+    sk.add_argument("--min-length", type=int, default=0, metavar="N", help="features of N bases or more")
+    sk.add_argument("--layout", choices=["auto", "bed", "rmsk"], default="auto", help="the features' file (default: told by its lines)")
+    sk.add_argument(
+        "--mode",
+        choices=["reference", "genotype", "haplotypes", "variants"],
+        default="reference",
+        help="what to draw (default the reference)",
+    )
+    sk.add_argument("--palette", choices=list(PALETTES), default="classic")
+    sk.add_argument("--scale", type=int, default=1, help="pixels per base, each way")
+    sk.add_argument("--bin", type=int, default=1, metavar="K", help="each pixel row the mean colour of K rows (for many features)")
+    sk.add_argument("--labelled", action="store_true", help="a title, the anchor, the bases from it, and a legend")
+    sk.add_argument("--cmyk", action="store_true", help="CMYK TIFF for print")
+    sk.add_argument("--profile", metavar="TSV", help="each column's bases (and the sample's variants), as a table")
+    sk.add_argument("--rows", metavar="BED", help="the features in the order drawn, with each one's row and sort key")
+    sk.add_argument("--reference", metavar="FASTA", help="reference FASTA or gpxil file, for files written with --no-ref")
+    sk.set_defaults(fn=cmd_stack)
 
     pl = sub.add_parser("palettes", help="list the built-in palettes")
     pl.set_defaults(fn=cmd_palettes)

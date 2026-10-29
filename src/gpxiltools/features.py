@@ -2,8 +2,9 @@
 
 Shared by ``gpxil runs``, ``stack``, ``spectrum``, ``skew`` and ``annotate``:
 
-- :func:`read_bed` reads intervals (BED, plain or gzipped; 0-based, the end
-  excluded) with their name, score and strand when the file has them;
+- :func:`read_features` reads intervals from BED files (plain or gzipped;
+  0-based, the end excluded), with their name, score and strand when the
+  file has them, or a RepeatMasker table's repeats (:func:`read_repeats`);
 - :func:`targets` gives what a command scans: the regions asked for, read as
   ``gpxil stats`` reads them, or else every sequence of the file, each base
   once (windows that overlap or touch are joined: spec 3.1);
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import gzip
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -25,7 +26,7 @@ from . import codes as C
 CHUNK = 1 << 22  #: bases read at a time
 
 
-@dataclass
+@dataclass(slots=True)
 class Feature:
     """One interval of a BED-like file: ``[start, end)``, 0-based."""
 
@@ -35,7 +36,7 @@ class Feature:
     name: str = ""
     score: float | None = None
     strand: str = "."
-    fields: list[str] = field(default_factory=list)
+    fields: tuple = ()  #: a BED line's columns after the sixth
 
     @property
     def length(self) -> int:
@@ -49,35 +50,176 @@ def _open_text(path):
     return gzip.open(path, "rt") if magic == b"\x1f\x8b" else open(path)
 
 
-def read_bed(path, *, columns: tuple[int, int, int] = (0, 1, 2), one_based: bool = False) -> list[Feature]:
-    """The intervals of a BED file (plain or gzipped): track, browser and ``#`` lines are skipped. ``columns`` gives
-    the (0-based) columns of the contig, start and end, for tables laid out otherwise (UCSC's rmsk: 5, 6, 7); a BED's
-    name, score and strand are columns 4, 5 and 6. ``one_based``: the starts are 1-based (GFF-like)."""
+class _Keep:
+    """Which features to keep as a file is read (a name matching ``match``, a length of ``min_length`` or more),
+    and one copy of each name and contig, which many features share."""
+
+    def __init__(self, match: str | None = None, min_length: int = 0):
+        import re
+
+        try:
+            self.pat = re.compile(match) if match else None
+        except re.error as exc:
+            raise ValueError(f"{match!r} is not a regular expression: {exc}") from None
+        self.min_length = min_length
+        self.names: dict[str, bool] = {}
+        self.shared: dict[str, str] = {}
+
+    def __call__(self, name: str, length: int) -> bool:
+        if length < self.min_length:
+            return False
+        if self.pat is None:
+            return True
+        ok = self.names.get(name)
+        if ok is None:
+            ok = self.names[name] = bool(self.pat.search(name))
+        return ok
+
+    def one(self, text: str) -> str:
+        return self.shared.setdefault(text, text)
+
+
+def _skip(line: str) -> bool:
+    return not line.strip() or line.startswith(("#", "track", "browser"))
+
+
+def read_bed(path, *, match: str | None = None, min_length: int = 0) -> list[Feature]:
+    """The intervals of a BED file (plain or gzipped; track, browser and ``#`` lines skipped), with their name,
+    score and strand when it has them (columns 4, 5 and 6). ``match``, ``min_length``: as :func:`chosen`, as the
+    file is read."""
+    keep = _Keep(match, min_length)
     out = []
-    ci, si, ei = columns
     with _open_text(path) as fh:
         for n, line in enumerate(fh, 1):
-            if not line.strip() or line.startswith(("#", "track", "browser")):
+            if _skip(line):
                 continue
             f = line.rstrip("\r\n").split("\t")
             if len(f) < 3:
                 f = line.split()
             try:
-                contig, start, end = f[ci], int(f[si]) - (1 if one_based else 0), int(f[ei])
+                contig, start, end = f[0], int(f[1]), int(f[2])
             except (IndexError, ValueError):
                 raise ValueError(f"{path}, line {n}: not a BED interval ({line.strip()[:60]!r})") from None
             if start < 0 or end < start:
                 raise ValueError(f"{path}, line {n}: start {start} and end {end} are not an interval")
-            name = f[3] if len(f) > 3 and columns == (0, 1, 2) else ""
+            name = f[3] if len(f) > 3 else ""
+            if not keep(name, end - start):
+                continue
             score = None
-            if len(f) > 4 and columns == (0, 1, 2):
+            if len(f) > 4:
                 try:
                     score = float(f[4])
                 except ValueError:
                     score = None
-            strand = f[5] if len(f) > 5 and columns == (0, 1, 2) and f[5] in ("+", "-", ".") else "."
-            out.append(Feature(contig, start, end, name, score, strand, f))
+            strand = f[5] if len(f) > 5 and f[5] in ("+", "-") else "."
+            out.append(Feature(keep.one(contig), start, end, keep.one(name), score, strand, tuple(f[6:])))
     return out
+
+
+def _repeat_name(cls: str, family: str, name: str) -> str:
+    """A repeat's name as a path: class, family (when it isn't the class again), name: 'SINE/Alu/AluSx'."""
+    parts = [cls] + ([family] if family and family != cls else []) + [name]
+    return "/".join(p for p in parts if p)
+
+
+def _whole(text: str) -> bool:
+    return text.lstrip("-").isdigit()
+
+
+def _rmsk_kind(line: str) -> str | None:
+    """How a RepeatMasker table lays out its lines, from one: ``ucsc1`` (UCSC's rmsk, tab-separated, 0-based, its
+    first column ``bin``), ``ucsc0`` (without ``bin``), ``out`` (RepeatMasker's ``.out``: separated by spaces,
+    1-based, ``C`` for the - strand); None if the line is none of them."""
+    t = line.rstrip("\r\n").split("\t")
+    for k in (1, 0):
+        if len(t) >= 16 + k and t[8 + k] in ("+", "-") and all(_whole(t[i + k]) for i in (1, 5, 6, 7)):
+            return f"ucsc{k}"
+    w = line.split()
+    if len(w) >= 15 and w[8] in ("+", "C") and all(_whole(w[i]) for i in (0, 5, 6)):
+        try:
+            float(w[1])
+        except ValueError:
+            return None
+        return "out"
+    return None
+
+
+def _rmsk_line(kind: str, line: str) -> tuple:
+    """``(contig, start, end, strand, name, class, family, divergence %)`` of a line laid out as ``kind`` says."""
+    if kind == "out":
+        w = line.split()
+        cls, _, family = w[10].partition("/")
+        return w[4], int(w[5]) - 1, int(w[6]), {"+": "+", "C": "-"}[w[8]], w[9], cls, family, float(w[1])
+    k = int(kind[-1])
+    t = line.rstrip("\r\n").split("\t")
+    return t[4 + k], int(t[5 + k]), int(t[6 + k]), {"+": "+", "-": "-"}[t[8 + k]], t[9 + k], t[10 + k], t[11 + k], int(t[1 + k]) / 10
+
+
+def read_repeats(path, *, match: str | None = None, min_length: int = 0) -> list[Feature]:
+    """The repeats of a RepeatMasker table (plain or gzipped): UCSC's rmsk (``rmsk.txt.gz``, or the Table Browser's
+    output) or RepeatMasker's own ``.out``. A repeat's name is its class, family and name, ``SINE/Alu/AluSx``
+    (``Simple_repeat/(GA)n``: a family named as its class is left out); its score is its divergence from the
+    repeat's consensus, in %, which grows with its age. ``match``, ``min_length``: as :func:`chosen`, as the table
+    is read (a genome's table has millions of lines)."""
+    keep = _Keep(match, min_length)
+    names: dict[tuple, str] = {}
+    out = []
+    kind = None
+    with _open_text(path) as fh:
+        for n, line in enumerate(fh, 1):
+            if _skip(line):
+                continue
+            if kind is None:
+                kind = _rmsk_kind(line)
+                if kind is None:
+                    if n <= 3 and not line.split()[0].isdigit():
+                        continue  # (a .out file begins with three lines of headings)
+                    raise ValueError(f"{path}, line {n}: not a RepeatMasker line ({line.strip()[:60]!r})")
+            try:
+                contig, start, end, strand, rep, cls, family, div = _rmsk_line(kind, line)
+            except (IndexError, KeyError, ValueError):
+                raise ValueError(f"{path}, line {n}: not a RepeatMasker line like those before it ({line.strip()[:60]!r})") from None
+            if start < 0 or end < start:
+                raise ValueError(f"{path}, line {n}: start {start} and end {end} are not an interval")
+            key = (cls, family, rep)
+            name = names.get(key)
+            if name is None:
+                name = names[key] = _repeat_name(cls, family, rep)
+            if keep(name, end - start):
+                out.append(Feature(keep.one(contig), start, end, name, div, strand))
+    return out
+
+
+def layout_of(path) -> str:
+    """Whether a file of features is a RepeatMasker table (``'rmsk'``) or BED (``'bed'``), by its first lines."""
+    with _open_text(path) as fh:
+        for n, line in enumerate(fh, 1):
+            if _skip(line):
+                continue
+            if _rmsk_kind(line) is not None:
+                return "rmsk"
+            if n > 3 or line.split()[0].isdigit() or len(line.split("\t")) >= 3:
+                break  # (a BED line; a .out file's headings come first, then its lines)
+    return "bed"
+
+
+def read_features(path, layout: str = "auto", *, match: str | None = None, min_length: int = 0) -> list[Feature]:
+    """Features from a BED file (``layout='bed'``) or a RepeatMasker table (``'rmsk'``: :func:`read_repeats`);
+    ``'auto'`` tells them apart by their first lines (:func:`layout_of`). ``match``, ``min_length``: as
+    :func:`chosen`."""
+    if layout not in ("auto", "bed", "rmsk"):
+        raise ValueError("layout must be 'auto', 'bed' or 'rmsk'")
+    if layout == "auto":
+        layout = layout_of(path)
+    read = read_repeats if layout == "rmsk" else read_bed
+    return read(path, match=match, min_length=min_length)
+
+
+def chosen(features: list[Feature], *, match: str | None = None, min_length: int = 0) -> list[Feature]:
+    """The features whose name matches the regular expression ``match`` (searched for anywhere in it:
+    ``'/Alu/'``, ``'^SINE/Alu/AluY'``) and that are ``min_length`` bases or more."""
+    keep = _Keep(match, min_length)
+    return [f for f in features if keep(f.name, f.length)]
 
 
 def targets(gfile, regions=None) -> list[tuple]:
