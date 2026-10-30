@@ -1,5 +1,20 @@
 # Changes
 
+## 0.8.2 (30 October 2026)
+
+- **A contig's sidecar is decoded once**: `Contig.sidecar()` kept no copy,
+  so every call unpacked the whole chromosome's inserted and complex
+  alleles again, and `haplotype_sequence` scanned all of them for each
+  region asked for. A contig now decodes its sidecar the first time and
+  keeps it (each call still gives a new list), and `Contig.insertions(hap,
+  start, end)` (and `Stretch.insertions`) look a region's insertions up in
+  an index made once. Reading HG002's haplotypes over 2,000 short regions of
+  chromosome 21 (11,257 entries) takes 1.2 s where the lookups alone took
+  about 20 s; on chromosome 1, with five times the entries, the saving is
+  larger. Found running experiment 11 of
+  [Gpxil-scratchpad](https://github.com/comparativechrono/Gpxil-scratchpad),
+  which reads a million repeat arrays' alleles one by one.
+
 ## 0.8.1 (29 October 2026)
 
 Two fixes found putting 0.8.0's tools in GpxilStudio.
