@@ -33,11 +33,12 @@ def _hap_states(contig: Contig, h: int, start: int, end: int) -> np.ndarray:
 
 
 def _insertions(contig: Contig, h: int, start: int, end: int) -> dict[int, str]:
-    out = {}
-    for e in contig.sidecar():
-        if e.kind == "INS" and e.hap == h and start <= e.offset < end:
-            out[e.offset] = e.data
-    return out
+    """Haplotype ``h``'s insertions anchored in ``[start, end)``: looked up in the contig's index of its sidecar when
+    it keeps one (a Contig or a Stretch), else read from its entries."""
+    look = getattr(contig, "insertions", None)
+    if look is not None:
+        return look(h, start, end)
+    return {e.offset: e.data for e in contig.sidecar() if e.kind == "INS" and e.hap == h and start <= e.offset < end}
 
 
 def haplotype_sequence(contig: Contig, h: int, start: int = 0, end: int | None = None, *, keep_case: bool = True) -> bytes:

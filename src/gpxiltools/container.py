@@ -375,6 +375,31 @@ def decode_sidecar(blob: bytes) -> list[SidecarEntry]:
     return out
 
 
+_NO_OFFSETS = np.empty(0, dtype=np.int64)
+
+
+def insertion_index(entries: Iterable[SidecarEntry]) -> dict[int, tuple[np.ndarray, list[str]]]:
+    """A sidecar's inserted bases by haplotype: ``hap -> (offsets, bases)``, the offsets sorted (an offset given twice
+    keeps its last entry, as a dict filled in file order would)."""
+    by: dict[int, dict[int, str]] = {}
+    for e in entries:
+        if e.kind == "INS":
+            by.setdefault(e.hap, {})[e.offset] = e.data
+    out = {}
+    for h, d in by.items():
+        offs = sorted(d)
+        out[h] = (np.array(offs, dtype=np.int64), [d[o] for o in offs])
+    return out
+
+
+def insertions_in(index: dict, hap: int, start: int, end: int) -> dict[int, str]:
+    """``offset -> bases`` of haplotype ``hap``'s insertions anchored at offsets ``[start, end)``, from
+    :func:`insertion_index`."""
+    offs, data = index.get(hap, (_NO_OFFSETS, []))
+    a, b = (int(x) for x in np.searchsorted(offs, (start, end), "left"))
+    return {int(offs[i]): data[i] for i in range(a, b)}
+
+
 def _window_sidecar(src, start: int, end: int) -> list[SidecarEntry]:
     """The sidecar of a window cut out of ``src`` at ``[start, end)`` (spec 3.1)."""
     first = int(src.read("gt", start, start + 1)[0]) if start > 0 and "gt" in src.pages else None
@@ -905,6 +930,8 @@ class Contig:
         self.rows: int = rows_for(self.length, self.width)
         self.pages: dict[str, int] = {k: int(v) for k, v in entry["pages"].items()}
         self._page_of: dict = {}  # (the TIFF pages read: tifffile parses a page again each time it is asked for one)
+        self._side: list[SidecarEntry] | None = None  # (the sidecar, decoded once: see sidecar())
+        self._ins: dict | None = None  # (its insertions by haplotype and offset: see insertions())
         #: for a window (spec 3.1), its ``window`` key: the parent, and where the window starts in it; else None
         self.window: dict | None = (
             check_window(self.name, self.length, entry["window"], entry.get("aliases", ())) if "window" in entry else None
@@ -1110,12 +1137,20 @@ class Contig:
         return flat[start - base : end - base].copy()
 
     def sidecar(self) -> list[SidecarEntry]:
-        if "gt" not in self.pages:
-            return []
-        tag = self._page("gt").tags.get(SIDECAR_TAG)
-        if tag is None:
-            return []
-        return decode_sidecar(bytes(tag.value))
+        """The sample's sidecar entries (spec 7), in the file's order. The tag is decoded the first time and kept: each
+        call gives a new list of the same entries."""
+        if self._side is None:
+            tag = self._page("gt").tags.get(SIDECAR_TAG) if "gt" in self.pages else None
+            self._side = [] if tag is None else decode_sidecar(bytes(tag.value))
+        return list(self._side)
+
+    def insertions(self, hap: int, start: int = 0, end: int | None = None) -> dict[int, str]:
+        """Haplotype ``hap``'s inserted bases anchored at offsets ``[start, end)`` (spec 7): ``offset -> bases``. The
+        sidecar is indexed once, so reading region after region looks the insertions up instead of passing over all
+        of the contig's entries each time."""
+        if self._ins is None:
+            self._ins = insertion_index(self.sidecar())
+        return insertions_in(self._ins, hap, start, self.length if end is None else end)
 
     # convenience views --------------------------------------------------
     def sequence(self, start: int = 0, end: int | None = None) -> str:
@@ -1177,6 +1212,7 @@ class Stretch:
         self.window = {"of": self.parent, "start": self.start}
         self._segments_of: dict[str, tuple[list, list]] = {}
         self._sidecar: list[SidecarEntry] | None = None
+        self._ins: dict | None = None
         self.planes = sort_planes({p for p in {p for c in self.parts for p in c.planes} if self.has(p)})
 
     def __repr__(self) -> str:
@@ -1290,6 +1326,12 @@ class Stretch:
             out.sort(key=lambda e: (e.offset, e.hap, e.kind))
             self._sidecar = out
         return self._sidecar
+
+    def insertions(self, hap: int, start: int = 0, end: int | None = None) -> dict[int, str]:
+        """As :meth:`Contig.insertions`, at the stretch's offsets."""
+        if self._ins is None:
+            self._ins = insertion_index(self.sidecar())
+        return insertions_in(self._ins, hap, start, self.length if end is None else end)
 
     def _copied(self, parts: list, sides: list, entries: list[SidecarEntry], at: int, e: SidecarEntry) -> bool:
         """Whether a COMPLEX entry at a window's first base, stretch offset ``at``, is the window's copy (spec 3.1) of

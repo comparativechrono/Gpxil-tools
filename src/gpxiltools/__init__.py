@@ -6,7 +6,7 @@ ordinary multi-page TIFF. See https://github.com/comparativechrono/Gpxil for
 the format specification.
 """
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 from .container import GpxilFile, GpxilWriter, open_gpxil  # noqa: E402
 
