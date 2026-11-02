@@ -5,7 +5,7 @@ needs only the strips it touches. :class:`RangeFile` is a read-only file
 object over a URL that fetches those bytes, a block at a time, and keeps the
 recent blocks, so that
 
-    >>> g = GpxilFile("https://comparativechrono.github.io/Gpxil-browser/data/grch38/gpxil/chr17.gpxil.tif")
+    >>> g = GpxilFile("https://pixelverse.cam/data/grch38/gpxil/chr17.gpxil.tif")
     >>> g["chr17"].sequence(7_668_401, 7_668_461)
 
 downloads a few hundred kilobytes, not the 23 MB file. The server must
