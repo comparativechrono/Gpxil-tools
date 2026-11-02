@@ -93,7 +93,7 @@ gpxil fasta HG002.noref.gpxil.tif --reference GRCh38.gpxil.tif --region chr21:5,
 
 # files on the web are read with range requests, a strip at a time: here the
 # Gpxil browser's GRCh38, used without downloading it
-G=https://comparativechrono.github.io/Gpxil-browser/data/grch38/gpxil
+G=https://pixelverse.cam/data/grch38/gpxil
 gpxil info $G/chr17.gpxil.tif
 gpxil fasta $G/chr17.gpxil.tif --region chr17:7,668,402-7,668,461
 gpxil stats $G/chr17.gpxil.tif chr17:7,661,779-7,687,546
